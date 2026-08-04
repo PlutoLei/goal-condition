@@ -11,8 +11,14 @@ description: Claude Code goal 模式（/goal）completion condition 起草工作
 
 ## 为什么值得一个协议
 
-goal 模式的 evaluator（默认 Haiku）**不跑命令、不读文件**，只看 Claude 已经表面化在对话里的内容。
-condition 写宽 = 提前假完成；写窄 = 无限空转烧 token。长任务的成败全押在起草这一步。
+goal 模式的 evaluator **只看 Claude 已经表面化在对话里的内容**——所以 condition 里必须
+显式要求把证据打进回复。condition 写宽 = 提前假完成；写窄 = 无限空转烧 token。长任务的
+成败全押在起草这一步。
+
+> ⚠️ **这条是经验性假设，不是官方契约**（2026-08-05 异源核实）：「evaluator 默认 Haiku」
+> 有实测支撑（跑一次 `/goal` 后 result 的 `modelUsage` 里确有 `claude-haiku-4-5`）；但
+> 「不跑命令、不读文件」在 `claude --help` 与 `/goal` 用法里都查不到任何行为契约。按它设计
+> 是安全侧（多打证据没坏处），但**别对外把它当官方保证引用**，也别指望它跨版本稳定。
 另外 condition 同时是第一个 turn 的任务指令——要带足任务语境（做什么、在哪个仓、什么范围）。
 
 ## 四步协议（顺序不可跳）
@@ -45,13 +51,26 @@ Or stop after <N> turns.
 2. 查「铁律库」——任务命中哪条线，该线铁律全部写进 Constraints
 3. **实测核对将写进 condition 的每个硬数字与路径**——锚点表给的是入口不是真值：测试基线数、产物行数、文件 / checkout 是否存在、脚本当前的剔题 / 拒绝覆盖行为，起草前逐一跑一遍。核不上就把差异摊给用户，不带着过期数字起草。凡是会随代码演进漂移的计数，锚定「脚本自打印的计数行 + 公式校验」而不是死数字——写死旧产物形状是 condition 的头号死法。
 
+🔴 **走出口 B（就地起进程）时，Constraints 必须固定追加禁嵌套子句**：
+
+```
+; this run is itself an unattended goal execution — do NOT compile another
+condition, do NOT spawn a nested `claude -p "/goal ..."`, and do NOT wait for
+user confirmation (there is no interactive user in this process).
+```
+
+失败模式（2026-08-05 异源核实）：`claude -p` 是 `--print` 语义——**打印一次就退出**，
+子进程里没有可交互的用户。若子会话再命中本 skill 的触发词，它会走到第 2 步与
+CHECKPOINT，然后卡在一个永远等不到的确认上。把禁嵌套写进 Constraints 是因为那是
+子会话第一个 turn 必读的任务指令；写在本文件里子会话不一定读得到。
+
 N 的取法：预估 turn 数 × 2；复杂任务 30–50，小任务 10–15。
 特大任务不写巨型条件，拆成多个接续的 goal（每阶段一个 condition）。
 
-⚠️ **N 给宽一点，否则终止原因不可区分**：实测一次 N=15 的跑，结果 `num_turns` 正好 15
-而 `subtype=success`——**判完成与撞上限在返回里长得一样**，事后无法断定产物是做完了还是
-被逼着收尾。宁可给到预估的 2–3 倍，让 turn 数明显低于上限，这样「贴着上限结束」本身
-就成了一个可读的告警信号。
+⚠️ **N 给宽一点，否则终止原因不可区分**（2026-08-04 实测）：一次测试跑 N=15，
+结果 `num_turns` 正好 15 而 `subtype=success`——**判完成与撞上限在返回里长得一样**，
+事后无法断定报告是做完了还是被逼着收尾。宁可给到预估的 2–3 倍，让 turn 数明显低于
+上限，这样「贴着上限结束」本身就成了一个可读的告警信号。
 
 ### 第 2 步：会话内验证（闸门）
 
@@ -64,7 +83,7 @@ N 的取法：预估 turn 数 × 2；复杂任务 30–50，小任务 10–15。
 | 3 | Constraints 覆盖命中线的全部铁律 |
 | 4 | 有 `or stop after N turns` 兜底 |
 | 5 | 完全自含：无「按之前说的」类引用（compaction 会吃掉被引用消息） |
-| 6 | ≤4000 字符 |
+| 6 | 长度受控（**自定预算非 CLI 限制**：`claude --help` 查不到任何 condition 长度约束，4000 字符是本协议自设的上限，防的是 condition 长到 evaluator 抓不住重点，不是防报错） |
 
 ### 🔴 CHECKPOINT · 🛑 STOP
 
@@ -92,7 +111,9 @@ cd <目标工作目录> && claude -p "/goal $COND" \
 ```
 
 用 `run_in_background` 起，别前台阻塞。观察要点（2026-08-04 实测）：
-- 开头几十行全是 `hook_started` / `hook_response`，不代表卡住
+- 开头几十行可能全是 `hook_started` / `hook_response`，**不代表卡住**。（本机实测：不加
+  `--include-hook-events` 也照样出现了 16 条 hook 事件——该 flag 存在但并非 hook 事件出现的
+  必要条件，本机装了 hook 才是。别据此判断进度。）
 - 过滤实质事件：`type=assistant` 的 text / tool_use，和末尾 `type=result`
 - `result` 里看 `subtype` / `num_turns` / `is_error` / `total_cost_usd`
 - **验完成不能只看 result**：还要独立核对终态产物存在、以及边界有没有被守住
@@ -100,8 +121,14 @@ cd <目标工作目录> && claude -p "/goal $COND" \
 
 **出口 B 不绕过 CHECKPOINT** —— 仍然是「弹 condition + 自检表 → 用户点头 → 才起进程」。
 自动化的是编译与启动，不是判断。理由：condition 写错的两种后果（提前假完成 / 无限空转）
-**都只有跑完才发现**，再叠加 `--permission-mode auto` 的全自动权限，出事下限很低。
-实测一次只读任务的测试跑也花了 7.6 分钟 / $3.69。
+**都只有跑完才发现**。实测一次只读任务的测试跑花了 7.6 分钟 / $3.69。
+
+⚠️ **`--permission-mode auto` 不是「全自动放行」**（2026-08-05 异源核实纠正）：它是一套带
+allow / soft_deny / hard_deny 判据的分类器（`claude auto-mode defaults` 可打印全文规则），
+与 `bypassPermissions` 是 `--permission-mode` 下并列的不同取值，危险操作照样会被拦。
+**别拿「反正 auto 全放行」当保留 CHECKPOINT 的理由**——auto 兜得住「误操作」，兜不住
+「方向错」，而 condition 写错正属于后者，这才是闸门不能省的真实理由。跑完必看 result 里的
+`permission_denials`：非空说明有动作被拦下、产物可能不完整，别当成功收工。
 
 ## 分线验证锚点表
 
