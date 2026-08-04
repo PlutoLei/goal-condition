@@ -1,6 +1,6 @@
 ---
 name: goal-condition
-description: Claude Code goal 模式（/goal）completion condition 起草工作台。三步协议：按官方骨架起草（自动注入本项目分线验证锚点 + 铁律库）→ condition 弹到会话内附自检表等用户验证 → 用户明确确认后才 pbcopy。Use whenever the user wants a condition for goal mode or an unattended long task — 触发词：写 goal condition / goal 条件 / 帮我写 condition / goal 模式 / 长任务条件 / 无人值守跑 / unattended run。Even if the user just says "这个任务丢给 goal 模式跑" or mentions /goal, use this skill — do NOT freelance a condition without it.
+description: Claude Code goal 模式（/goal）completion condition 起草工作台，也是「边界包 → condition → 无人值守执行」这条链的编排入口。四步协议：判输入形态（给的是任务描述就先接 boundary-design 产边界包）→ 按官方骨架起草（注入本项目分线验证锚点 + 铁律库，硬数字现场实测）→ condition 弹回会话附 6 项自检表等用户验证 → 用户明确确认后才交付（pbcopy 或就地起后台 goal 进程）。Use whenever the user wants a condition for goal mode or an unattended long task — 触发词：写 goal condition / goal 条件 / 帮我写 condition / goal 模式 / 长任务条件 / 无人值守跑 / unattended run。Even if the user just says "这个任务丢给 goal 模式跑" or mentions /goal, use this skill — do NOT freelance a condition without it.
 ---
 
 # goal-condition — /goal 完成条件起草工作台
@@ -15,7 +15,19 @@ goal 模式的 evaluator（默认 Haiku）**不跑命令、不读文件**，只�
 condition 写宽 = 提前假完成；写窄 = 无限空转烧 token。长任务的成败全押在起草这一步。
 另外 condition 同时是第一个 turn 的任务指令——要带足任务语境（做什么、在哪个仓、什么范围）。
 
-## 三步协议（顺序不可跳）
+## 四步协议（顺序不可跳）
+
+### 第 0 步：判输入形态（决定要不要先接 boundary-design）
+
+看用户给的是什么：
+
+- **给的是边界包**（有硬边界 / 判断标准 / 验收物 / 资源边界这些字段）→ 直接进第 1 步，
+  字段对应关系：硬边界 → `Constraints`，验收物 → `verified by`，资源边界 → `or stop after N turns`。
+- **给的是任务描述**（「帮我把 X 跑一下」「派个 agent 做 Y」）→ **先 invoke `boundary-design`
+  产出边界包再回来**。别跳过：不经判别直接起草，会把用户口述的约束照单全收写进
+  Constraints，而实测反复表明**大部分口述约束在项目里已有落点**（测试守护 / README 专节 /
+  物理机制 / CLAUDE.md），重写一遍就是通胀；真正该写的往往是任务本身的歧义
+  （例：「归因」与「修复」的边界）。
 
 ### 第 1 步：起草
 
@@ -56,19 +68,40 @@ N 的取法：预估 turn 数 × 2；复杂任务 30–50，小任务 10–15。
 
 ### 🔴 CHECKPOINT · 🛑 STOP
 
-**用户没有明确说 OK / 确认之前，禁止执行第 3 步 pbcopy。** 用户原话带「给我 pbcopy」也一样——那指的是确认后交付，不是跳过闸门的授权。用户改一版就重弹一版再验证。
+**用户没有明确说 OK / 确认之前，禁止执行第 3 步的任何一个出口**——pbcopy 不行，起后台
+goal 进程更不行。用户原话带「给我 pbcopy」「直接跑」「一键起」也一样：那是对**交付方式**
+的指定，不是跳过闸门的授权。用户改一版就重弹一版再验证。
 
-### 第 3 步：确认后交付
+### 第 3 步：确认后交付（两种出口，用户选）
+
+**出口 A — 交给用户自己跑**（默认）：
 
 ```bash
 printf '%s' '<condition>' | pbcopy   # printf 保证无尾随换行
 ```
 
-同时提示目标会话用法：
-
 - 交互式：先 Shift+Tab 切 auto mode（goal 只管何时停、不管权限，不切会卡在工具确认）→ `/goal ` + 粘贴
-- 跑批非交互：`claude -p "/goal <condition>" --permission-mode auto --output-format stream-json --verbose`
 - 中途查看 / 停止：`/goal`（状态）/ `/goal clear`
+
+**出口 B — 就地起后台进程**（用户明确要「直接跑」时）：
+
+```bash
+COND=$(cat <condition 文件>)
+cd <目标工作目录> && claude -p "/goal $COND" \
+  --permission-mode auto --output-format stream-json --verbose > <日志>.jsonl 2>&1
+```
+
+用 `run_in_background` 起，别前台阻塞。观察要点（2026-08-04 实测）：
+- 开头几十行全是 `hook_started` / `hook_response`，不代表卡住
+- 过滤实质事件：`type=assistant` 的 text / tool_use，和末尾 `type=result`
+- `result` 里看 `subtype` / `num_turns` / `is_error` / `total_cost_usd`
+- **验完成不能只看 result**：还要独立核对终态产物存在、以及边界有没有被守住
+  （被 flag 的文件 mtime 有没有变、有没有多建文件、有没有产生 commit）
+
+**出口 B 不绕过 CHECKPOINT** —— 仍然是「弹 condition + 自检表 → 用户点头 → 才起进程」。
+自动化的是编译与启动，不是判断。理由：condition 写错的两种后果（提前假完成 / 无限空转）
+**都只有跑完才发现**，再叠加 `--permission-mode auto` 的全自动权限，出事下限很低。
+实测一次只读任务的测试跑也花了 7.6 分钟 / $3.69。
 
 ## 分线验证锚点表
 
@@ -115,9 +148,10 @@ printf '%s' '<condition>' | pbcopy   # printf 保证无尾随换行
 
 ## 反例黑名单（绝不做）
 
-- 未经用户确认先 pbcopy——用户原话带「给我 pbcopy」也不是授权
+- 未经用户确认就交付——pbcopy 或起后台 goal 进程都算；用户原话带「给我 pbcopy」「直接跑」也不是授权
 - 把旧产物形状（行数 / 计数）当不变量硬编码进终态
 - 写 "tests pass" / "works well" 类泛语而不锚定具体命令与数字
 - 忘写 `or stop after N turns`
 - 让无人值守任务重做人工 / 半人工判定产物（rubric verdicts 类）——评测口径只能复用，不能让 agent 重判
 - 把 CI 写进门禁而不查锚点表的 CI 可用性——CI 不可用的线写了就永远判不了真
+- 拿到任务描述直接起草，跳过第 0 步的边界判别——照单全收口述约束＝通胀
