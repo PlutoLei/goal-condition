@@ -121,7 +121,7 @@ cd <目标工作目录> && claude -p "/goal $COND" \
 
 **出口 B 不绕过 CHECKPOINT** —— 仍然是「弹 condition + 自检表 → 用户点头 → 才起进程」。
 自动化的是编译与启动，不是判断。理由：condition 写错的两种后果（提前假完成 / 无限空转）
-**都只有跑完才发现**。实测一次只读任务的测试跑花了 7.6 分钟 / $3.69。
+**都只有跑完才发现**。实测一次只读任务的测试跑花了 7.6 分钟 / USD 3.69。
 
 ⚠️ **`--permission-mode auto` 不是「全自动放行」**（2026-08-05 异源核实纠正）：它是一套带
 allow / soft_deny / hard_deny 判据的分类器（`claude auto-mode defaults` 可打印全文规则），
