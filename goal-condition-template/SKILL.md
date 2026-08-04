@@ -1,6 +1,6 @@
 ---
 name: goal-condition
-description: Claude Code goal 模式（/goal）completion condition 起草工作台，也是「边界包 → condition → 无人值守执行」这条链的编排入口。四步协议：判输入形态（给的是任务描述就先接 boundary-design 产边界包）→ 按官方骨架起草（注入本项目分线验证锚点 + 铁律库，硬数字现场实测）→ condition 弹回会话附 6 项自检表等用户验证 → 用户明确确认后才交付（pbcopy 或就地起后台 goal 进程）。Use whenever the user wants a condition for goal mode or an unattended long task — 触发词：写 goal condition / goal 条件 / 帮我写 condition / goal 模式 / 长任务条件 / 无人值守跑 / unattended run。Even if the user just says "这个任务丢给 goal 模式跑" or mentions /goal, use this skill — do NOT freelance a condition without it.
+description: Claude Code goal 模式（/goal）completion condition 起草工作台，也是「边界包 → condition → 无人值守执行」这条链的编排入口。五步协议：判输入形态（给的是任务描述就先接 boundary-design 产边界包）→ 按官方骨架起草（注入本项目分线验证锚点 + 铁律库，硬数字现场实测）→ condition 弹回会话附 6 项自检表等用户验证 → 用户明确确认后才交付（pbcopy 或就地起后台 goal 进程）→ 跑完由主会话独立核对终态与边界（evaluator 防不住编造证据）。Use whenever the user wants a condition for goal mode or an unattended long task — 触发词：写 goal condition / goal 条件 / 帮我写 condition / goal 模式 / 长任务条件 / 无人值守跑 / unattended run。Even if the user just says "这个任务丢给 goal 模式跑" or mentions /goal, use this skill — do NOT freelance a condition without it.
 ---
 
 # goal-condition — /goal 完成条件起草工作台
@@ -21,7 +21,7 @@ goal 模式的 evaluator **只看 Claude 已经表面化在对话里的内容**�
 > 是安全侧（多打证据没坏处），但**别对外把它当官方保证引用**，也别指望它跨版本稳定。
 另外 condition 同时是第一个 turn 的任务指令——要带足任务语境（做什么、在哪个仓、什么范围）。
 
-## 四步协议（顺序不可跳）
+## 五步协议（顺序不可跳）
 
 ### 第 0 步：判输入形态（决定要不要先接 boundary-design）
 
@@ -130,38 +130,42 @@ allow / soft_deny / hard_deny 判据的分类器（`claude auto-mode defaults` �
 「方向错」，而 condition 写错正属于后者，这才是闸门不能省的真实理由。跑完必看 result 里的
 `permission_denials`：非空说明有动作被拦下、产物可能不完整，别当成功收工。
 
-## 分线验证锚点表
+### 第 4 步：独立核对（两个出口都必做，不可跳）
 
-> **填写指南（装好后先做这件事）**：每条「线」= 你项目里一类会被反复派活的工作流。
-> 每行填**可直接执行的真实命令 + 产物落点 + 当前基线数字**，不要写 "跑测试"。
-> 数字后面标注口径日期，因为它会漂移。CI 不可用的线要写明，否则把 CI 写进门禁
-> 会导致 condition 永远判不了真。**本表是锚点唯一权威源，锚点过期就更新本表。**
+🔴 **evaluator 只能防「什么都没说」，防不住「说了假的」。** 它不跑命令、不读文件，
+分不清「真跑了并粘贴输出」与「直接编出一行摘要」——所以 `subtype=success` **不是**
+完成证据，只是「agent 说它完成了」。整条链此前唯一的验真腿是人工事后核对，而人工
+正是本协议要省掉的东西。这一步就是把那条腿补回来，且**由主会话做，不是让 goal 进程
+自己做**（自证不算证）。
 
-| 线 | 可验证锚点 |
-|---|---|
-| `<线名，如：单元测试线>` | `<repo 根 pytest 命令>`，基线 **<N>** tests 全绿（<YYYY-MM-DD> 口径；派发前跑 `--collect-only -q` 复核计数）；CI 可用性=<可用/不可用及原因>；仓路径 `<绝对路径>` |
-| `<线名，如：某评测线>` | `<runner 脚本路径>`；报告落 `<产物目录>`；过线判据 `<具体检查>` |
-| `<线名，如：构建线>` | `<build 命令>` + `<test 命令>`；交付形态 = <PR / 直推 / 产物文件> |
+0. **先看 result 的三个字段，不是一个**：🔴 `subtype=success` **可以和 `is_error=true`
+   同时出现**。2026-08-05 首次真实使用第 4 步就撞上：`subtype: success` /
+   `is_error: True` / `terminal_reason: api_error`，而终态产物**根本没生成**。
+   只认 `subtype` 会把一次 API 中断判成完成。三个字段都要看：
+   `subtype` + `is_error` + `terminal_reason`（正常完成是 `terminal_reason: completed`）。
+1. **重跑终态验证命令**——condition 里 `verified by` 那条，主会话自己跑一遍，
+   与 agent 贴出的输出比对。不一致 → 判未完成。**产物不存在直接判未完成**，
+   不必看 agent 说了什么。
+2. **边界核对四项**（缺一不可）：
 
-**填表时的两个坑**：
-1. 「exit 0 即过」不够——脚本可能因路径失效而 SKIP 且 exit 0，静默空转还判通过。
-   过线标准写成「exit 0 **且**输出不含 SKIP」。
-2. 别锚死数字，锚「脚本自打印的计数行 + 公式校验」，否则代码一演进 condition 就误报。
+   | 项 | 命令 | 堵什么 |
+   |---|---|---|
+   | 被 flag 文件 mtime | `stat -f '%Sm' <files>` | 声明只读却改了文件 |
+   | 新增文件 | `ls -lT <目标目录>`（**BSD find 不支持 `-newermt`，用了会静默返回空**） | 偷偷建产物 |
+   | 新 commit | `git log --oneline <base>..HEAD` | 违规提交 |
+   | **远端动作** | `git log origin/<branch>..` + `git reflog show origin/<branch>` | **push 走本地已存在的 commit——不新建 commit、不改 mtime、不多建文件，前三项全过而铁律已破** |
 
-## 铁律库（Constraints 素材）
+3. 任何一项对不上 → 判未完成，把差异摊给用户，别拿 `subtype=success` 当收工凭据。
 
-> **填写指南**：只装**违反了会造成不可逆或高代价后果**的约束，且每条要说得出具体失败模式。
-> 可逆的、低代价的、模型看代码就能推断的，都不要往这里塞——铁律库通胀会让模型分不清
-> 哪条是真红线。能用物理机制拦住的（只读连接 / hook / permissions）优先做成机制，
-> 这里只留一行指针。
+**第 4 步不可省的实证**：某仓实测 `git rev-list --left-right --count HEAD...origin/main`
+= `4 529`——本地躺着 4 个未推 commit。agent 只要 `git push` 就破了「交付=PR 不直推」，
+而前三项审计一项都不会响。
 
-| 类别 | 填什么 |
-|---|---|
-| 数据安全 | 生产数据库 / 外部服务的只读或禁写约束，及其**机制化状态**（有 wrapper 就指过去） |
-| 算法与口径 | 不许擅自改的公式 / 权重 / 阈值，以及「动了必须人工报备」的边界 |
-| 交付纪律 | 分支命名、能不能直推、交付形态是 PR 还是产物 |
-| 数据泄漏护栏 | 评测类项目里禁止读取的真值字段等 |
-| 通用 | 不碰正交代码；不删原有死代码 |
+## 查表：锚点表 + 铁律库
+
+第 1 步的两次查表 → Read `references/anchors-and-rules.md`（**模板，装好先填**）。
+
+🔴 两条表纪律：**锚点表只登记可执行命令与前置条件，一律不写基线数字**（实测教训：某表写死「237 tests」，实际 566，且表里的解释器命令在该机根本不存在）；**铁律库命中不到具体线时必须落治理分层兜底**，否则自检 #3 会在无条目的线上真空通过。
 
 ## 常见失败模式（起草时对照）
 
@@ -182,3 +186,6 @@ allow / soft_deny / hard_deny 判据的分类器（`claude auto-mode defaults` �
 - 让无人值守任务重做人工 / 半人工判定产物（rubric verdicts 类）——评测口径只能复用，不能让 agent 重判
 - 把 CI 写进门禁而不查锚点表的 CI 可用性——CI 不可用的线写了就永远判不了真
 - 拿到任务描述直接起草，跳过第 0 步的边界判别——照单全收口述约束＝通胀
+- **在本文件里写 `$` 紧跟数字**（如金额 `$3.69`）——2026-08-05 实测：skill 加载时
+  `$3` 被当成位置参数，替换成了调用 args 里的第 3 个词，正文**静默变成垃圾且不报错**。
+  金额写 `USD 3.69`。同理，任何要展示的 shell 变量示例都要意识到这一层展开面
