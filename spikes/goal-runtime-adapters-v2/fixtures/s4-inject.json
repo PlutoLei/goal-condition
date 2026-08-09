@@ -1,0 +1,185 @@
+{
+  "diagnostic": "Postflight failed: ./out.txt missing. Create it with content DONE, then stop.",
+  "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+  "trials": [
+    {
+      "label": "candA",
+      "items": [
+        {
+          "type": "text",
+          "text": "Postflight failed: ./out.txt missing. Create it with content DONE, then stop."
+        }
+      ],
+      "threadId": "22222222-2222-4222-8222-000000000010",
+      "set": {
+        "goal": {
+          "threadId": "22222222-2222-4222-8222-000000000010",
+          "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+          "status": "active",
+          "tokenBudget": 50000,
+          "tokensUsed": 0,
+          "timeUsedSeconds": 0,
+          "createdAt": 1786007477,
+          "updatedAt": 1786007477
+        }
+      },
+      "turnStart": {
+        "turn": {
+          "id": "22222222-2222-4222-8222-000000000011",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": null,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "firstTurnDone": true,
+      "preInject": {
+        "goal": {
+          "threadId": "22222222-2222-4222-8222-000000000010",
+          "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+          "status": "active",
+          "tokenBudget": 50000,
+          "tokensUsed": 8212,
+          "timeUsedSeconds": 22,
+          "createdAt": 1786007477,
+          "updatedAt": 1786007500
+        },
+        "turnStartedCount": 2,
+        "turnCompletedCount": 1,
+        "outTxtExists": false
+      },
+      "inject": {},
+      "injectError": false,
+      "getFinal": {
+        "threadId": "22222222-2222-4222-8222-000000000010",
+        "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+        "status": "blocked",
+        "tokenBudget": 50000,
+        "tokensUsed": 11496,
+        "timeUsedSeconds": 32,
+        "createdAt": 1786007477,
+        "updatedAt": 1786007510
+      },
+      "eventsAfterInject": [
+        "item/completed",
+        "item/started",
+        "item/agentMessage/delta",
+        "thread/tokenUsage/updated",
+        "account/rateLimits/updated",
+        "thread/goal/updated",
+        "thread/status/changed",
+        "turn/completed",
+        "turn/started",
+        "mcpServer/startupStatus/updated"
+      ],
+      "turnStartedAfterInject": 1,
+      "turnCompletedAfterInject": 2,
+      "outTxtExistsFinal": false,
+      "outTxtContent": null,
+      "outTxtAppearedAtMsAfterInject": null,
+      "tokensUsedDelta": 3284,
+      "pass": false
+    },
+    {
+      "label": "candB",
+      "items": [
+        {
+          "type": "message",
+          "role": "user",
+          "content": [
+            {
+              "type": "input_text",
+              "text": "Postflight failed: ./out.txt missing. Create it with content DONE, then stop."
+            }
+          ]
+        }
+      ],
+      "threadId": "22222222-2222-4222-8222-000000000012",
+      "set": {
+        "goal": {
+          "threadId": "22222222-2222-4222-8222-000000000012",
+          "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+          "status": "active",
+          "tokenBudget": 50000,
+          "tokensUsed": 0,
+          "timeUsedSeconds": 0,
+          "createdAt": 1786007552,
+          "updatedAt": 1786007552
+        }
+      },
+      "turnStart": {
+        "turn": {
+          "id": "22222222-2222-4222-8222-000000000013",
+          "items": [],
+          "itemsView": "notLoaded",
+          "status": "inProgress",
+          "error": null,
+          "startedAt": null,
+          "completedAt": null,
+          "durationMs": null
+        }
+      },
+      "firstTurnDone": true,
+      "preInject": {
+        "goal": {
+          "threadId": "22222222-2222-4222-8222-000000000012",
+          "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+          "status": "active",
+          "tokenBudget": 50000,
+          "tokensUsed": 8422,
+          "timeUsedSeconds": 23,
+          "createdAt": 1786007552,
+          "updatedAt": 1786007576
+        },
+        "turnStartedCount": 2,
+        "turnCompletedCount": 1,
+        "outTxtExists": false
+      },
+      "inject": {},
+      "injectError": false,
+      "getFinal": {
+        "threadId": "22222222-2222-4222-8222-000000000012",
+        "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
+        "status": "complete",
+        "tokenBudget": 50000,
+        "tokensUsed": 19846,
+        "timeUsedSeconds": 43,
+        "createdAt": 1786007552,
+        "updatedAt": 1786007596
+      },
+      "eventsAfterInject": [
+        "item/started",
+        "item/completed",
+        "item/agentMessage/delta",
+        "thread/tokenUsage/updated",
+        "account/rateLimits/updated",
+        "turn/diff/updated",
+        "thread/goal/updated",
+        "mcpServer/startupStatus/updated",
+        "thread/status/changed",
+        "turn/completed"
+      ],
+      "turnStartedAfterInject": 0,
+      "turnCompletedAfterInject": 1,
+      "outTxtExistsFinal": true,
+      "outTxtContent": "DONE\n",
+      "outTxtAppearedAtMsAfterInject": 10015,
+      "tokensUsedDelta": 11424,
+      "pass": true
+    }
+  ],
+  "pass": true,
+  "winningShape": {
+    "type": "message",
+    "role": "user",
+    "content": [
+      {
+        "type": "input_text",
+        "text": "Postflight failed: ./out.txt missing. Create it with content DONE, then stop."
+      }
+    ]
+  }
+}

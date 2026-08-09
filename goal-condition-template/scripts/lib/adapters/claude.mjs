@@ -1,0 +1,231 @@
+// Claude runtime adapter 纯函数。执行豁口在 scripts/launch.mjs；本文件不 spawn、不读写盘。
+
+// 版本闸是**下限**不是精确 allowlist。它想挡的是 result envelope 形状漂移，可那是个代理指标——
+// 真正要防的东西下面的 21-key 全集校验已经**直接**在管：envelope 没变的新版本被精确 allowlist 拦下
+// 是纯误杀，envelope 真变了的新版本直检照样红且诊断更精确。代理指标严于直接指标，代价却是 claude
+// 每隔几天升一次版就「工具不可用」（2026-08-09 真实触发：2.1.225 上线，allowlist 只有 2.1.223），
+// 而那种闸的真实结局是有人把它注释掉。下限只排除已知过旧的版本。
+export const CLAUDE_VERSION_FLOOR = '2.1.223';
+
+// 实测锚定版本 2.1.223 的 result envelope 完整 key 集（spike S3 抓取）。SDK 文档与实现存在字段漂移，
+// 以实测集为准；升版改了 envelope 由 normalizeTerminal 落红，核对新版本 envelope 后再改这张表。
+export const CLAUDE_RESULT_KEYS = Object.freeze([
+  'api_error_status', 'duration_api_ms', 'duration_ms', 'fast_mode_disabled_reason',
+  'fast_mode_state', 'is_error', 'modelUsage', 'num_turns', 'permission_denials',
+  'result', 'session_id', 'stop_reason', 'subtype', 'terminal_reason',
+  'time_to_request_ms', 'total_cost_usd', 'ttft_ms', 'ttft_stream_ms', 'type', 'usage', 'uuid',
+]);
+
+const EXPECTED_KEYS = new Set(CLAUDE_RESULT_KEYS);
+
+// 版本闸放宽成下限之后，「新版本改了 result envelope」全靠这道直检兜底，所以诊断必须直接指路：
+// 只说「多了 N 个未知 key」的操作员不知道下一步该干什么。隐私纪律不变——只给计数，不回显 key 名。
+const DRIFT_HINT = 'this may be a claude upgrade drifting the result envelope: '
+  + "re-check the new version's result envelope, then update CLAUDE_RESULT_KEYS";
+
+export function normalizeTerminal(raw) {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, reasons: ['Claude result must be an object'] };
+  }
+  const actual = Object.keys(raw);
+  const missing = CLAUDE_RESULT_KEYS.filter((key) => !Object.hasOwn(raw, key));
+  const unknown = actual.filter((key) => !EXPECTED_KEYS.has(key));
+  const reasons = [];
+  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${DRIFT_HINT}`);
+  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${DRIFT_HINT}`);
+  if (reasons.length) return { ok: false, reasons };
+  return {
+    ok: true,
+    candidate: {
+      subtype: raw.subtype,
+      is_error: raw.is_error,
+      terminal_reason: raw.terminal_reason,
+      permission_denials: raw.permission_denials,
+    },
+  };
+}
+
+export const MAX_HOOK_BLOCKS = 8;
+
+// hook 是续轮驱动器不是验收：它的结论不进任何 controller 证据通道，
+// hook 全绿仍可能被控制器独立 postflight 推翻（如越权 mutation 仅 baseline compare 可见）。
+export function buildStopHook({ contract, stateDir }) {
+  const entries = contract.postflight.map(({ id, cwd, argv }) => ({ id, cwd, argv }));
+  const budget = contract.budget;
+  const maxBlocks = budget?.user_provided && typeof budget.max_turns === 'number'
+    ? Math.min(MAX_HOOK_BLOCKS, Math.floor(budget.max_turns)) : MAX_HOOK_BLOCKS;
+  const maxWallMs = budget?.user_provided && typeof budget.max_minutes === 'number'
+    ? Math.round(budget.max_minutes * 60_000) : null;
+  const script = `#!/usr/bin/env node
+// controller 生成的 Stop hook（达标判定，多红收集不抛）。生成器: scripts/lib/adapters/claude.mjs
+import { execFileSync } from 'node:child_process';
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const stateDir = ${JSON.stringify(stateDir)};
+const entries = ${JSON.stringify(entries)};
+const maxBlocks = ${maxBlocks};
+const maxWallMs = ${maxWallMs === null ? 'null' : maxWallMs};
+
+const envFile = join(stateDir, 'hook-env.json');
+const extraEnv = existsSync(envFile) ? JSON.parse(readFileSync(envFile, 'utf8')) : {};
+const env = { ...process.env, ...extraEnv };
+
+const startedAtFile = join(stateDir, 'hook-started-at');
+if (!existsSync(startedAtFile)) writeFileSync(startedAtFile, String(Date.now()));
+const startedAt = Number(readFileSync(startedAtFile, 'utf8'));
+
+const reds = [];
+for (const entry of entries) {
+  try {
+    execFileSync(entry.argv[0], entry.argv.slice(1), { cwd: entry.cwd, env, stdio: 'ignore' });
+  } catch {
+    reds.push(entry.id);
+  }
+}
+
+const countFile = join(stateDir, 'hook-blocks.count');
+const blocks = existsSync(countFile) ? Number(readFileSync(countFile, 'utf8')) : 0;
+const overWall = maxWallMs !== null && Date.now() - startedAt > maxWallMs;
+let decision = 'allow';
+if (reds.length > 0 && blocks < maxBlocks && !overWall) {
+  decision = 'block';
+  writeFileSync(countFile, String(blocks + 1));
+}
+appendFileSync(join(stateDir, 'hook-runs.jsonl'),
+  JSON.stringify({ ts: Date.now(), reds, decision }) + '\\n');
+if (decision === 'block') {
+  const reason = 'postflight not green yet: ' + reds.join(', ')
+    + '. Continue working toward the original objective, make these checks pass, then finish.';
+  const reasonStr = JSON.stringify(reason);
+  process.stdout.write('{"decision":"block","reason":' + reasonStr + '}');
+}
+process.exit(0);
+`;
+  return { script };
+}
+
+function shellSingleQuote(value) {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildSettings({ hookScriptPath, stateDir }) {
+  return {
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: `node ${shellSingleQuote(hookScriptPath)}` }] }] },
+    // S5 实测：Edit deny 对简单 Bash 重定向也有效（permission_denials 实录 tool_name:Bash），
+    // 但精确上限（语义级 vs 字面匹配）INCONCLUSIVE——不宣称完全物理保证。
+    // deny 路径必须是 realpath 规范形（/var/folders vs /private/var/folders 的字面失配会让 deny 落空）。
+    permissions: { deny: [`Edit(/${hookScriptPath})`, `Edit(/${stateDir}/**)`] },
+  };
+}
+
+export const CLI_MAX_TURNS = 50;
+
+// 用户显式给的 max_turns 与 CLI 默认上限取 min——与 launch.mjs 的 effectiveDeadlineMs 对
+// max_minutes 的处置同形，用户明给的预算不能被更宽的默认值盖过。gate 与 buildStopHook 的
+// maxBlocks 逐字一致（user_provided 且是数字才算数），两处不能对同一个字段各认各的。
+export function effectiveMaxTurns(budget) {
+  return budget?.user_provided && typeof budget.max_turns === 'number'
+    ? Math.min(CLI_MAX_TURNS, Math.floor(budget.max_turns))
+    : CLI_MAX_TURNS;
+}
+
+export function launchSpec({ prompt, settingsPath, cwd, budget }) {
+  // prompt 由调用方从权限受控文件 bytes 读出、单 argv 传入（现行规则）；本函数纯数据不执行。
+  return {
+    argv: ['claude', '-p', prompt, '--output-format', 'json', '--settings', settingsPath,
+      '--permission-mode', 'acceptEdits', '--max-turns', String(effectiveMaxTurns(budget))],
+    settingsPath, cwd, env_names: [],
+  };
+}
+
+export function resumeSpec({
+  sessionId, settingsPath, diagnosticText, cwd, budget,
+}) {
+  return {
+    argv: ['claude', '-p', diagnosticText, '--resume', sessionId, '--output-format', 'json',
+      '--settings', settingsPath, '--permission-mode', 'acceptEdits',
+      '--max-turns', String(effectiveMaxTurns(budget))],
+    settingsPath, cwd, env_names: [],
+  };
+}
+
+const DIGEST = /^[0-9a-f]{64}$/;
+
+// `2.1.225`、`2.1.223 (Claude Code)`、带前导空白或换行的 --version 原样输出都要能解析；取不到三段
+// 数字返回 null。launch.mjs 的采集器在 --version 输出不含三段数字时也给 null，两边同形。
+function parseVersion(value) {
+  const match = typeof value === 'string' ? /^\s*v?(\d+)\.(\d+)\.(\d+)\b/.exec(value) : null;
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
+}
+
+// 逐段数值比较。字符串字典序在这里是错的：它会把 2.1.9 判成不低于 2.1.223、把 2.1.1000 判成更旧。
+function versionFloorReason(claudeVersion) {
+  const actual = parseVersion(claudeVersion);
+  // 解析不出来 = 未知形态，不是放行理由（fail closed）。
+  if (actual === null) {
+    return `claude version is unreadable, so the ${CLAUDE_VERSION_FLOOR} minimum cannot be verified`;
+  }
+  const floor = parseVersion(CLAUDE_VERSION_FLOOR);
+  for (let i = 0; i < 3; i += 1) {
+    if (actual[i] !== floor[i]) {
+      return actual[i] < floor[i]
+        ? `claude version is older than the tested minimum: at least ${CLAUDE_VERSION_FLOOR} is required`
+        : null;
+    }
+  }
+  return null;
+}
+
+function settingsContainKey(value, forbidden) {
+  if (value === null || typeof value !== 'object') return false;
+  return Object.keys(value).some((key) => forbidden.includes(key))
+    || Object.values(value).some((child) => settingsContainKey(child, forbidden));
+}
+
+// contract 参与判定的部分只有 constraints 的 physical 核验（见下）；hash 与 binding 的核验在
+// workflow.mjs binding 层。
+export function assertLaunchable(contract, probes) {
+  const reasons = [];
+  if (!DIGEST.test(probes?.contractHash ?? '')) reasons.push('contractHash must be lowercase SHA-256');
+  if (probes?.confirmedHash !== probes?.contractHash) reasons.push('confirmed hash does not match contract hash');
+  if (probes?.baselineDigestStored !== true) reasons.push('baseline digest is not stored in trusted orchestration state');
+  const versionReason = versionFloorReason(probes?.claudeVersion);
+  if (versionReason !== null) reasons.push(versionReason);
+  if (settingsContainKey(probes?.settings, ['disableAllHooks', 'allowManagedHooksOnly'])) {
+    reasons.push('settings must not disable or restrict hooks');
+  }
+  const hook = probes?.hookScript;
+  const deny = probes?.settings?.permissions?.deny ?? [];
+  if (!hook?.exists) reasons.push('hook script is not on disk in controller state');
+  if (hook?.sha256 !== probes?.expectedHookSha256) reasons.push('hook script bytes do not match the generated script');
+  if (hook?.mode !== '0500') reasons.push('hook script mode must be 0500');
+  // 下面两条 deny 检查守的是**本文件的生成器**，不是篡改：生产路径上 probes.settings 就是
+  // buildSettings 现场生成、并由 launch.mjs 覆写回磁盘的那一份（judged object = consumed object
+  // 由构造保证，见 launch.mjs 的 writeReplacing(settingsPath, ...)），所以这两行在那条路径上是
+  // 同义反复。它们真正拦得住的是「buildSettings 将来被改坏、少生成一条 deny」——那时 launch
+  // 仍会照常起飞，只有这里能红。别把它读成防篡改闸。
+  if (!deny.includes(`Edit(/${hook?.path})`)) reasons.push('settings must deny Edit on the hook script path');
+  // state 目录那条护的是 hook-runs.jsonl / hook-env.json / probes.json，
+  // 少了它 hook 脚本本身没被改、留痕却可以被抹掉。stateDir 缺失时拼不出规则，天然落红。
+  if (!deny.includes(`Edit(/${probes?.stateDir}/**)`)) {
+    reasons.push('settings must deny Edit on the whole controller state directory');
+  }
+  if ((probes?.targetRoots ?? []).some((root) => typeof hook?.path === 'string' && hook.path.startsWith(`${root}/`))) {
+    reasons.push('hook script must live outside every target root');
+  }
+  // buildSettings 不接收 contract：生成的 deny 恒为「hook 脚本 + state 目录」两条，护的都是控制器
+  // 自己的机件。也就是说 claude runtime 上根本不存在面向用户约束的物理拦截面，任何
+  // enforcement:"physical" 都不成立，一律红——降级成 audit_only 是 contract 作者的决定，执行层
+  // 只负责停车。曾经的判据是「mechanism 必须逐字点名一条生成的 deny 规则」：行为同样是红，但
+  // 诊断在骗人——它读起来像「改 mechanism 就能过」，而那两条 deny 含 contractHash（还含 prepare
+  // 才知道的 stateRoot/controller），把它写进 contract 会改掉 hash，是个不动点陷阱。故 reason 直说
+  // 真因，且刻意不提 mechanism（N1）。
+  for (const constraint of contract?.constraints ?? []) {
+    if (constraint?.enforcement !== 'physical') continue;
+    reasons.push(`constraint ${constraint.id ?? '?'} declares physical enforcement, which the claude `
+      + 'runtime cannot support: this adapter generates deny rules only for its own hook script and '
+      + 'state directory, never for user-facing constraints, so rewrite the constraint as audit_only');
+  }
+  return { ok: reasons.length === 0, reasons };
+}

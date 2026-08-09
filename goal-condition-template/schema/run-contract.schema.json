@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Goal-condition run contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "runtime",
+    "objective",
+    "context_sources",
+    "target_roots",
+    "judgment_criteria",
+    "success_criteria",
+    "constraints",
+    "allowed_mutations",
+    "preflight",
+    "postflight"
+  ],
+  "properties": {
+    "version": {"const": 1},
+    "runtime": {"enum": ["claude", "codex"]},
+    "objective": {"type": "string", "minLength": 1},
+    "context_sources": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/contextSource"}
+    },
+    "target_roots": {"$ref": "#/$defs/pathList", "minItems": 1},
+    "judgment_criteria": {"$ref": "#/$defs/judgmentCriteria", "minItems": 1},
+    "success_criteria": {"$ref": "#/$defs/successCriteria", "minItems": 1},
+    "constraints": {"type": "array", "items": {"$ref": "#/$defs/constraint"}},
+    "allowed_mutations": {"$ref": "#/$defs/allowedMutations"},
+    "budget": {"$ref": "#/$defs/budget"},
+    "preflight": {"type": "array", "items": {"$ref": "#/$defs/preflightEntry"}, "minItems": 1},
+    "postflight": {"type": "array", "items": {"$ref": "#/$defs/commandEntry"}, "minItems": 1}
+  },
+  "$defs": {
+    "nonEmptyString": {"type": "string", "minLength": 1},
+    "pathList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
+    "stringList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
+    "id": {"type": "string", "minLength": 1},
+    "contextSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "path": {"$ref": "#/$defs/nonEmptyString"},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "judgmentCriteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "rule", "why"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "rule": {"$ref": "#/$defs/nonEmptyString"},
+          "why": {"$ref": "#/$defs/nonEmptyString"}
+        }
+      }
+    },
+    "successCriteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "command", "expected"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "command": {"$ref": "#/$defs/nonEmptyString"},
+          "expected": {"$ref": "#/$defs/nonEmptyString"}
+        }
+      }
+    },
+    "constraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "rule", "enforcement"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "rule": {"$ref": "#/$defs/nonEmptyString"},
+        "enforcement": {"enum": ["physical", "audit_only"]},
+        "mechanism": {"type": "string"},
+        "verify": {"type": "string"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"enforcement": {"const": "physical"}}},
+          "then": {
+            "required": ["mechanism", "verify"],
+            "properties": {
+              "mechanism": {"type": "string", "minLength": 1},
+              "verify": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      ]
+    },
+    "allowedMutations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["files", "git", "external"],
+      "properties": {
+        "files": {"$ref": "#/$defs/stringList"},
+        "git": {"$ref": "#/$defs/stringList"},
+        "external": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user_provided"],
+      "anyOf": [
+        {"required": ["max_turns"]},
+        {"required": ["max_minutes"]},
+        {"required": ["max_tokens"]},
+        {"required": ["max_cost_usd"]}
+      ],
+      "properties": {
+        "user_provided": {"const": true},
+        "max_turns": {"type": "integer", "exclusiveMinimum": 0},
+        "max_minutes": {"type": "number", "exclusiveMinimum": 0},
+        "max_tokens": {"type": "number", "exclusiveMinimum": 0},
+        "max_cost_usd": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "gitEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "target"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"const": "git"},
+        "target": {"$ref": "#/$defs/nonEmptyString"},
+        "require_branch": {"type": "string", "minLength": 1},
+        "require_clean": {"type": "boolean"},
+        "require_upstream": {"type": "boolean"}
+      }
+    },
+    "pathEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "target", "require"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"const": "path"},
+        "target": {"$ref": "#/$defs/nonEmptyString"},
+        "require": {"enum": ["file", "directory", "exists"]}
+      }
+    },
+    "commandEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "cwd", "argv"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"const": "command"},
+        "cwd": {"$ref": "#/$defs/nonEmptyString"},
+        "argv": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonEmptyString"}},
+        "requires_env": {"type": "array", "items": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"}},
+        "capture": {"enum": ["hash", "text"]}
+      }
+    },
+    "preflightEntry": {
+      "oneOf": [
+        {"$ref": "#/$defs/gitEntry"},
+        {"$ref": "#/$defs/pathEntry"},
+        {"$ref": "#/$defs/commandEntry"}
+      ]
+    }
+  }
+}

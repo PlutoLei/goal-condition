@@ -1,0 +1,175 @@
+{
+  "runs": [
+    {
+      "threadId": "22222222-2222-4222-8222-000000000005",
+      "cases": [
+        {
+          "label": "create",
+          "requested": {
+            "objective": "Write DONE into ./out.txt then stop.",
+            "tokenBudget": 50000
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "to-complete",
+          "requested": {
+            "status": "complete"
+          },
+          "setStatus": "complete",
+          "setTokensUsed": 0,
+          "getStatus": "complete",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "pull-active-plain",
+          "requested": {
+            "status": "active"
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "to-budget",
+          "requested": {
+            "status": "budgetLimited"
+          },
+          "setStatus": "budgetLimited",
+          "setTokensUsed": 0,
+          "getStatus": "budgetLimited",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "pull-active-with-budget",
+          "requested": {
+            "status": "active",
+            "tokenBudget": 1000000
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        }
+      ]
+    },
+    {
+      "threadId": "22222222-2222-4222-8222-000000000006",
+      "cases": [
+        {
+          "label": "create",
+          "requested": {
+            "objective": "Write DONE into ./out.txt then stop.",
+            "tokenBudget": 50000
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "to-complete",
+          "requested": {
+            "status": "complete"
+          },
+          "setStatus": "complete",
+          "setTokensUsed": 0,
+          "getStatus": "complete",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "pull-active-plain",
+          "requested": {
+            "status": "active"
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "to-budget",
+          "requested": {
+            "status": "budgetLimited"
+          },
+          "setStatus": "budgetLimited",
+          "setTokensUsed": 0,
+          "getStatus": "budgetLimited",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "pull-active-with-budget",
+          "requested": {
+            "status": "active",
+            "tokenBudget": 1000000
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        }
+      ]
+    },
+    {
+      "threadId": "22222222-2222-4222-8222-000000000007",
+      "cases": [
+        {
+          "label": "create",
+          "requested": {
+            "objective": "Write DONE into ./out.txt then stop.",
+            "tokenBudget": 50000
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "to-complete",
+          "requested": {
+            "status": "complete"
+          },
+          "setStatus": "complete",
+          "setTokensUsed": 0,
+          "getStatus": "complete",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "pull-active-plain",
+          "requested": {
+            "status": "active"
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "to-budget",
+          "requested": {
+            "status": "budgetLimited"
+          },
+          "setStatus": "budgetLimited",
+          "setTokensUsed": 0,
+          "getStatus": "budgetLimited",
+          "getTokensUsed": 0
+        },
+        {
+          "label": "pull-active-with-budget",
+          "requested": {
+            "status": "active",
+            "tokenBudget": 1000000
+          },
+          "setStatus": "active",
+          "setTokensUsed": 0,
+          "getStatus": "active",
+          "getTokensUsed": 0
+        }
+      ]
+    }
+  ]
+}

@@ -2,7 +2,15 @@
 
 给 agent 派活时，别写操作手册，写边界。
 
-这是两个配套的 [Claude Code skill](https://code.claude.com/docs/en/skills)：**boundary-design** 判断一件事该管什么、不该管什么、该管到什么形式；**goal-condition** 把结论编译成 `/goal` 无人值守任务能吃下的完成条件。
+整条链路是三步——**边界 → 目标 → 执行**：
+
+| 步 | 做什么 | 由谁 |
+|---|---|---|
+| **边界** | 把任务砍成一张边界包：硬边界、判断标准、验收物、放层清单 | `boundary-design` |
+| **目标** | 把边界包编译成一份可校验的 run contract——canonical JSON，一个自含 objective，逐字节确认 hash | `goal-condition-template/` 的 compiler / validator |
+| **执行** | 以已确认的 contract 启动 Claude Code 或 Codex，跑完由**主会话独立终验**，执行会话不能自证完成 | runtime adapter + postflight |
+
+公开仓只保存脱敏的核心协议、adapter、脚本和测试；具体项目的事实、锚点与核验来源由私有 profile 在安装时注入。
 
 ## 为什么
 
@@ -12,61 +20,125 @@ Boris Cherny（Claude Code 作者）给过最简式：*"Describe the task, descr
 
 boundary-design 的主要动作是**砍**：对每条候选约束问四个问题，判断它该不该存在、该存在于哪一层、该用什么形式表达。用完之后规则变多了，多半是用错了。
 
-## 两个 skill
+## boundary-design 输出
 
-### boundary-design
+`boundary-design` 输出一张边界包，供人审阅或继续编译为 run contract：
 
-输入一个目标加背景，输出一张「边界包」：
-
-```
+```text
 GOAL: <一句话，带语境>
-硬边界（目标 ≤5 条）:      每条必须对应一个说得出口的高代价失败模式
+硬边界（目标不超过五条）:  每条必须对应一个说得出口的高代价失败模式
 判断标准（每条带 why）:     给现场可观测的判据来源，不给结论
-待机制化:                  能物理拦截的别靠文字
-验收物:                    可测量终态 + 需要表面化的证据
-资源边界:                  turn / token / 时间上限
-放层清单:                  每条边界 → 它成立的最小作用域
+待机制化:                    能物理拦截的别靠文字
+验收物:                      可测量终态 + 需要表面化的证据
+资源边界:                    用户明确给出的 turn / token / 时间上限
+放层清单:                    每条边界 → 它成立的最小作用域
 ```
 
 核心是**四判断题**（代价定硬度 / 可推断定写不写 / 作用域定放层 / 可机制化定形式）和**表达形式阶梯**：
 
-```
+```text
 文字规则 < 判断标准 < 接口结构 < 验收物 < 物理机制
 ```
 
-能往高处走就往高处走。阶梯高处的边界不占上下文、不怕被忽略、不需要被「记得」。
+能往高处走就往高处走。阶梯高处的边界不占上下文、不怕被忽略、不需要被「记得」。硬边界为空也完全正常：多数任务只需要判断标准和验收物。
 
-有一点反直觉但很重要：**「硬边界为空」应该是常态**。绝大多数任务只需要判断标准和验收物。
+## goal-condition 的当前架构
 
-### goal-condition（模板）
+核心协议不是运行时专属的长提示词。它以 canonical JSON run contract 为唯一权威 artifact：一个 contract 只容纳一个自含 objective，完整记录 content-bound 稳定上下文、目标根、判断标准、验收标准、边界、允许变更、preflight、postflight 与有明确用户来源的资源上限。每个 `context_sources` entry 都绑定唯一 ID、绝对稳定路径和文件 bytes 的 SHA-256；未知字段、临时上下文、重复 ID、伪装为物理机制的文字约束和 shell 字符串执行入口都会 fail closed。
 
-`/goal` 的 evaluator 不跑命令、不读文件，只看已经表面化在对话里的内容。条件写宽了提前判假完成，写窄了无限空转烧 token。这个 skill 用三步协议管住它：起草（查锚点表 + 铁律库 + 实测每个硬数字）→ 弹回会话过 6 项自检 → **用户明确确认才 pbcopy**。
+| 阶段 | 责任 | 不可跳过的条件 |
+|---|---|---|
+| `boundary-design` | 产出平台无关的边界包 | 目标、判据、约束与验收物可审阅 |
+| compiler / validator | 编译并校验 canonical run contract | contract bytes 必须 byte-identical 且通过 closed-world 校验 |
+| preview / confirm | 展示完整 canonical JSON 与 SHA-256 | 用户明确确认当前 hash；任何字节变化都必须重新确认 |
+| preflight | 核对 context bytes，capture 启动前 Git、路径与结构化命令基线 | baseline 原子落盘，并将 `baseline_digest` 保存在 baseline 文件之外的可信编排状态 |
+| runtime adapter | 以已确认 contract 启动 Claude 或 Codex | 不补写目标、预算或权限承诺 |
+| postflight / close | 主会话独立复验产物与边界 | 使用原先保存的 digest 比较基线；任一差异都不得完成 |
 
-仓里这份是**模板**：锚点表和铁律库是空壳加填写指南，装到你项目里要先填成你自己的内容。原版含所属组织的内部信息，未随仓发布。
+`success_criteria.command` 仅是给人审阅的精确命令说明。机器执行只接受 `cwd` 加 `argv[]` 的结构化 command；不会使用 `eval`、`sh -c` 或 shell 拼接。
 
-## 安装
+### 完整 preview、hash 与基线握手
 
-```bash
-# 全局（所有项目可用）——方法论适合放这层
-cp -r boundary-design ~/.claude/skills/
+在任何启动前，先运行 validator 的 `--preview`。它会展示完整的 canonical artifact（包括嵌套的 preflight 与 postflight 参数）和绑定该 bytes 的 SHA-256。确认的是这个精确 hash，不是“语义大致相同”的 JSON。
 
-# 项目级——goal-condition 装这层，因为它的锚点表是项目特有的
-mkdir -p <你的项目>/.claude/skills
-cp -r goal-condition-template <你的项目>/.claude/skills/goal-condition
+确认后才 capture baseline。Snapshot schema v3 会绑定 context bytes/mode、文件与目录 mode、Git refs/index/effective material、Git clean-filter 投影后的 effective objects、带 blob bytes hash 的 committed tree，以及 exact baseline/current HEAD ancestry evidence。Refs 仍从正常 Git 视图完整枚举，但任何非空 `refs/replace` 都会被拒绝；commit/tree/blob 与 effective material 的读取统一使用 `--no-replace-objects`。每个 committed blob 只流式读取一次，同时计算 raw SHA-256 和由 repository object format、声明 size 与 bytes 得出的 canonical object ID，二者都会进入或约束可信 tree material；computed object ID 必须等于 tree 中的 object ID。比较器即使在 HEAD 未变化时也会逐项比较 tree，任何同 HEAD 或同 object identity 下的 material drift 都作为完整性错误拒绝，不能被允许路径放行。Snapshot 同时拒绝 shallow history 与 graft metadata；只有当前 branch ref 唯一前移到 baseline 的真实后代才算允许的 commit。capture 输出的 `baseline_digest` 必须由编排器保存到 baseline 文件之外，并与已确认 contract hash 绑定。postflight 验证必须显式传回该受信任 digest；不得从可能已经被替换的 baseline 文件重新计算后当作信任来源。digest 验证 baseline 完整性，不能替代对成功产物或外部副作用的独立 verifier。
+
+```text
+node goal-condition-template/scripts/validate-contract.mjs --contract <CONTRACT_FILE> --preview
+node goal-condition-template/scripts/snapshot.mjs capture --contract <CONTRACT_FILE> --out <BASELINE_FILE>
+node goal-condition-template/scripts/snapshot.mjs verify --contract <CONTRACT_FILE> --baseline <BASELINE_FILE> --expected-baseline-digest <TRUSTED_BASELINE_DIGEST>
 ```
 
-两个 skill 都是自动触发。说「定个边界」「设条红线」「这活丢给 goal 跑」之类就会起来，也可以 `/boundary-design` 直接叫。
+## 运行时 adapter
 
-## 关于案例库
+Claude 与 Codex 共用同一 contract 和基线握手，但终态按各自接口单独解释。两个 adapter 都要求由启动任务的主会话独立完成 postflight；执行会话贴出的成功文本不是完成证据。
 
-原版 skill 带一个 `references/badcases.md` 正反例库，因含内部信息未发布。**强烈建议你自建一份**，用你自己项目里的真事故——比任何合成用例都值钱。几个攒法：
+| Runtime | 候选终态 | 主会话完成链 |
+|---|---|---|
+| Claude Code | 只含 `subtype=success`、`is_error=false`、`terminal_reason=completed`、空 `permission_denials` 的 exact result | 独立执行 postflight 与 baseline compare，提交 bound controller evidence 后才 Close |
+| Codex | 精确的 `status=ready_for_postflight` 且 `remaining_work=false` | `postflight` → `finalize_runtime`（`thread/goal/set`）→ `verify_runtime`（`thread/goal/get`）→ complete |
 
-- **锚点腐烂**比规则通胀更高发。迁移、离职、重构之后，文字层的路径 / 组织名 / 人名 / commit hash 没人更新，而失效是静默的。做过一次全量审计的话，把失效指针的比例记下来。
-- **验收物自己也会腐烂**。见过一个快速检查脚本因为旧路径而 SKIP 且 exit 0，被清单判为「通过」，静默空转十天。所以过线标准要写「exit 0 且输出不含 SKIP」。
-- **物理机制的失败是静默的**。文字规则失败是「被忽略」，人看得见；物理机制失败是「作用域写错」——它照常拦截，只是拦错了对象，一声不吭。往阶梯上层走不是免费的，要额外验作用域。
-- **检索作用域假阴性**。判断「这条约束项目里有没有落点」时，grep 返回空不会告诉你是真没有还是没搜到。产边界包前把边界载体逐类扫一遍：README、代码注释、测试名、配置、CLAUDE.md、物理机制。跳过任何一类都可能把已写好的当缺失的重写一遍——而重写正是通胀的来源。
+两个 runtime 都必须先由主会话建立 controller-owned `runBinding`，并提交同一 binding 的 `preflightEvidence` 后才能 launch；两者的独立终验也都使用 bound `postflightEvidence`。Codex 另外要求 `finalizationReceipt` 与 `runtimeReadback`。候选 runtimeResult 不得伪造这些证据；任何缺项、乱序、cross-binding、blocked、权限错误或 remaining work 都 fail closed。
 
-  这类失误一天之内可以复发四次：限定了错的文件类型、shell glob 没展开、关键词表漏了最关键那个词、以及用了 GNU 的 `find -newermt` 而 BSD find 静默返回空。共同形态是**工具照常返回、退出码 0、零报错**，只是覆盖面不对。防法是先拿一个已知必然命中的对照样本验证检索方法本身，再信它的空结果——验证脚本静默失效比被验对象出错更危险。
+## 安装与私有 profile
+
+安装器从明确的 Git commit 物化共享核心，而不是复制目录。它把私有 profile 注入 release，并为 Claude 与 Codex 创建指向同一 release 的链接；profile 不应提交到这个公开仓。安装输出包含 `manifestDigest`，它是 release 外部（external）保留的信任根，不能从待验证 release 自己重建。本节两段命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`，两者指的是同一个文件，差别只在你站在哪一层。下面仅展示参数形状，所有值都是占位符，示例不执行安装：
+
+```text
+node goal-condition-template/scripts/install.mjs install \
+  --repo <PUBLIC_REPOSITORY> \
+  --ref <COMMIT_SHA> \
+  --profile <PRIVATE_PROFILE_FILE> \
+  --release-root <RELEASE_DIRECTORY> \
+  --link claude=<CLAUDE_SKILL_LINK> \
+  --link codex=<CODEX_SKILL_LINK>
+```
+
+安装后保存输出的 `manifestDigest`。验证指定 release 时必须显式传回这个外部值；verifier 会先校验原始 manifest bytes，再核对 closed-world 文件 hashes、core 的 exact Git-derived mode、profile `0600`、manifest `0644`，以及 release root 和所有必需目录的 `0755`；四位八进制比较也会拒绝 setuid、setgid 与 sticky bits：
+
+```text
+node goal-condition-template/scripts/install.mjs verify \
+  --release <RELEASE_DIRECTORY> \
+  --expected-manifest-digest <TRUSTED_MANIFEST_DIGEST>
+```
+
+Release 只允许以下完整核心集；pinned commit 缺少任何一项都会在 release、backup 或 runtime link 变更前失败：
+
+- `SKILL.md`
+- `references/run-contract.md`
+- `references/adapters/claude.md`
+- `references/adapters/codex.md`
+- `schema/run-contract.schema.json`
+- `scripts/validate-contract.mjs`
+- `scripts/snapshot.mjs`
+- `scripts/install.mjs`
+- `scripts/lib/contract.mjs`
+- `scripts/lib/snapshot.mjs`
+- `scripts/lib/installer.mjs`
+- `scripts/lib/workflow.mjs`
+- `scripts/launch.mjs`
+- `scripts/lib/adapters/claude.mjs`
+- `scripts/lib/adapters/codex.mjs`
+
+安装事务对 runtime link parent、release root 与 backup root 的物理 directory identity 反复核对；stage、backup、cutover、readback、rollback 或 owned cleanup 期间发生祖先重定向都会 fail closed。
+
+## 测试
+
+从仓库根目录运行完整回归：
+
+```text
+npm test
+```
+
+测试覆盖 contract 的 closed-world 校验、canonical JSON/hash、状态机、基线 capture/compare、commit-pinned installer、adapter 静态契约、公开 Markdown 的隐私/loader 门禁，以及五类 paired pressure samples。自动测试不会启动真实 goal、访问网络或写入真实 runtime 安装位置；installer 回归会在测试专属临时目录中执行真实 materialize、backup、atomic link switch、rollback 与 TOCTOU fault injection。
+
+`goal-condition-template/evidence/pressure-evidence.json` 保存 prompt injection、多目标压力、伪 physical mechanism、临时 context 和虚假完成五类无工具、无私有上下文的成对模型样本。它用于公开审阅指令是否改变模型行为；model sample evidence is not deterministic unit proof，也不替代 schema、状态机与故障注入测试。`pressure-cases.json` 只是确定性的状态机 regression fixture，不被包装成独立行为实验。
+
+## 历史评估说明
+
+仓库曾有一次合成用例评估与一次真实任务 dogfood。它们属于**历史三步版协议**的材料：合成用例与判分同出一个生成器、没有独立真值路径，也没有针对已知缺陷的失败注入。这些结果不构成当前跨运行时实现、hash 确认、baseline digest 握手或 controller-owned Codex 完成链的证据。
+
+历史 dogfood 仍提供一个方法论观察：口述的四条业务约束经现场核实全部已有落点，边界包的文字层应当为空。在维护良好的项目里，boundary design 的主要工作是核实与指路，不是撰写。
 
 ## 出处
 
@@ -82,14 +154,6 @@ cp -r goal-condition-template <你的项目>/.claude/skills/goal-condition
 - [Prompting Claude Opus 5](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-5)
 
 「删掉 80% 系统提示词而评测无可测量下降」这个数字只引官方口径 *"over 80% … no measurable loss on our coding evaluations"*；流传的「2,686→514 词」是第三方测量且对应关闭 memory 的口径，不当官方数字引。"unhobbling" 一词源自 Leopold Aschenbrenner 的 *Situational Awareness*。
-
-官方从未使用 "boundary design" 这个词，对齐的官方术语是 degrees of freedom / right altitude / access boundaries。
-
-## 证据强度
-
-诚实交代：这两个 skill 经过 4 个合成用例的 eval（with 20/20 vs baseline 16/20）和一次真实任务 dogfood。**那个 eval 不作强证据**——用例与判分同出一个生成器（LLM 自评，无独立真值路径）、未注入已知缺陷验非恒绿、baseline 方差大于组间差的一半。真实 dogfood 的结论反而更有意思：口述的 4 条业务约束经现场核实**全部已有落点，边界包的文字层应该是空的**。
-
-在维护良好的项目里，边界设计的主要工作是**核实与指路，不是撰写**。
 
 ## License
 

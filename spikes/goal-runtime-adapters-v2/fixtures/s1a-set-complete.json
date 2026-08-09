@@ -1,0 +1,60 @@
+{
+  "threadId": "22222222-2222-4222-8222-000000000002",
+  "setActive": {
+    "id": 3,
+    "result": {
+      "goal": {
+        "threadId": "22222222-2222-4222-8222-000000000002",
+        "objective": "Write DONE into ./out.txt then stop.",
+        "status": "active",
+        "tokenBudget": 50000,
+        "tokensUsed": 0,
+        "timeUsedSeconds": 0,
+        "createdAt": 1786000451,
+        "updatedAt": 1786000451
+      }
+    }
+  },
+  "setComplete": {
+    "id": 4,
+    "result": {
+      "goal": {
+        "threadId": "22222222-2222-4222-8222-000000000002",
+        "objective": "Write DONE into ./out.txt then stop.",
+        "status": "complete",
+        "tokenBudget": 50000,
+        "tokensUsed": 0,
+        "timeUsedSeconds": 0,
+        "createdAt": 1786000451,
+        "updatedAt": 1786000451
+      }
+    }
+  },
+  "getAfter": {
+    "id": 5,
+    "result": {
+      "goal": {
+        "threadId": "22222222-2222-4222-8222-000000000002",
+        "objective": "Write DONE into ./out.txt then stop.",
+        "status": "complete",
+        "tokenBudget": 50000,
+        "tokensUsed": 0,
+        "timeUsedSeconds": 0,
+        "createdAt": 1786000451,
+        "updatedAt": 1786000451
+      }
+    }
+  },
+  "goalKeys": [
+    "threadId",
+    "objective",
+    "status",
+    "tokenBudget",
+    "tokensUsed",
+    "timeUsedSeconds",
+    "createdAt",
+    "updatedAt"
+  ],
+  "hasGoalId": false,
+  "statusAfterComplete": "complete"
+}

@@ -1,0 +1,164 @@
+# Claude Code adapter
+
+此 adapter 只处理 `runtime="claude"` 的已确认 run contract。字段语义、hash 与 snapshot 握手见 [run-contract reference](../run-contract.md)。它不修改 contract，也不替其他 runtime 解释状态。
+
+## Launch 前置条件
+
+主会话必须已经完成 canonical artifact 的 byte-identical 检查、Validate、完整 Preview、当前 hash 的明确确认以及 Preflight。Capture 输出的 `baseline_digest` 必须保存在 baseline 文件之外的可信编排状态。随后主会话建立 controller-owned `runBinding`，并把独立 preflight 结果绑定到同一值；缺少任一项都不 launch：
+
+```json
+{
+  "runBinding": {
+    "contractHash": "<confirmed contract hash>",
+    "baselineDigest": "<trusted baseline digest>",
+    "runId": "<controller-issued run id>"
+  },
+  "preflightEvidence": {
+    "ok": true,
+    "reasons": [],
+    "binding": {
+      "contractHash": "<confirmed contract hash>",
+      "baselineDigest": "<trusted baseline digest>",
+      "runId": "<controller-issued run id>"
+    }
+  }
+}
+```
+
+`preflightEvidence` 是 closed-world controller channel，不能从执行会话或 launch 输出反序列化得到。失败必须用 `ok=false` 和非空安全 reasons 表达，并停止 launch。
+
+## 启动姿态与 Stop hook
+
+**弃用 `/goal`**：`/goal` 是 session-scoped 的 prompt-based Stop hook 包装，每轮由默认小模型（Haiku，弱判官）判条件是否满足；condition 上限 4000 字符，压缩长 contract 会丢语义；一旦 settings 出现 `disableAllHooks`（或 `allowManagedHooksOnly`），`/goal` 整体失效、无降级路径。记名保留、明确弃用，不再作为本 adapter 的启动姿态。改用裸 `claude -p` 直接起会话，配合控制器生成的 command 型 Stop hook 自建确定性续轮自检；协议核心（contract 格式、hash、证据通道）不受影响。
+
+把已确认 contract 的 `objective` 与必要的 criteria、constraints、allowed mutations、成功证据编译成一个自含 prompt。内容先写入权限受控的普通文件，再由启动器读取文件 bytes，以单一 argv 参数交给 `claude -p`；禁止把 prompt 拼进 shell 字符串，也禁止通过 shell quoting 传递特殊字符。达标判定不依赖这段 prompt 里的自然语言承诺——它由下方的 Stop hook 以确定性命令兜底。
+
+任务级权限收紧通过明确的 `--disallowedTools` 或独立 `--settings` 文件传入。必须先验证 deny/settings 确实覆盖 contract 声称为 `physical` 的动作；仅有文字禁令、auto 分类或未经 fault injection 的 scoped rule 不构成物理拦截，应降为 `audit_only` 或停止 launch。这条验证已机械化，且结论是硬的：本 adapter 生成的 deny 恒为「hook 脚本路径 + 整个 state 目录」两条，护的都是控制器自己的机件，**不存在面向用户约束的物理拦截面**。launch 前置闸因此逐条拒绝 `enforcement="physical"` 的 constraint，`mechanism` 怎么写都红；改写 `mechanism` 不是出路——那两条 deny 含 contract hash 与 prepare 期才确定的 state 路径，把它抄进 contract 会改掉 hash。claude runtime 下的约束一律写 `audit_only`；确需物理保证，就先把 proxy、只读凭证或 sandbox 备好，或改用有物理面的 runtime。
+
+### 启动姿态里的两个权限事实
+
+- **`--permission-mode acceptEdits`**：`launchSpec`/`resumeSpec` 固定带这个 flag。它意味着除 `--settings` 里那两条 deny（hook 脚本路径、整个 state 目录）之外，编辑一律自动放行、不再逐次询问——无人值守下这是必要的，但它也是本 adapter 的真实权限面：权限收紧只由 deny 列表承担，不要以为还有一层交互确认在兜底。contract 里凡是靠「模型会先问一句」成立的约束都不成立。
+- **`--max-turns`**：固定带上，默认取 adapter 常量 `CLI_MAX_TURNS = 50`；contract 的 `budget.user_provided=true` 且给了更小的 `max_turns` 时取两者较小值。它与 Stop hook 的 block 次数上限（`MAX_HOOK_BLOCKS`）是两层不同的闸：前者由 CLI 硬停单次 attempt 的轮数，后者决定 hook 还愿不愿意把未达标的会话续下去。
+
+### Stop hook 契约
+
+- **生成**：launch 前由控制器从已确认 contract 的 `postflight` command entries 逐条取 `id`/`cwd`/`argv` 投影生成脚本——不解释、不改写命令语义，零 schema 改动。脚本落 controller state 目录（例如 `~/.local/state/goal-condition/controllers/<name>/<contract-hash>/`），`--settings` 对该脚本路径与整个 state 目录设 **Edit** deny。
+- **达标判定**：hook 逐条执行 postflight command，多条红收集不抛出——某条非零退出即记为红；这同时钉死独立 postflight 的红判据（command entry 不带 `expected` 字段，红=非零退出）。全绿即候选达标，继续 block 表示尚未达标。
+- **block 协议**：hook 向 stdout 写 JSON decision `{"decision":"block","reason":"..."}` 并以 exit 0 退出——不是 exit code 2；放行时不写 decision，同样 exit 0。`reason` 措辞必须与 objective 兼容，只能是「未达标，请补 X」式陈述，不得与任务目标语义冲突——冲突会让模型遵从 objective 罢工、静默 block 到预算耗尽，形成死循环。
+- **预算放行**：block 次数达到上限（`MAX_HOOK_BLOCKS`，默认 8，contract 的 `budget.max_turns` 更严时取较小值）或运行时长超过 `budget.max_minutes` 折算的墙钟预算，hook 一律放行停机，候选态如实标「未达标」，不得无限 block。
+- **运行留痕**：hook 每次执行向 state 目录追加一条记录（时间戳、红项清单、decision）。控制器 postflight 校验「hook 运行次数 ≥ attempt 轮数」，把 hook 静默缺席（resume 未继承 `--settings`、hook 被绕过删除）变成可验证的红。对账所需的两个数从 launch 返回体取：每个 attempt 结果（候选与终局报告都有）带 `attemptNumber` 与 `hookRuns`（该刻的留痕行数），主会话不必自己读 state 目录里的文件。`attemptNumber` 为 `null` 是一个明确取值，表示这次调用被 launch 前置闸挡在起飞之前、没有占用任何轮次——此时不存在可对账的 attempt，那一轮不进入「hook 运行次数 ≥ attempt 轮数」的比较。字段本身恒在，`null` 与「缺字段」不是一回事。
+- **定位声明**：hook 是续轮驱动器，不是验收。它的判定结论不进入任何 controller 证据通道；hook 全绿仍可能被控制器独立 postflight 推翻，例如越权 mutation 只有 baseline compare 能看见。
+- **副作用告诫**：hook 命令集应限定为无写副作用的子集；如确有产物写入，必须把产物路径纳入 contract 的 `allowed_mutations` 并在 Preview 里显式列出，否则可能落进 target root、被误判为不可续的边界违规。
+
+### hook 保护定性
+
+`--settings` 对 hook 脚本与整个 state 目录设 Edit deny；实测显示这条 deny 对简单 Bash 重定向（例如把输出直接写进 hook 脚本路径）同样有效，被真实 `permission_denials` 拦下——比早先「仅观测性防线」的假设更强。但 deny 的精确上限（语义级路径解析 vs 字面文本匹配）仍 INCONCLUSIVE，待补测后再收紧措辞，不宣称完全物理保证。deny 路径必须写成 realpath 规范形——字面路径与其符号链接别名不一致会让 deny 落空。
+
+此文只规定 adapter 契约，不在文档或测试中调用真实 launcher。实际启动前仍要向用户展示准确 argv、目标目录和已确认 hash。
+
+## launcher 退出码语义
+
+`scripts/launch.mjs` 的退出码只是给编排器的粗信号；**成败的权威判据永远是 stdout 的报告体**（`outcome` 与 `reasons`）。四格互不重叠：
+
+| 退出码 | 含义 | stdout |
+|---|---|---|
+| 0 | 命令跑完并产出它声明的结果；`launch`/`resume` 特指 `outcome="candidate"` | 报告体 JSON |
+| 1 | 进程级失败：contract / prompt / diagnostics 文件读不出**或红项清单不合形状**、attempt 号没占上（配额已耗尽 `ATTEMPT_LIMIT_EXCEEDED`，或并发下被别的进程抢先 `ATTEMPT_SLOT_TAKEN`）、flag 落在不支持的 runtime 上 | 空（诊断在 stderr） |
+| 2 | usage 错误：未知子命令、缺必填 flag、重复或无值 flag | 空（usage 在 stderr） |
+| 3 | `launch`/`resume` 返回 `outcome="terminal_report"`：被前置闸挡下没起飞，或起飞后判定终局 | 完整报告体 JSON，`reasons` 非空 |
+
+3 与 0 分开是刻意的：二者此前同为 0，「根本没起飞」因此对只读退出码的编排器完全不可见。读退出码判成败的编排器至少要能 fail closed；但它仍不能替代把 `runtimeResult` 原样喂给 `nextAction` 这一步——终局报告不是候选，只有状态机能给出下一步。
+
+`snapshot.mjs` 的 `verify` 判否时同样把完整报告体打到 stdout、但 `exitCode` 走的是 1，与上表把「完整报告体」钉在 3、把 1 定义成「stdout 空」不是同一套约定——上表已显式限定 `scripts/launch.mjs`，跨脚本编排退出码时不要混用。
+
+## Runtime 终态
+
+不得只看 `subtype`。Adapter 向公共状态机提交的结果必须先通过实测版本的 21-key 完整 key 集校验（`claude -p --output-format json` 的 result envelope），未知 key 或缺失 key 一律 fail closed，不静默丢弃；通过后投影出以下 4 个字段参与判定：
+
+| 字段 | 成功条件 |
+|---|---|
+| `subtype` | 精确为 `success` |
+| `is_error` | 精确为 `false` |
+| `terminal_reason` | 精确为 `completed` |
+| `permission_denials` | 必须是空数组 |
+
+`terminal_reason:"completed"` 这一取值是 `2.1.223` 实测锚定；⚠️ SDK 文档列出的 `terminal_reason` 取值集并不包含 `completed`（列的是 `success`/`max_turns_reached` 等），字段取值存在文档与实现的漂移，exact-match 判定必须钉住实测版本的取值。
+
+### 版本闸：下限，不是白名单
+
+版本闸只排除已知过旧的版本：launch 前置闸拒绝低于 `CLAUDE_VERSION_FLOOR`（= `2.1.223`，实测锚定的最早版本）的 claude，等于或高于一律放行。envelope 的**形状**漂移由上面那道 21-key 全集校验直接兜住——注意它**只覆盖 key 集**，字段取值不在其内（见下面「放松之后丢了什么」第 1 条）。
+
+判定细节：版本串按 major/minor/patch 逐段**数值**比较（`2.1.9` 低于 `2.1.10`，字符串字典序在这里会翻车）；解析器锚定串首，接受版本号打头的形态（`2.1.223`、`2.1.223 (Claude Code)`），版本号不在串首的（`Claude Code 2.1.225`）会被**拒**；解析不出来一律拒，不当作放行。生产路径上这个解析器拿不到 `--version` 的原样输出——采集器（`scripts/launch.mjs`）先用无锚定正则抽出三段数字再写进 `probes.json`，`parseVersion` 是那一步之后的兜底，别把采集器那一步省掉，省掉之后前缀形态的输出会变成「读不出来 → 拒」的可用性 bug。预发布号是**已知边界**：`2.1.223-beta.1` 在 semver 里低于 `2.1.223`，这里却放行；改 `parseVersion` 没用，采集器的正则已经把预发布后缀丢掉了，真要拦得改采集器——claude `--version` 目前不发预发布标签，暂记为已知边界。
+
+之所以不是精确 allowlist：版本号是**代理指标**，它想挡的 result envelope 形状漂移已经有**直接检查**在管。于是两种情形都对 allowlist 不利——envelope 没变的新版本被 allowlist 拦下是纯误杀；envelope 的 key 集真变了的新版本，21-key 直检照样红，诊断还更精确（reason 会指出「可能是 claude 升版导致 envelope 漂移，核对新版本的 result envelope 后更新 `CLAUDE_RESULT_KEYS`」，按隐私纪律只给计数、不回显 key 名）。代理指标严于直接指标，换来的代价是 claude 每隔几天升一次版就「工具不可用」——而那种闸的真实结局是有人把它注释掉，那才是最坏的。
+
+#### 放松之后丢了什么
+
+allowlist 原本顺带覆盖、而直检覆盖不到的有三处。它们**不都是可观测的**，别用可观测性声明把缺口盖住。
+
+1. **取值锚没有直检兜底。** 21-key 全集校验判的是 **key 集**；`terminal_reason:"completed"` 是**取值**锚，取值由 `workflow.mjs` 的 exact-match 判定（不等于 `completed` 即红），而那个取值是 `2.1.223` 实测钉下来的，没有任何检查去核对它在新版本里还是不是同一个意思。两个方向后果不同：取值被**改名** → exact-match 全红，方向是 fail-closed，但诊断退化成「Claude terminal_reason must be completed」，读起来像「模型没干完活」，操作员可能把续跑配额烧在一个幻觉上；取值语义**变宽**（例如新版本把 `max_turns_reached` 也归进 `completed`）→ 形状与取值两道检查都过，产出**假 candidate**。**升版后第一次 run 必须人工核对这个取值。**
+2. **Stop hook 的 block 协议**（stdout 写 JSON decision、exit 0）。不是 envelope 形状，直检覆盖不到。可观测性要分开说：hook **本体被篡改**抓得住——每个 attempt 现场重新 lstat + 重算 hook 脚本 sha256（不信任 `probes.json` 的缓存值），与现场重新生成的期望值比对，篡改会在下一个 attempt 的前置闸落红；残留敞口是最后一个 attempt 内的篡改没有下一轮去查。但**协议漂移**抓不住：生成的脚本向 `hook-runs.jsonl` 追加留痕这一步在 decision 分支**之外无条件执行**，协议漂了（改回 exit 2、或换 JSON 形状）hook 照常运行、照常追加、`hookRuns` 照常涨，只是 claude 不再理会 block。它的真实表现是「会话没续、postflight 红」，与「任务本来就没做完」不可区分——**弱可观测，没有专门指向病因的信号**。（`hookRuns` 不涨描述的是另一种失效：hook **缺席**，resume 没继承 `--settings` 或 hook 被删。两者不是一回事。）
+3. **`--settings` deny 的防护面。** 同样不是 envelope 形状，而且这里**没有可用的观测量**：`permission_denials` 必须为空才算成功，deny 面失效产出的也是空数组，与健康 run 逐字节相同——「deny 好使、没人尝试」和「deny 坏了、写进去了」在这个字段上不可区分；何况这条信号要求真有人去写受保护路径，正常 run 里根本不产生观测量。
+
+还有一条要写明：第 2 条的证据 `hook-runs.jsonl` 就住在第 3 条的 deny 所保护的 state 目录里。deny 面若失效，执行器可以往里追加伪造行让「hook 运行次数 ≥ attempt 轮数」的对账凑数而 hook 从未真跑。**这两条不是互相独立的双保险，是一条守着另一条的证据。**
+
+**放松之后真正的安全底是分层防御，不是可观测性。** 即便取值语义变宽产出假 candidate，下面「Postflight 与 Close」一节要求主会话**独立重跑** postflight command verifier 并调用 snapshot verify（传入可信编排状态保存的 `baseline_digest`）之后才能 Close——**假 candidate 不等于假 Close**。升版后若怀疑上述任一处，回头补 S3/S5 实测，并按需要抬高下限。
+
+成功 fixture：
+
+```json
+{
+  "subtype": "success",
+  "is_error": false,
+  "terminal_reason": "completed",
+  "permission_denials": []
+}
+```
+
+失败 fixture，即使 subtype 表面成功也必须 reject：
+
+```json
+{
+  "subtype": "success",
+  "is_error": true,
+  "terminal_reason": "api_error",
+  "permission_denials": ["denied operation"]
+}
+```
+
+字段缺失、类型不符、未知字段或 denial 非空同样失败，不允许猜测默认成功；runtime 也不能把 controller evidence 塞进 terminal result。
+
+## resume 外环
+
+单次首发未达标（hook 因预算放行、或候选终态判定未过）时，主会话可发起 `--resume <session_id>` 续跑；续跑请求必须带上与首发完全相同的 `--settings` 文件——不带则 Stop hook 静默失效，续轮判定形同虚设。外环有上限：一次逻辑 run = 1 首发 + 最多 2 次续跑，attempt 序号写入 controller state、单调递增。
+
+计数口径就是这句话的字面意思：**只有真的要 spawn 执行器时才占号**。被 launch 前置闸挡下的调用（binding 对不上、`claude` 版本低于下限或读不出来、hook 文件被改、`baselineDigest` 没存、resume 找不到 thread.json）一格都不占，改正之后配额仍是满的。这不是宽松，而是让计数器只统计它声称统计的东西：占号不可撤销，`prepare` 与 `close` 都不清 `attempts/`，而上述拒绝原因全在 contract 之外——改正它们不改 contract hash，也就不换 state 目录。配额真的用尽时，诊断 `ATTEMPT_LIMIT_EXCEEDED` 会给出出路：换一个 `--controller` 名重跑 `prepare`（写出带全新配额的 state 目录），或在确认没有 run 在跑之后手工删掉那个 `attempts/` 目录。
+
+红项按类型分流，分类由控制器基于自己独立跑出的 postflight 结果判定，不解析 hook 或 evidence 里的 reason 字符串：
+
+| postflight 红项 | 处置 |
+|---|---|
+| 未达标类（测试红、产物缺、命令结果不符） | 可续：诊断信息随下一次 `--resume` 馈回 |
+| 边界违规类（越权 mutation、`permission_denials` 非空等） | 不可续，立即终局——执行器已离约 |
+
+「馈回」的内容有边界，与 codex 侧同一条规定：**diagnostic 只能由 contract 声明的事实与控制器自己的判定构成——postflight 条目 id、该条目在 contract 里的 argv 与 cwd、退出码、红项分类结论；执行体产出的任何字节都不得进入这条通道。** 这里的 diagnostic 是 `claude -p` 的 prompt 位，也就是下一轮的用户回合，容易踩的形态是把红项命令的 stdout 贴进去——而 postflight 命令的 stdout 完全可能是执行体自己上一轮写出来的文件内容（`cat`/`diff`/`jq` 类 verifier 都会），那等于让它自己的产出以指令的身份回到它面前。`--diagnostics-file` 因此收的是一份闭世界的红项清单（`{"reds":[{"entry","code","exit"}]}`，`entry` 必须是本 contract 的 postflight 条目 id，`argv`/`cwd` 从 contract 取而不从文件读），文本由 launcher 渲染；不合形状即进程级失败（exit 1）。
+
+attempt 用尽或超出时间预算同样终局，按 diagnostic 报告差异与下一步。
+
+## Postflight 与 Close
+
+候选终态通过字段检查后，启动 Claude 的主会话独立重跑 `postflight` command verifier，并调用 snapshot verify，传入可信编排状态保存的原始 `baseline_digest` 作为 `--expected-baseline-digest`。执行会话贴出的日志不是独立证据。主会话将结果写入与原始 `runBinding` 完全相同的 controller-owned `postflightEvidence`：
+
+```json
+{
+  "ok": true,
+  "reasons": [],
+  "binding": {
+    "contractHash": "<confirmed contract hash>",
+    "baselineDigest": "<trusted baseline digest>",
+    "runId": "<controller-issued run id>"
+  }
+}
+```
+
+只有 exact terminal result、success artifact、边界 compare、外部 verifier 与 bound `postflightEvidence` 全绿，公共状态机才可 Close。Claude 不接受 Codex 的 finalization receipt/readback 通道。任一差异都报告安全的 observed、expected 与 next step；不得用成功文本覆盖失败证据。

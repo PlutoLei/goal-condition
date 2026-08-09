@@ -1,0 +1,1156 @@
+{
+  "threadId": "22222222-2222-4222-8222-000000000008",
+  "objective": "Step 1: create ./a.txt containing X. Then in a later turn, Step 2: create ./b.txt containing Y. Do them in separate turns: after finishing step 1, end your turn and stop — do not start step 2 yourself in this same turn.",
+  "set": {
+    "goal": {
+      "threadId": "22222222-2222-4222-8222-000000000008",
+      "objective": "Step 1: create ./a.txt containing X. Then in a later turn, Step 2: create ./b.txt containing Y. Do them in separate turns: after finishing step 1, end your turn and stop — do not start step 2 yourself in this same turn.",
+      "status": "active",
+      "tokenBudget": 50000,
+      "tokensUsed": 0,
+      "timeUsedSeconds": 0,
+      "createdAt": 1786005422,
+      "updatedAt": 1786005422
+    }
+  },
+  "turnStart": {
+    "turn": {
+      "id": "22222222-2222-4222-8222-000000000009",
+      "items": [],
+      "itemsView": "notLoaded",
+      "status": "inProgress",
+      "error": null,
+      "startedAt": null,
+      "completedAt": null,
+      "durationMs": null
+    }
+  },
+  "getFinal": {
+    "goal": {
+      "threadId": "22222222-2222-4222-8222-000000000008",
+      "objective": "Step 1: create ./a.txt containing X. Then in a later turn, Step 2: create ./b.txt containing Y. Do them in separate turns: after finishing step 1, end your turn and stop — do not start step 2 yourself in this same turn.",
+      "status": "complete",
+      "tokenBudget": 50000,
+      "tokensUsed": 23353,
+      "timeUsedSeconds": 58,
+      "createdAt": 1786005422,
+      "updatedAt": 1786005481
+    }
+  },
+  "events": [
+    {
+      "t": 1786005422665,
+      "method": "thread/started"
+    },
+    {
+      "t": 1786005422665,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005422665,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005422665,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005422825,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005422833,
+      "method": "thread/status/changed"
+    },
+    {
+      "t": 1786005422833,
+      "method": "turn/started"
+    },
+    {
+      "t": 1786005429398,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005444468,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005444468,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005451335,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005451335,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451370,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451383,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451383,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451384,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451387,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451387,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451387,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451431,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451431,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451570,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451570,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005451751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005452104,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005455505,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005455610,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005455610,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005455612,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005455659,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005455659,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005455659,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005459999,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005459999,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005460000,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005460005,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005460005,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005460005,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005462057,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005462060,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462060,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462061,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462082,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462093,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462117,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462134,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462135,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462165,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462176,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462195,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462216,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462244,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462263,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462264,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462283,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462306,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462333,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462350,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462375,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462390,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462390,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462411,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462428,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462449,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462516,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462516,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462519,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462519,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462542,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462560,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462586,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462601,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462615,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462685,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462685,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462685,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462685,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462708,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462719,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462740,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462778,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462788,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462797,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462818,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462838,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462857,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462869,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462891,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005462920,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463017,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463017,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463017,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463017,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463017,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463017,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463047,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463047,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005463140,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005463199,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005463199,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005463199,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005463213,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005463213,
+      "method": "thread/status/changed"
+    },
+    {
+      "t": 1786005463213,
+      "method": "turn/completed"
+    },
+    {
+      "t": 1786005463226,
+      "method": "thread/status/changed"
+    },
+    {
+      "t": 1786005463226,
+      "method": "turn/started"
+    },
+    {
+      "t": 1786005465300,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005465885,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005465885,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005465885,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465885,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465886,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465947,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465948,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465948,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465948,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005465950,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466038,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466038,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466042,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466042,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466140,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466193,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466193,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466196,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466196,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466196,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466200,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466200,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466281,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005466429,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005468461,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005468461,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005468461,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005468462,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005468462,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005470278,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005470283,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005470366,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005470369,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005470370,
+      "method": "mcpServer/startupStatus/updated"
+    },
+    {
+      "t": 1786005472411,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005472512,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005472512,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005472513,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005474340,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005474340,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005474340,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005478882,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005478882,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005478882,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005478900,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005478900,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005478900,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005480819,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005481163,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005481515,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005481515,
+      "method": "thread/goal/updated"
+    },
+    {
+      "t": 1786005481569,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005481569,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005481569,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005483314,
+      "method": "item/started"
+    },
+    {
+      "t": 1786005483317,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483329,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483353,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483374,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483393,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483394,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483412,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483435,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483470,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483476,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483497,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483522,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483536,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483556,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483556,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483578,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483600,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483622,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483648,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483662,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483687,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483688,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483705,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483723,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483757,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483761,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483785,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483819,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483823,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483843,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483846,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483899,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483899,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483946,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483946,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483959,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483972,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005483976,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484050,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484059,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484059,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484059,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484106,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484119,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484119,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484152,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484154,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484167,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484185,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484200,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484221,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484243,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484243,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484261,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484279,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484305,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484318,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484337,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484355,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484377,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484400,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484415,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484474,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484474,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484474,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484477,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484530,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484530,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484547,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484562,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484582,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484605,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484609,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484626,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484655,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484670,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484685,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484709,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484709,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484728,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484751,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484768,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484792,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484811,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484832,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484851,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484851,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484871,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484956,
+      "method": "item/agentMessage/delta"
+    },
+    {
+      "t": 1786005484991,
+      "method": "item/completed"
+    },
+    {
+      "t": 1786005485054,
+      "method": "thread/tokenUsage/updated"
+    },
+    {
+      "t": 1786005485054,
+      "method": "account/rateLimits/updated"
+    },
+    {
+      "t": 1786005485054,
+      "method": "turn/diff/updated"
+    },
+    {
+      "t": 1786005485066,
+      "method": "thread/status/changed"
+    },
+    {
+      "t": 1786005485066,
+      "method": "turn/completed"
+    }
+  ],
+  "turnStartedCount": 2,
+  "turnCompletedCount": 2,
+  "goalUpdates": 9,
+  "turnStarts": 2,
+  "workFiles": [
+    {
+      "name": "a.txt",
+      "mtimeMs": 1786005455608.9092
+    },
+    {
+      "name": "b.txt",
+      "mtimeMs": 1786005472510.7483
+    }
+  ]
+}
