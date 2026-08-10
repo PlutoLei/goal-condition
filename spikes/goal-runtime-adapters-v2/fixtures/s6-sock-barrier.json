@@ -1,15 +1,15 @@
 {
   "step1_daemonStartAttempt": {
-    "codexHome": "/var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-daemon-attempt-RE6MvN",
+    "codexHome": "/var/folders/<TMPDIR_SALT>/T/spike-s6-daemon-attempt-RE6MvN",
     "exitCode": 1,
     "stdout": "",
-    "stderr": "Error: managed standalone Codex install not found at /private/var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-daemon-attempt-RE6MvN/packages/standalone/current/codex\n\nThis command requires the standalone install managed by the Codex installer, because the daemon starts and updates app-server from that fixed path.\n\nInstall it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\nThen rerun the command you just tried.",
+    "stderr": "Error: managed standalone Codex install not found at /private/var/folders/<TMPDIR_SALT>/T/spike-s6-daemon-attempt-RE6MvN/packages/standalone/current/codex\n\nThis command requires the standalone install managed by the Codex installer, because the daemon starts and updates app-server from that fixed path.\n\nInstall it with:\n  curl -fsSL https://chatgpt.com/codex/install.sh | sh\n\nThen rerun the command you just tried.",
     "blocked": true
   },
   "step1_substitute": {
     "sockDir": "/tmp/s6-sock-oEqRYE",
     "sockPath": "/tmp/s6-sock-oEqRYE/a.sock",
-    "substrateCodexHome": "/var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-appsrv-codex-home-nxKROc",
+    "substrateCodexHome": "/var/folders/<TMPDIR_SALT>/T/spike-s6-appsrv-codex-home-nxKROc",
     "pid": 16200,
     "sockReady": true,
     "appsrvExitedEarly": false,
@@ -22,13 +22,13 @@
   },
   "executorView": {
     "authCopied": true,
-    "execCodexHome": "/var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-exec-codex-home-n03nZC",
-    "execWork": "/var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-exec-work-eS4evg",
+    "execCodexHome": "/var/folders/<TMPDIR_SALT>/T/spike-s6-exec-codex-home-n03nZC",
+    "execWork": "/var/folders/<TMPDIR_SALT>/T/spike-s6-exec-work-eS4evg",
     "exitCode": 0,
     "marker": "EXECUTOR_BLOCKED:EPERM",
     "connected": false,
     "stdoutTail": "EXECUTOR_BLOCKED:EPERM\n",
-    "stderrTail": "Reading additional input from stdin...\n2026-08-06T09:53:04.606500Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\n2026-08-06T09:53:04.606514Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\nOpenAI Codex v0.146.0-alpha.9.2\n--------\nworkdir: /var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-exec-work-eS4evg\nmodel: gpt-5.6-sol\nprovider: openai\napproval: never\nsandbox: workspace-write [workdir, /tmp, $TMPDIR]\nreasoning effort: none\nreasoning summaries: none\nsession id: 22222222-2222-4222-8222-000000000015\n--------\nuser\nRun this exact shell command and then stop: node -e \"const net=require('net');const s=net.createConnection(\\\"/tmp/s6-sock-oEqRYE/a.sock\\\");s.on('connect',()=>{console.log('EXECUTOR_CONNECTED');s.destroy();process.exit(0)});s.on('error',e=>{console.log('EXECUTOR_BLOCKED:'+e.code);process.exit(0)});setTimeout(()=>{console.log('EXECUTOR_BLOCKED:TIMEOUT');process.exit(0)},4000);\"\nReport the command's stdout verbatim in your final message. Do not modify the command. Do not create any files.\ncodex\nI’m running the command exactly as provided.\nexec\n/bin/zsh -lc \"node -e \\\"const net=require('net');const s=net.createConnection(\\\\\\\"/tmp/s6-sock-oEqRYE/a.sock\\\\\\\");s.on('connect',()=>{console.log('EXECUTOR_CONNECTED');s.destroy();process.exit(0)});s.on('error',e=>{console.log('EXECUTOR_BLOCKED:'+e.code);process.exit(0)});setTimeout(()=>{console.log('EXECUTOR_BLOCKED:TIMEOUT');process.exit(0)},4000);\\\"\" in /var/folders/ab/0123456789abcdef0123456789ab/T/spike-s6-exec-work-eS4evg\n succeeded in 35ms:\nEXECUTOR_BLOCKED:EPERM\n\ncodex\nEXECUTOR_BLOCKED:EPERM\ntokens used\n8,642\n"
+    "stderrTail": "Reading additional input from stdin...\n2026-08-06T09:53:04.606500Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\n2026-08-06T09:53:04.606514Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit\nOpenAI Codex v0.146.0-alpha.9.2\n--------\nworkdir: /var/folders/<TMPDIR_SALT>/T/spike-s6-exec-work-eS4evg\nmodel: gpt-5.6-sol\nprovider: openai\napproval: never\nsandbox: workspace-write [workdir, /tmp, $TMPDIR]\nreasoning effort: none\nreasoning summaries: none\nsession id: 00000000-0000-4000-8000-000000000027\n--------\nuser\nRun this exact shell command and then stop: node -e \"const net=require('net');const s=net.createConnection(\\\"/tmp/s6-sock-oEqRYE/a.sock\\\");s.on('connect',()=>{console.log('EXECUTOR_CONNECTED');s.destroy();process.exit(0)});s.on('error',e=>{console.log('EXECUTOR_BLOCKED:'+e.code);process.exit(0)});setTimeout(()=>{console.log('EXECUTOR_BLOCKED:TIMEOUT');process.exit(0)},4000);\"\nReport the command's stdout verbatim in your final message. Do not modify the command. Do not create any files.\ncodex\nI’m running the command exactly as provided.\nexec\n/bin/zsh -lc \"node -e \\\"const net=require('net');const s=net.createConnection(\\\\\\\"/tmp/s6-sock-oEqRYE/a.sock\\\\\\\");s.on('connect',()=>{console.log('EXECUTOR_CONNECTED');s.destroy();process.exit(0)});s.on('error',e=>{console.log('EXECUTOR_BLOCKED:'+e.code);process.exit(0)});setTimeout(()=>{console.log('EXECUTOR_BLOCKED:TIMEOUT');process.exit(0)},4000);\\\"\" in /var/folders/<TMPDIR_SALT>/T/spike-s6-exec-work-eS4evg\n succeeded in 35ms:\nEXECUTOR_BLOCKED:EPERM\n\ncodex\nEXECUTOR_BLOCKED:EPERM\ntokens used\n8,642\n"
   },
   "verdict": "BLOCKED → sock 访问壁垒成立（在本替代实验的前提下）→ finalize receipt 维持可信，但注意本测试用的是 --listen unix:// 前台替代进程，不是 daemon 管理的真实 control sock（daemon 子系统在本机无法起——见 step1_daemonStartAttempt），结论的可信度受此限制"
 }

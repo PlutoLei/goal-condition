@@ -37,13 +37,13 @@ $ node spikes/goal-runtime-adapters-v2/probe-handshake.mjs
   "threadStart": {
     "id": 2,
     "result": {
-      "thread": { "id": "22222222-2222-4222-8222-000000000001", "ephemeral": true, ... },
+      "thread": { "id": "00000000-0000-4000-8000-000000000001", "ephemeral": true, ... },
       "model": "gpt-5.6-sol",
       "sandbox": { "type": "readOnly", "networkAccess": false },
       ...
     }
   },
-  "threadId": "22222222-2222-4222-8222-000000000001"
+  "threadId": "00000000-0000-4000-8000-000000000001"
 }
 SCRATCH=/var/folders/.../spike-handshake-tERF1f
 ```

@@ -3,7 +3,7 @@
   "duration_api_ms": 38232,
   "num_turns": 7,
   "stop_reason": "end_turn",
-  "session_id": "00000000-0000-4000-8000-000000000001",
+  "session_id": "00000000-0000-4000-8000-000000000002",
   "total_cost_usd": 0.896317,
   "usage": {
     "input_tokens": 12,
@@ -61,5 +61,5 @@
   "time_to_request_ms": 104,
   "type": "result",
   "duration_ms": 40544,
-  "uuid": "11111111-1111-4111-8111-000000000001"
+  "uuid": "00000000-0000-4000-8000-000000000003"
 }

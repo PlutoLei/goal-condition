@@ -130,7 +130,9 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 npm test
 ```
 
-测试覆盖 contract 的 closed-world 校验、canonical JSON/hash、状态机、基线 capture/compare、commit-pinned installer、adapter 静态契约、公开 Markdown 的隐私/loader 门禁，以及五类 paired pressure samples。自动测试不会启动真实 goal、访问网络或写入真实 runtime 安装位置；installer 回归会在测试专属临时目录中执行真实 materialize、backup、atomic link switch、rollback 与 TOCTOU fault injection。
+测试覆盖 contract 的 closed-world 校验、canonical JSON/hash、状态机、基线 capture/compare、commit-pinned installer、adapter 静态契约、公开 Markdown 的隐私/loader 门禁、**全仓发布面泄漏闸**，以及五类 paired pressure samples。
+
+发布面泄漏闸（`tests/publish-surface.test.mjs`）扫描**每一个被 Git 跟踪的文本文件**，按模式类而不是按已知样例判定：家目录绝对路径、per-user 临时目录 salt、真实 UUID、凭证样式串、真实邮箱地址。合成占位靠形态与真值区分（合成 UUID 的首段是 8 个相同字符），因此新增占位值不需要维护白名单。它与上面那道 Markdown 隐私门禁关注点不同，互不替代：后者只看 loader 会读进上下文的 Markdown，还要管 `$1` 展开这类 loader hazard。自动测试不会启动真实 goal、访问网络或写入真实 runtime 安装位置；installer 回归会在测试专属临时目录中执行真实 materialize、backup、atomic link switch、rollback 与 TOCTOU fault injection。
 
 `goal-condition-template/evidence/pressure-evidence.json` 保存 prompt injection、多目标压力、伪 physical mechanism、临时 context 和虚假完成五类无工具、无私有上下文的成对模型样本。它用于公开审阅指令是否改变模型行为；model sample evidence is not deterministic unit proof，也不替代 schema、状态机与故障注入测试。`pressure-cases.json` 只是确定性的状态机 regression fixture，不被包装成独立行为实验。
 

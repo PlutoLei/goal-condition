@@ -1,9 +1,9 @@
 {
-  "threadId": "22222222-2222-4222-8222-000000000008",
+  "threadId": "00000000-0000-4000-8000-000000000010",
   "objective": "Step 1: create ./a.txt containing X. Then in a later turn, Step 2: create ./b.txt containing Y. Do them in separate turns: after finishing step 1, end your turn and stop — do not start step 2 yourself in this same turn.",
   "set": {
     "goal": {
-      "threadId": "22222222-2222-4222-8222-000000000008",
+      "threadId": "00000000-0000-4000-8000-000000000010",
       "objective": "Step 1: create ./a.txt containing X. Then in a later turn, Step 2: create ./b.txt containing Y. Do them in separate turns: after finishing step 1, end your turn and stop — do not start step 2 yourself in this same turn.",
       "status": "active",
       "tokenBudget": 50000,
@@ -15,7 +15,7 @@
   },
   "turnStart": {
     "turn": {
-      "id": "22222222-2222-4222-8222-000000000009",
+      "id": "00000000-0000-4000-8000-000000000011",
       "items": [],
       "itemsView": "notLoaded",
       "status": "inProgress",
@@ -27,7 +27,7 @@
   },
   "getFinal": {
     "goal": {
-      "threadId": "22222222-2222-4222-8222-000000000008",
+      "threadId": "00000000-0000-4000-8000-000000000010",
       "objective": "Step 1: create ./a.txt containing X. Then in a later turn, Step 2: create ./b.txt containing Y. Do them in separate turns: after finishing step 1, end your turn and stop — do not start step 2 yourself in this same turn.",
       "status": "complete",
       "tokenBudget": 50000,

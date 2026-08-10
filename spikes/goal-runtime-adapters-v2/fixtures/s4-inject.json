@@ -10,10 +10,10 @@
           "text": "Postflight failed: ./out.txt missing. Create it with content DONE, then stop."
         }
       ],
-      "threadId": "22222222-2222-4222-8222-000000000010",
+      "threadId": "00000000-0000-4000-8000-000000000014",
       "set": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000010",
+          "threadId": "00000000-0000-4000-8000-000000000014",
           "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
           "status": "active",
           "tokenBudget": 50000,
@@ -25,7 +25,7 @@
       },
       "turnStart": {
         "turn": {
-          "id": "22222222-2222-4222-8222-000000000011",
+          "id": "00000000-0000-4000-8000-000000000015",
           "items": [],
           "itemsView": "notLoaded",
           "status": "inProgress",
@@ -38,7 +38,7 @@
       "firstTurnDone": true,
       "preInject": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000010",
+          "threadId": "00000000-0000-4000-8000-000000000014",
           "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
           "status": "active",
           "tokenBudget": 50000,
@@ -54,7 +54,7 @@
       "inject": {},
       "injectError": false,
       "getFinal": {
-        "threadId": "22222222-2222-4222-8222-000000000010",
+        "threadId": "00000000-0000-4000-8000-000000000014",
         "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
         "status": "blocked",
         "tokenBudget": 50000,
@@ -97,10 +97,10 @@
           ]
         }
       ],
-      "threadId": "22222222-2222-4222-8222-000000000012",
+      "threadId": "00000000-0000-4000-8000-000000000016",
       "set": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000012",
+          "threadId": "00000000-0000-4000-8000-000000000016",
           "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
           "status": "active",
           "tokenBudget": 50000,
@@ -112,7 +112,7 @@
       },
       "turnStart": {
         "turn": {
-          "id": "22222222-2222-4222-8222-000000000013",
+          "id": "00000000-0000-4000-8000-000000000017",
           "items": [],
           "itemsView": "notLoaded",
           "status": "inProgress",
@@ -125,7 +125,7 @@
       "firstTurnDone": true,
       "preInject": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000012",
+          "threadId": "00000000-0000-4000-8000-000000000016",
           "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
           "status": "active",
           "tokenBudget": 50000,
@@ -141,7 +141,7 @@
       "inject": {},
       "injectError": false,
       "getFinal": {
-        "threadId": "22222222-2222-4222-8222-000000000012",
+        "threadId": "00000000-0000-4000-8000-000000000016",
         "objective": "Wait for corrective instructions, then follow them exactly. Do not create, modify, or delete any files unless a corrective instruction explicitly tells you to do so.",
         "status": "complete",
         "tokenBudget": 50000,

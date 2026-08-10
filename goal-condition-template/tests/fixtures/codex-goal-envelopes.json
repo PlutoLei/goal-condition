@@ -1,11 +1,11 @@
 {
   "s1a": {
-    "threadId": "22222222-2222-4222-8222-000000000002",
+    "threadId": "00000000-0000-4000-8000-000000000004",
     "setActive": {
       "id": 3,
       "result": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000002",
+          "threadId": "00000000-0000-4000-8000-000000000004",
           "objective": "Write DONE into ./out.txt then stop.",
           "status": "active",
           "tokenBudget": 50000,
@@ -20,7 +20,7 @@
       "id": 4,
       "result": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000002",
+          "threadId": "00000000-0000-4000-8000-000000000004",
           "objective": "Write DONE into ./out.txt then stop.",
           "status": "complete",
           "tokenBudget": 50000,
@@ -35,7 +35,7 @@
       "id": 5,
       "result": {
         "goal": {
-          "threadId": "22222222-2222-4222-8222-000000000002",
+          "threadId": "00000000-0000-4000-8000-000000000004",
           "objective": "Write DONE into ./out.txt then stop.",
           "status": "complete",
           "tokenBudget": 50000,
@@ -60,7 +60,7 @@
     "statusAfterComplete": "complete"
   },
   "s2b": {
-    "threadId": "22222222-2222-4222-8222-000000000003",
+    "threadId": "00000000-0000-4000-8000-000000000005",
     "phases": [
       {
         "label": "set",
@@ -125,7 +125,7 @@
     ],
     "turnStartRaw": {
       "turn": {
-        "id": "22222222-2222-4222-8222-000000000004",
+        "id": "00000000-0000-4000-8000-000000000006",
         "items": [],
         "itemsView": "notLoaded",
         "status": "inProgress",
