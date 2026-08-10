@@ -1,4 +1,4 @@
-# boundary-design
+# goal-condition
 
 给 agent 派活时，别写操作手册，写边界。
 
