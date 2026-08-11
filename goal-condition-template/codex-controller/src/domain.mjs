@@ -257,7 +257,7 @@ function validateCondition(condition, deliverableIds, path) {
     throw domainError('ABSOLUTE_PATH_REQUIRED', `${path}.verifier.cwd must be normalized and absolute`, `${path}.verifier.cwd`);
   }
   stringArray(condition.verifier.argv, `${path}.verifier.argv`, { min: 1, unique: false });
-  if (!['text', 'json'].includes(condition.verifier.capture)) {
+  if (!['text', 'hash'].includes(condition.verifier.capture)) {
     throw domainError('VERIFIER_CAPTURE_INVALID', `${path}.verifier.capture is invalid`, `${path}.verifier.capture`);
   }
   exactFields(condition.projection, PROJECTION_FIELDS, `${path}.projection`);
