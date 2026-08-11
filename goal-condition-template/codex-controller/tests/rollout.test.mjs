@@ -20,8 +20,9 @@ function certifiedCanaryExport() {
     attempt_id: 'attempt-old', run_id: 'run-old', status: 'Rejected', completion_level: 'candidate',
   };
   const receipt = {
-    receipt_version: 1, session_id: 'session-canary', attempt_id: 'attempt-certified',
+    receipt_version: 2, session_id: 'session-canary', attempt_id: 'attempt-certified',
     run_id: 'run-certified', intent_hash: 'a'.repeat(64), thread_id: 'thread-canary',
+    turn_start_response_id: 'turn-start-response-canary',
     turn_id: 'turn-canary', authorized_turn_ids: ['turn-canary'],
     started_at: '2026-08-11T00:00:00.000Z',
   };

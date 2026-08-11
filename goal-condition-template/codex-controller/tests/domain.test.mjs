@@ -189,6 +189,8 @@ test('audit schemas are closed-world and pin the public versions', async () => {
   assert.equal(sessionSchema.$defs.condition.additionalProperties, false);
   assert.equal(sessionSchema.$defs.authority.additionalProperties, false);
   assert.equal(sessionSchema.$defs.contextDependency.additionalProperties, false);
+  assert.equal(sessionSchema.$defs.launchReceipt.properties.receipt_version.const, 2);
+  assert.ok(sessionSchema.$defs.launchReceipt.required.includes('turn_start_response_id'));
   assert.ok(sessionSchema.$defs.launchReceipt.required.includes('authorized_turn_ids'));
   assert.equal(operationSchema.$id, 'https://goal-condition.dev/schema/codex/revision-operation-v1.schema.json');
   assert.equal(operationSchema.$defs.operationBase.additionalProperties, false);

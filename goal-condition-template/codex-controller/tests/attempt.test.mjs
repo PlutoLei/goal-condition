@@ -5,6 +5,7 @@ import {
   createLaunchIntent,
   createLaunchReceipt,
   realizeAttempt,
+  validateAttemptRecord,
   verifyLaunchCapability,
 } from '../src/attempt.mjs';
 
@@ -34,16 +35,26 @@ test('LaunchIntent and LaunchReceipt bind one native turn to one immutable Attem
   const receipt = createLaunchReceipt({
     intent,
     threadId: 'thread-native-1',
+    turnStartResponseId: 'turn-start-response-1',
     turnId: 'turn-native-1',
     authorizedTurnIds: ['turn-native-1', 'turn-native-2'],
     startedAt: '2026-08-11T00:00:00.000Z',
   });
   const attempt = realizeAttempt({ intent, receipt });
   assert.equal(attempt.status, 'Launched');
+  assert.equal(attempt.launch_receipt.receipt_version, 2);
   assert.equal(attempt.launch_receipt.thread_id, 'thread-native-1');
+  assert.equal(attempt.launch_receipt.turn_start_response_id, 'turn-start-response-1');
   assert.deepEqual(attempt.launch_receipt.authorized_turn_ids, ['turn-native-1', 'turn-native-2']);
   assert.equal(attempt.run_id, 'run-0001');
   assert.equal(attempt.controller_release_digest, '9'.repeat(64));
+  assert.throws(
+    () => validateAttemptRecord({
+      ...attempt,
+      launch_receipt: { ...attempt.launch_receipt, receipt_version: 1 },
+    }),
+    (error) => error.code === 'LAUNCH_RECEIPT_VERSION_INVALID',
+  );
 });
 
 test('LaunchReceipt rejects a primary turn that is absent from the authorized turn set', () => {
@@ -59,7 +70,8 @@ test('LaunchReceipt rejects a primary turn that is absent from the authorized tu
   });
   assert.throws(
     () => createLaunchReceipt({
-      intent, threadId: 'thread-native-1', turnId: 'turn-native-1',
+      intent, threadId: 'thread-native-1', turnStartResponseId: 'turn-start-response-1',
+      turnId: 'turn-native-1',
       authorizedTurnIds: ['turn-native-2'], startedAt: '2026-08-11T00:00:00.000Z',
     }),
     (error) => error.code === 'AUTHORIZED_TURNS_INVALID',

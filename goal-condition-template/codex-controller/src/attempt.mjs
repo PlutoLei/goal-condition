@@ -14,7 +14,7 @@ const INTENT_FIELDS = Object.freeze([
 ]);
 const RECEIPT_FIELDS = Object.freeze([
   'receipt_version', 'session_id', 'attempt_id', 'run_id', 'intent_hash', 'thread_id',
-  'turn_id', 'authorized_turn_ids', 'started_at',
+  'turn_start_response_id', 'turn_id', 'authorized_turn_ids', 'started_at',
 ]);
 const CANDIDATE_FIELDS = Object.freeze(['status', 'remaining_work']);
 const BYPASS_FIELDS = Object.freeze(['type', 'reason_codes']);
@@ -116,11 +116,17 @@ export function verifyLaunchCapability({ intent, key }) {
   }
 }
 
-export function createLaunchReceipt({ intent, threadId, turnId, authorizedTurnIds, startedAt }) {
+export function createLaunchReceipt({
+  intent, threadId, turnStartResponseId, turnId, authorizedTurnIds, startedAt,
+}) {
   exactFields(intent, INTENT_FIELDS, 'launch_intent');
   if (typeof threadId !== 'string' || threadId.length === 0
+    || typeof turnStartResponseId !== 'string' || turnStartResponseId.length === 0
     || typeof turnId !== 'string' || turnId.length === 0) {
-    throw attemptError('NATIVE_TURN_REQUIRED', 'a receipt requires native thread and turn ids');
+    throw attemptError(
+      'NATIVE_TURN_REQUIRED',
+      'a receipt requires native thread, start-response, and persisted turn ids',
+    );
   }
   if (!Array.isArray(authorizedTurnIds)
     || authorizedTurnIds.length === 0
@@ -133,12 +139,13 @@ export function createLaunchReceipt({ intent, threadId, turnId, authorizedTurnId
     );
   }
   return {
-    receipt_version: 1,
+    receipt_version: 2,
     session_id: intent.session_id,
     attempt_id: intent.attempt_id,
     run_id: intent.run_id,
     intent_hash: launchIntentHash(intent),
     thread_id: threadId,
+    turn_start_response_id: turnStartResponseId,
     turn_id: turnId,
     authorized_turn_ids: structuredClone(authorizedTurnIds),
     started_at: requireTime(startedAt, 'startedAt'),
@@ -186,6 +193,15 @@ export function validateAttemptRecord(attempt) {
     throw attemptError('ATTEMPT_STATUS_INVALID', 'attempt status is invalid');
   }
   exactFields(attempt.launch_receipt, RECEIPT_FIELDS, 'launch_receipt');
+  if (attempt.launch_receipt.receipt_version !== 2) {
+    throw attemptError('LAUNCH_RECEIPT_VERSION_INVALID', 'launch receipt version is invalid');
+  }
+  for (const field of ['thread_id', 'turn_start_response_id', 'turn_id']) {
+    if (typeof attempt.launch_receipt[field] !== 'string'
+      || attempt.launch_receipt[field].length === 0) {
+      throw attemptError('NATIVE_TURN_REQUIRED', `launch receipt ${field} is invalid`);
+    }
+  }
   const authorized = attempt.launch_receipt.authorized_turn_ids;
   if (!Array.isArray(authorized)
     || authorized.length === 0

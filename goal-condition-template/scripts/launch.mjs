@@ -1261,6 +1261,7 @@ export async function runCodexLaunch({
   const cwd = contract.target_roots[0];
 
   let threadId;
+  let initialTurnIds;
   try {
     return await withCodexClient({
       stateDir, codexHome, cwd, authSource, clientFactory,
@@ -1273,7 +1274,7 @@ export async function runCodexLaunch({
       // 不换 contract hash 也就不换 state 目录，占在前面等于连撞三次就把这份 contract 锁死。
       const attemptNumber = await nextAttempt(stateDir);
 
-      ({ threadId } = await client.threadStart({ sandbox: sandboxMode }));
+      ({ threadId, initialTurnIds } = await client.threadStart({ sandbox: sandboxMode }));
       // cwd 一并落盘：finalize/close 不读 contract，重连 daemon 时要拿回同一个工作目录。
       // codex-home.path 与 thread.json 在同一时刻落盘：这一刻之前，state 目录里的两个指针都还
       // 指向上一次成功的那套；这一刻之后，两个都指向本次。中间不存在「thread 坐标说重连旧
@@ -1318,7 +1319,7 @@ export async function runCodexLaunch({
         turnCap: effectiveCap(MAX_TURNS_PER_ATTEMPT, contract, 'max_turns'),
         tokenCap: effectiveCap(MAX_TOKENS_PER_ATTEMPT, contract, 'max_tokens'),
       });
-      return { ...terminal, turnId };
+      return { ...terminal, turnId, initialTurnIds };
     });
   } catch (error) {
     if (error instanceof AttemptClaimError) throw error;

@@ -83,7 +83,7 @@ verify --state-root <controller-state> --session-id <session-id> --attempt-id <a
   --run-id <run-id> --runtime-root <runtime-state>
 ```
 
-LaunchReceipt 的 `authorized_turn_ids` 只来自 controller 发出的 `turn/start` 响应，不把首次 readback 的未知 turn 洗入授权。verify 以 `thread/read(includeTurns=true)` 精确对比；任何额外 turn 都持久化为 `CONTROL_PLANE_BYPASS`，readback 不可归因则进入 `ReconciliationRequired`。随后 controller 在 default-deny Seatbelt 中执行 active Conditions：只读显式系统 runtime 依赖与 target roots、唯一可写 verifier 临时目录、无网络、最小环境、有界进程/CPU/文件资源，不能检查或 signal 宿主进程；启动使用结构化 argv 与 `shell:false`，Condition 仍可显式声明 `/bin/sh -c`，但不会发生隐式 shell 拼接。Evidence 绑定 root baseline、当前 context、runtime version、projection、snapshot 与 Attempt。
+当前 app-server 的 `turn/start` 响应 ID 与 `thread/read` 持久化 ID 可能不同，不能把二者强行视为同一个字段，也不能把任意 readback turn 洗入授权。LaunchReceipt v2 要求 controller 新建 thread 时读取到空 turn 集，随后保存 `turn_start_response_id`；运行结束后的首次 `thread/read(includeTurns=true)` 必须在同一 thread 上精确出现一个持久化 turn，才把该 ID 写入 `turn_id/authorized_turn_ids`，形成有界 `0→1` 因果栅栏。初始非空、零个或多于一个 turn、后续或 finalize 前后的任何额外 turn 都持久化为 `CONTROL_PLANE_BYPASS`；readback 不可归因则进入 `ReconciliationRequired`。随后 controller 在 default-deny Seatbelt 中执行 active Conditions：只读显式系统 runtime 依赖与 target roots、唯一可写 verifier 临时目录、无网络、最小环境、有界进程/CPU/文件资源，不能检查或 signal 宿主进程；启动使用结构化 argv 与 `shell:false`，Condition 仍可显式声明 `/bin/sh -c`，但不会发生隐式 shell 拼接。Evidence 绑定 root baseline、当前 context、runtime version、projection、snapshot 与 Attempt。
 
 verify 红，或 Candidate 阶段的新 reviewer 发现 Authority 内缺口时，把 controller 事实编译为封闭 typed operation，调用 `revise`；revision 输入只有 `operation`，不接受调用方提供的 `controller_facts` 布尔值。`auto_apply` 后先 `close` 被取代 Attempt，释放它的 target-root lease，再用新的 `attempt_id/run_id/nonce` 调 `resume`；GoalSession 层的 resume 是新 immutable Attempt，不复用旧 candidate：
 

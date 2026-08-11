@@ -546,7 +546,12 @@ export class GoalRpcClient {
     // threadId 在 result.thread.id（schema Thread 无 threadId 字段，只有 id）。
     const threadId = r.result?.thread?.id;
     if (!threadId) throw new Error('thread/start returned no threadId: ' + JSON.stringify(r));
-    return { threadId, raw: r };
+    const initialTurns = r.result?.thread?.turns;
+    if (!Array.isArray(initialTurns)
+      || initialTurns.some((turn) => typeof turn?.id !== 'string' || turn.id.length === 0)) {
+      throw new Error('thread/start returned no attributable initial turn set');
+    }
+    return { threadId, initialTurnIds: initialTurns.map((turn) => turn.id), raw: r };
   }
 
   threadResume({ threadId }) {

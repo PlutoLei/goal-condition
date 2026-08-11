@@ -31,7 +31,7 @@ Claude/legacy: Compile v1 → Validate → Preview → Confirm(contract hash)
 
 Compiler 只在缺失信息会导致两个实质不同、且不能采用保守默认时产生一个 blocking `CompilationGap`。Brainstorm/Grill 只用于设计前或对本 skill 做压力测试，绝不成为 runtime 命令、开放式访谈或 mandatory checklist。输入完整时直接编译。
 
-每个 Attempt 必须先持久化 LaunchIntent 与 target-root lease；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path、device、inode，再在同一事务把 intent/session 置为 `dispatching/Dispatching`，之后才能调用既有 Codex launcher；dispatch 前版本和物理身份再核，claim 后任何崩溃或重试只 readback，绝不重发。没有 `write` Authority 的 Attempt 使用 `read-only` sandbox；获授 `write` 才能使用 `workspace-write`。LaunchReceipt 只绑定 controller 发出的 `turn/start` 响应 ID；首次、finalize 前后或其他 readback 出现额外 turn 都是 `CONTROL_PLANE_BYPASS`，不能 Certified。
+每个 Attempt 必须先持久化 LaunchIntent 与 target-root lease；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path、device、inode，再在同一事务把 intent/session 置为 `dispatching/Dispatching`，之后才能调用既有 Codex launcher；dispatch 前版本和物理身份再核，claim 后任何崩溃或重试只 readback，绝不重发。没有 `write` Authority 的 Attempt 使用 `read-only` sandbox；获授 `write` 才能使用 `workspace-write`。LaunchReceipt v2 以 controller 新建 thread 的空 turn 集为前态，同时绑定 `turn/start` 响应 ID 与完成后唯一的持久化 turn ID；不能证明精确 `0→1`，或 finalize 前后出现额外 turn，都是 `CONTROL_PLANE_BYPASS`，不能 Certified。
 
 Hard Prohibition 只能是 controller schema 枚举的 capability ID，且 `rule===capability`；只有 `ENFORCED` 才能启动，`DETECTED`、`DECLARED` 或 `UNAVAILABLE` 一律阻断。Context dependency 必须位于当前 Active Boundary 内并在首次预览展示路径与内容哈希。verifier 在 default-deny Seatbelt、最小环境与有界进程/CPU/文件资源下运行，只读实际 executable/dependency closure 与 target，临时目录唯一可写，不能读其他宿主路径、联网、检查或 signal 宿主进程；executor/runtime 只能给出 Candidate，controller Evidence 当前有效、无旁路/未对账变化且 finalize 原生读回归因成立，才可 Certified Complete。
 

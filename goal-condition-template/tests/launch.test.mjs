@@ -1529,7 +1529,7 @@ function dyingCodexStdioStub() {
   Object.assign(child, { stdin, stdout, kill: () => {} });
   const results = {
     initialize: {},
-    'thread/start': { thread: { id: 't-stub' } },
+    'thread/start': { thread: { id: 't-stub', turns: [] } },
     'thread/goal/set': { goal: makeGoal('active', { threadId: 't-stub' }) },
     'turn/start': { turn: { id: 'turn-1' } },
   };
@@ -3593,7 +3593,7 @@ async function installFakeCodex(setup) {
     '    if (!line) continue;',
     '    const msg = JSON.parse(line);',
     '    writeSync(1, JSON.stringify({ jsonrpc: "2.0", id: msg.id,',
-    '      result: { thread: { id: "t-fake" }, goal, turn: { id: "turn-1" } } }) + "\\n");',
+    '      result: { thread: { id: "t-fake", turns: [] }, goal, turn: { id: "turn-1" } } }) + "\\n");',
     '    if (msg.method === "turn/start") process.exit(0);',
     '  }',
     '});',

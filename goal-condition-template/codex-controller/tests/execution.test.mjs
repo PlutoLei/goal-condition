@@ -79,7 +79,7 @@ test('intent and exclusive root lease are durable before the live launcher is ca
       assert.equal(store.readLaunchIntent('run-0001').status, 'dispatching');
       assert.equal(store.read(session.session_id).status, 'Dispatching');
       return {
-        outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-1',
+        outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-1', initialTurnIds: [],
         candidate: { status: 'ready_for_postflight', remaining_work: false },
       };
     },
@@ -96,7 +96,36 @@ test('intent and exclusive root lease are durable before the live launcher is ca
   store.close();
 });
 
-test('a native turn not named by the controller turn/start response is never authorized by later readback', async () => {
+test('a fresh-thread 0-to-1 fence binds the persisted turn when start response identity drifts', async () => {
+  const { store, session } = await fixture();
+  const prepared = prepareControlledAttempt({
+    store, sessionId: session.session_id, attemptId: 'attempt-id-drift',
+    workspaceDigest: 'b'.repeat(64), runId: 'run-id-drift',
+    expiresAt: '2099-08-11T01:00:00.000Z', nonce: '00112233445566778899aabbccddeeff',
+    capabilityReport: { launchable: true },
+  });
+  const result = await launchControlledAttempt({
+    store,
+    prepared,
+    launch: async () => ({
+      outcome: 'candidate', threadId: 'thread-1',
+      turnId: 'turn-start-response-v7', initialTurnIds: [],
+      candidate: { status: 'ready_for_postflight', remaining_work: false },
+    }),
+    readback: async () => ({
+      available: true, thread_id: 'thread-1', turns: [{ id: 'turn-persisted-v4' }],
+    }),
+    now: '2026-08-11T00:01:00.000Z',
+  });
+  assert.equal(result.disposition, 'candidate');
+  assert.equal(result.receipt.receipt_version, 2);
+  assert.equal(result.receipt.turn_start_response_id, 'turn-start-response-v7');
+  assert.equal(result.receipt.turn_id, 'turn-persisted-v4');
+  assert.deepEqual(result.receipt.authorized_turn_ids, ['turn-persisted-v4']);
+  store.close();
+});
+
+test('more than one persisted turn before receipt is a control-plane bypass', async () => {
   const { store, session } = await fixture();
   const prepared = prepareControlledAttempt({
     store, sessionId: session.session_id, attemptId: 'attempt-injected',
@@ -108,7 +137,7 @@ test('a native turn not named by the controller turn/start response is never aut
     store,
     prepared,
     launch: async () => ({
-      outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-authorized',
+      outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-authorized', initialTurnIds: [],
       candidate: { status: 'ready_for_postflight', remaining_work: false },
     }),
     readback: async () => ({
@@ -253,7 +282,7 @@ test('launch completion cannot overwrite a concurrent controller revision', asyn
           blobs: [],
         });
         return {
-          outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-1',
+          outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-1', initialTurnIds: [],
           candidate: { status: 'ready_for_postflight', remaining_work: false },
         };
       },
@@ -301,7 +330,8 @@ test('a native terminal report rejects the Attempt and blocks the Session', asyn
     store,
     prepared,
     launch: async () => ({
-      outcome: 'terminal_report', threadId: 'thread-1', turnId: 'turn-1', reasons: ['blocked'],
+      outcome: 'terminal_report', threadId: 'thread-1', turnId: 'turn-1', initialTurnIds: [],
+      reasons: ['blocked'],
     }),
     readback: async () => ({ available: true, thread_id: 'thread-1', turns: [{ id: 'turn-1' }] }),
     now: '2026-08-11T00:01:00.000Z',

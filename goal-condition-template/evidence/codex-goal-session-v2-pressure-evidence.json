@@ -9,9 +9,9 @@
   },
   "v2_guidance": {
     "source": "Every with-v2-guidance sample used a distinct fresh agent context that read the complete final SKILL.md, Codex adapter reference, and GoalSession v2 protocol before answering the exact scenario prompt.",
-    "skill_sha256": "d4ed349b07f82e3dee7722dfc441d5d4533ed8d4324a4e3cdf963fb27c8353bd",
-    "codex_reference_sha256": "b3cc11c7c53c2e5377d804cf7ec90e2576f24eee2c6e7bd54c27a4355830ac88",
-    "protocol_reference_sha256": "92b1c0f631689dbbb8562d08c1eee090a0ca7723c3d7ee0227dd258d07999718"
+    "skill_sha256": "c8e08337b07a802b4cce9633648f62e0ee1fe0defbe151c0b29595f40f8fdf60",
+    "codex_reference_sha256": "0938a34ee2233db9dbef728990933323c5c5fd7453026a834d629580e3771563",
+    "protocol_reference_sha256": "7359c7b408c72fc6897897cdffcd94d28b17de7a4f1fccca052dd382ef3f0c36"
   },
   "red_campaign": {
     "fresh_contexts": 5,

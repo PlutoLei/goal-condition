@@ -331,15 +331,16 @@
       "additionalProperties": false,
       "required": [
         "receipt_version", "session_id", "attempt_id", "run_id", "intent_hash",
-        "thread_id", "turn_id", "authorized_turn_ids", "started_at"
+        "thread_id", "turn_start_response_id", "turn_id", "authorized_turn_ids", "started_at"
       ],
       "properties": {
-        "receipt_version": { "const": 1 },
+        "receipt_version": { "const": 2 },
         "session_id": { "$ref": "#/$defs/id" },
         "attempt_id": { "$ref": "#/$defs/id" },
         "run_id": { "$ref": "#/$defs/id" },
         "intent_hash": { "$ref": "#/$defs/hash" },
         "thread_id": { "type": "string", "minLength": 1 },
+        "turn_start_response_id": { "type": "string", "minLength": 1 },
         "turn_id": { "type": "string", "minLength": 1 },
         "authorized_turn_ids": {
           "type": "array",
