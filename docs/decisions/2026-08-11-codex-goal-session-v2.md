@@ -1,6 +1,6 @@
 # ADR：Codex GoalSession v2 控制面
 
-状态：Accepted for planning
+状态：Implemented on the Codex-only release branch
 
 日期：2026-08-11
 
@@ -26,6 +26,14 @@ Codex 侧当前把 Goal、Authority、Boundary、Condition 和 Attempt 聚合为
 - 持久化使用独立 Codex Controller 包、Node.js 24.15 及以上、内置 node:sqlite 与内容寻址 blob；
 - Claude adapter、共享 v1 schema、共享 workflow 和根包 Node 要求不变；
 - Grill 只用于设计评审，不进入 goal-condition 运行时。
+- controller state 与 target root 拒绝 symlink alias，LaunchIntent 绑定 canonical path/device/inode；
+- verifier 使用 default-deny Seatbelt 与资源上限，不能读取非授权宿主路径或控制宿主进程；
+- `opt-in→default` 必须绑定真实动态修订 canary 的 Certified promotion receipt。
+- promotion receipt 必须绑定当前安装 release 的外部 manifest digest；切换 release 后重新 canary；
+- LaunchIntent/Attempt 绑定 controller release digest，prepare 后换版本必须在 dispatch 前拒绝；
+- executor sandbox 由 Active Boundary 的 `write` Authority 投影为 `read-only | workspace-write`；
+- Context dependency 只能位于 Active Boundary 内并在授权预览中显示；
+- finalize 在 terminal mutation 前后执行 exact native turn fence，close 以 runtime quiescence 为释放租约前提。
 
 ## 备选
 

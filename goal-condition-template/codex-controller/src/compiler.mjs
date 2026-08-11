@@ -154,6 +154,8 @@ export function renderAuthorizationPreview(session) {
   const shortFingerprint = session.authorization_hash.slice(0, 12);
   const conditions = design.conditions.map((condition) =>
     `- ${condition.id} [${condition.kind}]: ${condition.rule} (verifier: ${condition.verifier.id})`).join('\n');
+  const contextDependencies = design.context_dependencies.map((dependency) =>
+    `${dependency.id}: ${dependency.path} (content SHA-256 ${dependency.sha256})`);
   const markdown = [
     '# GoalSession Authorization',
     '',
@@ -193,6 +195,10 @@ export function renderAuthorizationPreview(session) {
     '## Initial Conditions',
     '',
     conditions,
+    '',
+    '## Initial Context Dependencies',
+    '',
+    bullet(contextDependencies),
     '',
     '## Automatic Design Revisions',
     '',

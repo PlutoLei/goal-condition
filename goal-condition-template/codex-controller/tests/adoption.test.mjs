@@ -19,4 +19,6 @@ test('legacy adoption creates an unconfirmed Draft with current-state provenance
   assert.equal(result.provenance.baseline_provenance, 'adopted_at_current_state');
   assert.equal(result.provenance.legacy_confirmation, 'unverified');
   assert.equal(result.provenance.certifies_pre_adoption_state, false);
+  assert.deepEqual(result.session.authority_revisions[0].authority.hard_prohibitions, []);
+  assert.ok(result.session.non_goals.includes('Commands are previewed but never executed by validation.'));
 });

@@ -2,10 +2,16 @@ import { isAbsolute, relative, resolve } from 'node:path';
 
 import { digestCanonical, exactFields } from './values.mjs';
 import { validateAttemptRecord } from './attempt.mjs';
+import { validateEvidenceRecord } from './evidence.mjs';
 
 const ID = /^[a-z0-9][a-z0-9-]*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const RISK_ORDER = Object.freeze({ low: 0, medium: 1, high: 2, critical: 3 });
+export const HARD_PROHIBITION_CAPABILITIES = Object.freeze([
+  'workspace-write-boundary',
+  'network-deny',
+  'controller-state-isolation',
+]);
 
 const DRAFT_FIELDS = Object.freeze([
   'session_id',
@@ -97,11 +103,15 @@ const DESIGN_REVISION_FIELDS = Object.freeze([
   'previous_design_revision_hash',
   'design_revision_hash',
 ]);
+const LEDGER_ENTRY_FIELDS = Object.freeze([
+  'sequence', 'event_type', 'payload_hash', 'previous_event_hash', 'event_hash', 'created_at',
+]);
 
 export const GOAL_SESSION_STATUSES = Object.freeze([
   'Drafting',
   'AwaitingConfirmation',
   'Ready',
+  'Dispatching',
   'Running',
   'Evaluating',
   'Revising',
@@ -141,8 +151,8 @@ function stringArray(value, path, { min = 0, unique = true } = {}) {
 }
 
 function finiteBudget(value, path) {
-  if (value !== null && (!Number.isFinite(value) || value < 0)) {
-    throw domainError('BUDGET_INVALID', `${path} must be null or a non-negative finite number`, path);
+  if (value !== null && (!Number.isFinite(value) || value <= 0)) {
+    throw domainError('BUDGET_INVALID', `${path} must be null or a positive finite number`, path);
   }
 }
 
@@ -205,6 +215,15 @@ function validateAuthority(authority, path = 'authority') {
   }
   finiteBudget(authority.maximum_budget, `${path}.maximum_budget`);
   stringArray(authority.hard_prohibitions, `${path}.hard_prohibitions`);
+  authority.hard_prohibitions.forEach((capability, index) => {
+    if (!HARD_PROHIBITION_CAPABILITIES.includes(capability)) {
+      throw domainError(
+        'HARD_PROHIBITION_CAPABILITY_INVALID',
+        `${path}.hard_prohibitions[${index}] is not a mechanically enforced capability`,
+        `${path}.hard_prohibitions[${index}]`,
+      );
+    }
+  });
 }
 
 function validateBoundary(boundary, authority, path = 'active_boundary') {
@@ -330,6 +349,15 @@ function validateDesign(design, authority, deliverableIds, path = 'initial_desig
     if (ids.has(condition.id)) throw domainError('DUPLICATE_ID', `duplicate condition ${condition.id}`, conditionPath);
     ids.add(condition.id);
   });
+  design.conditions.forEach((condition, index) => {
+    if (!design.active_boundary.target_roots.some((root) => isInside(root, condition.verifier.cwd))) {
+      throw domainError(
+        'VERIFIER_CWD_OUTSIDE_BOUNDARY',
+        `${path}.conditions[${index}].verifier.cwd is outside the active boundary`,
+        `${path}.conditions[${index}].verifier.cwd`,
+      );
+    }
+  });
   for (const condition of design.conditions) {
     for (const dependency of [...condition.depends_on, ...condition.strengthens]) {
       if (!ids.has(dependency)) {
@@ -338,6 +366,15 @@ function validateDesign(design, authority, deliverableIds, path = 'initial_desig
     }
   }
   validateContextDependencies(design.context_dependencies, `${path}.context_dependencies`);
+  design.context_dependencies.forEach((dependency, index) => {
+    if (!design.active_boundary.target_roots.some((root) => isInside(root, dependency.path))) {
+      throw domainError(
+        'CONTEXT_OUTSIDE_BOUNDARY',
+        `${path}.context_dependencies[${index}].path is outside the active boundary`,
+        `${path}.context_dependencies[${index}].path`,
+      );
+    }
+  });
   nonEmptyString(design.projection_version, `${path}.projection_version`);
   nonEmptyString(design.reason, `${path}.reason`);
 }
@@ -369,6 +406,48 @@ export function hashAuthorization(goalHash, authorityRevisionHash) {
 
 export function hashDesignRevision(design) {
   return digestCanonical(designSemantic(design));
+}
+
+function authorityExpands(previous, candidate) {
+  const rootsPreserved = previous.target_roots.every((root) =>
+    candidate.target_roots.some((maximum) => isInside(maximum, root)));
+  const budgetPreserved = previous.maximum_budget === null
+    ? true
+    : candidate.maximum_budget !== null && candidate.maximum_budget >= previous.maximum_budget;
+  return rootsPreserved
+    && subset(previous.actions, candidate.actions)
+    && subset(previous.external_effects, candidate.external_effects)
+    && subset(previous.secret_refs, candidate.secret_refs)
+    && subset(previous.hard_prohibitions, candidate.hard_prohibitions)
+    && (!previous.destructive || candidate.destructive)
+    && RISK_ORDER[candidate.maximum_risk] >= RISK_ORDER[previous.maximum_risk]
+    && budgetPreserved;
+}
+
+export function appendAuthorityRevision(session, authority) {
+  validateAuthority(authority, 'operation.payload.authority');
+  const previous = session.authority_revisions.at(-1);
+  if (!authorityExpands(previous.authority, authority)) {
+    throw domainError(
+      'AUTHORITY_EXPANSION_NOT_MONOTONIC',
+      'a new AuthorityRevision may expand but must not remove previously confirmed authority or prohibitions',
+    );
+  }
+  const currentDesign = session.design_revisions.at(-1);
+  const design = Object.fromEntries(
+    INITIAL_DESIGN_FIELDS.map((field) => [field, currentDesign[field]]),
+  );
+  assertDesignWithinAuthority({ goal: session.goal, authority, design });
+  const next = structuredClone(session);
+  const authorityRevisionHash = hashAuthorityRevision(authority);
+  next.authority_revisions.push({
+    revision: previous.revision + 1,
+    authority: structuredClone(authority),
+    previous_authority_revision_hash: previous.authority_revision_hash,
+    authority_revision_hash: authorityRevisionHash,
+  });
+  next.authorization_hash = hashAuthorization(next.goal_hash, authorityRevisionHash);
+  return next;
 }
 
 export function hashAttempt(attempt) {
@@ -502,6 +581,11 @@ export function validateGoalSession(session) {
         if (revision.authority_revision_hash !== hashAuthorityRevision(revision)) {
           diagnostics.push({ code: 'AUTHORITY_HASH_MISMATCH', path: `${path}.authority_revision_hash` });
         }
+        if (revision.revision !== index + 1
+          || revision.previous_authority_revision_hash
+            !== (index === 0 ? null : session.authority_revisions[index - 1].authority_revision_hash)) {
+          diagnostics.push({ code: 'AUTHORITY_REVISION_CHAIN_INVALID', path });
+        }
       } catch (error) {
         diagnostics.push(diagnosticFrom(error));
       }
@@ -528,6 +612,11 @@ export function validateGoalSession(session) {
         validateDesign(design, currentAuthority, deliverableIds, path);
         if (revision.design_revision_hash !== hashDesignRevision(revision)) {
           diagnostics.push({ code: 'DESIGN_HASH_MISMATCH', path: `${path}.design_revision_hash` });
+        }
+        if (revision.revision !== index + 1
+          || revision.previous_design_revision_hash
+            !== (index === 0 ? null : session.design_revisions[index - 1].design_revision_hash)) {
+          diagnostics.push({ code: 'DESIGN_REVISION_CHAIN_INVALID', path });
         }
       } catch (error) {
         diagnostics.push(diagnosticFrom(error));
@@ -559,6 +648,63 @@ export function validateGoalSession(session) {
         runs.add(attempt.run_id);
       } catch (error) {
         diagnostics.push({ ...diagnosticFrom(error), path: `attempts[${index}]` });
+      }
+    });
+  }
+  if (Array.isArray(session.evidence)) {
+    const ids = new Set();
+    session.evidence.forEach((record, index) => {
+      try {
+        validateEvidenceRecord(record);
+        if (ids.has(record.evidence_id)) throw domainError('EVIDENCE_DUPLICATE', 'evidence ids must be unique');
+        ids.add(record.evidence_id);
+      } catch (error) {
+        diagnostics.push({ ...diagnosticFrom(error), path: `evidence[${index}]` });
+      }
+    });
+  }
+  if (Array.isArray(session.confirmation_receipts)) {
+    session.confirmation_receipts.forEach((receipt, index) => {
+      try {
+        exactFields(receipt, RECEIPT_FIELDS, 'confirmation_receipt');
+        const authority = session.authority_revisions.find(
+          (revision) => revision.authority_revision_hash === receipt.authority_revision_hash,
+        );
+        const designFound = session.design_revisions.some(
+          (revision) => revision.design_revision_hash === receipt.presented_design_hash,
+        );
+        const expectedAuthorization = authority === undefined
+          ? null : hashAuthorization(session.goal_hash, authority.authority_revision_hash);
+        const valid = receipt.receipt_version === 1
+          && receipt.session_id === session.session_id
+          && receipt.goal_hash === session.goal_hash
+          && receipt.authorization_hash === expectedAuthorization
+          && receipt.short_fingerprint === receipt.authorization_hash.slice(0, 12)
+          && designFound
+          && !Number.isNaN(new Date(receipt.confirmed_at).getTime())
+          && typeof receipt.thread_id === 'string' && receipt.thread_id.length > 0
+          && typeof receipt.turn_or_message_ref === 'string' && receipt.turn_or_message_ref.length > 0
+          && ['user_message', 'codex-task', 'migration_unverified'].includes(receipt.confirmation_source);
+        if (!valid) throw domainError('CONFIRMATION_RECEIPT_INVALID', 'confirmation receipt is invalid');
+      } catch (error) {
+        diagnostics.push({ ...diagnosticFrom(error), path: `confirmation_receipts[${index}]` });
+      }
+    });
+  }
+  if (Array.isArray(session.decision_ledger)) {
+    session.decision_ledger.forEach((entry, index) => {
+      try {
+        exactFields(entry, LEDGER_ENTRY_FIELDS, 'decision_ledger_entry');
+        const previous = index === 0 ? null : session.decision_ledger[index - 1].event_hash;
+        const valid = entry.sequence === index + 1
+          && typeof entry.event_type === 'string' && entry.event_type.length > 0
+          && typeof entry.payload_hash === 'string' && SHA256.test(entry.payload_hash)
+          && entry.previous_event_hash === previous
+          && typeof entry.event_hash === 'string' && SHA256.test(entry.event_hash)
+          && !Number.isNaN(new Date(entry.created_at).getTime());
+        if (!valid) throw domainError('DECISION_LEDGER_INVALID', 'decision ledger entry is invalid');
+      } catch (error) {
+        diagnostics.push({ ...diagnosticFrom(error), path: `decision_ledger[${index}]` });
       }
     });
   }
@@ -613,7 +759,9 @@ export function transitionSession(session, event) {
     }
     next.confirmation_receipts.push(validatedReceipt(session, event.receipt));
     next.status = 'Ready';
-  } else if (type === 'ATTEMPT_LAUNCHED' && from === 'Ready') {
+  } else if (type === 'ATTEMPT_DISPATCHING' && from === 'Ready') {
+    next.status = 'Dispatching';
+  } else if (type === 'ATTEMPT_LAUNCHED' && from === 'Dispatching') {
     if (event.turn_started !== true) throw domainError('TURN_START_REQUIRED', 'Running requires observed turn/start');
     next.status = 'Running';
   } else if (type === 'ATTEMPT_CANDIDATE' && from === 'Running') next.status = 'Evaluating';
@@ -630,11 +778,28 @@ export function transitionSession(session, event) {
     next.successor_session_id = event.successor_session_id;
     next.status = 'Superseded';
   } else if (type === 'RECONCILIATION_REQUIRED'
-    && ['Ready', 'Running', 'Evaluating', 'Revising', 'Blocked'].includes(from)) {
+    && ['Ready', 'Dispatching', 'Running', 'Evaluating', 'Revising', 'Blocked'].includes(from)) {
     next.status = 'ReconciliationRequired';
   } else if (type === 'RECONCILED' && from === 'ReconciliationRequired') {
     if (event.reconciliation?.controller_owned !== true) {
       throw domainError('CONTROLLER_RECONCILIATION_REQUIRED', 'reconciliation must be controller-owned');
+    }
+    next.status = 'Ready';
+  } else if (type === 'RECONCILED_TO_EVALUATING' && from === 'ReconciliationRequired') {
+    if (event.reconciliation?.controller_owned !== true
+      || !next.attempts.some((attempt) => attempt.status === 'Candidate')) {
+      throw domainError(
+        'CONTROLLER_RECONCILIATION_REQUIRED',
+        'evaluation reconciliation requires a controller-owned Candidate readback',
+      );
+    }
+    next.status = 'Evaluating';
+  } else if (type === 'ATTEMPT_TERMINAL' && from === 'Running') {
+    next.status = 'Blocked';
+  } else if (type === 'CONTROLLER_CLOSED'
+    && ['Dispatching', 'Running', 'ReconciliationRequired', 'Blocked'].includes(from)) {
+    if (event.cleanup?.controller_owned !== true) {
+      throw domainError('CONTROLLER_CLEANUP_REQUIRED', 'close recovery requires controller-owned cleanup');
     }
     next.status = 'Ready';
   } else if (type === 'BLOCK' && !['Complete', 'Superseded'].includes(from)) next.status = 'Blocked';
@@ -662,8 +827,25 @@ export function transitionAttempt(attempt, event) {
   const next = structuredClone(attempt);
   if (attempt.status === 'Prepared' && event?.type === 'TURN_STARTED') next.status = 'Launched';
   else if (attempt.status === 'Launched' && event?.type === 'RUNTIME_COMPLETED') next.status = 'Candidate';
+  else if (attempt.status === 'Launched' && event?.type === 'RUNTIME_TERMINATED') next.status = 'Rejected';
   else if (attempt.status === 'Candidate' && event?.type === 'POSTFLIGHT_REJECTED') next.status = 'Rejected';
   else if (attempt.status === 'Candidate' && event?.type === 'POSTFLIGHT_VERIFIED') next.status = 'Verified';
   else throw illegalTransition('ATTEMPT', attempt.status, event?.type);
+  return next;
+}
+
+export function rejectCurrentCandidateForRevision(session) {
+  const index = session.status === 'Evaluating'
+    ? session.attempts.findLastIndex((attempt) => attempt.status === 'Candidate')
+    : -1;
+  if (index < 0) {
+    throw domainError(
+      'CURRENT_CANDIDATE_REQUIRED',
+      'a reviewer-triggered revision from Evaluating requires the current Candidate',
+    );
+  }
+  const next = structuredClone(session);
+  next.attempts[index] = transitionAttempt(next.attempts[index], { type: 'POSTFLIGHT_REJECTED' });
+  next.attempts[index].completion_level = 'candidate';
   return next;
 }

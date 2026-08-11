@@ -88,7 +88,7 @@ export function adoptLegacyContract({ contract, sessionId, currentStateDigest, o
       statement: contract.objective,
       deliverables: [{ id: deliverableId, description: contract.objective }],
     },
-    non_goals: [],
+    non_goals: contract.constraints.map((constraint) => constraint.rule),
     root_baseline: {
       kind: originalBaseline === null ? 'adopted-current-state' : 'legacy-original',
       digest: originalBaseline?.digest ?? currentStateDigest,
@@ -101,7 +101,9 @@ export function adoptLegacyContract({ contract, sessionId, currentStateDigest, o
       destructive: false,
       maximum_risk: 'low',
       maximum_budget: budget,
-      hard_prohibitions: contract.constraints.map((constraint) => constraint.rule),
+      // Legacy prose constraints have no trustworthy one-to-one mapping to v2 mechanical capabilities.
+      // Preserve them for confirmation as non-goals; the adopter must explicitly choose v2 capabilities.
+      hard_prohibitions: [],
     },
     initial_design: {
       active_boundary: {

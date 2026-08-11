@@ -89,7 +89,7 @@ test('non-goals and hard prohibitions remain visible in every Attempt projection
     result.contextPackage.value.hard_prohibitions,
     session.authority_revisions.at(-1).authority.hard_prohibitions,
   );
-  assert.ok(result.manifest.constraints.some((entry) => entry.rule === 'No production deployment.'));
+  assert.ok(result.manifest.constraints.some((entry) => entry.rule === 'network-deny'));
 });
 
 test('long conditions do not inflate the native objective', () => {

@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  appendAuthorityRevision,
   createGoalSession,
   hashDesignRevision,
+  rejectCurrentCandidateForRevision,
   transitionAttempt,
   transitionSession,
 } from '../src/domain.mjs';
@@ -50,12 +52,11 @@ function fixtureFor(type) {
   const boundary = structuredClone(current.active_boundary);
   switch (type) {
     case 'ADD_CONDITION':
-      return { session, operation: operation(type, { condition: newCondition() }), controllerFacts: {} };
+      return { session, operation: operation(type, { condition: newCondition() }) };
     case 'ADD_AND_VERIFIER':
       return {
         session,
         operation: operation(type, { condition: newCondition() }),
-        controllerFacts: { verifier_controlled: true, dependencies_declared: true },
       };
     case 'TIGHTEN_TYPED_THRESHOLD':
       return {
@@ -66,17 +67,15 @@ function fixtureFor(type) {
           from: 80,
           to: 90,
         }),
-        controllerFacts: { predicate_readback: true },
       };
     case 'NARROW_ACTIVE_BOUNDARY':
       boundary.actions = ['read'];
-      return { session, operation: operation(type, { active_boundary: boundary }), controllerFacts: {} };
+      return { session, operation: operation(type, { active_boundary: boundary }) };
     case 'EXPAND_WITHIN_AUTHORITY':
       boundary.actions = ['read', 'write'];
       return {
         session,
         operation: operation(type, { active_boundary: boundary }),
-        controllerFacts: { boundary_fact_checked: true },
       };
     case 'REFRESH_CONTEXT':
       return {
@@ -86,7 +85,7 @@ function fixtureFor(type) {
           prior_hash: 'b'.repeat(64),
           next_hash: 'c'.repeat(64),
         }),
-        controllerFacts: { context_hash_verified: true },
+        controllerProof: { context_hash: 'c'.repeat(64) },
       };
     case 'REPLACE_EQUIVALENT_VERIFIER': {
       const verifier = structuredClone(current.conditions[0].verifier);
@@ -98,9 +97,6 @@ function fixtureFor(type) {
           verifier,
           proof_ref: 'proof-parity-1',
         }),
-        controllerFacts: {
-          equivalence_proof: { proof_ref: 'proof-parity-1', kind: 'parity', passed: true },
-        },
       };
     }
     case 'CONTROLLER_CORRECTION':
@@ -111,12 +107,11 @@ function fixtureFor(type) {
           prior_hash: hashDesignRevision(current),
           next_value: 'v1.1',
         }),
-        controllerFacts: { correction_verified: true },
       };
     case 'EXPAND_AUTHORITY': {
       const authority = structuredClone(session.authority_revisions.at(-1).authority);
       authority.target_roots.push('/work/second-project');
-      return { session, operation: operation(type, { authority }), controllerFacts: {} };
+      return { session, operation: operation(type, { authority }) };
     }
     case 'WEAKEN_CONDITION':
       return {
@@ -125,7 +120,6 @@ function fixtureFor(type) {
           condition_id: 'condition-tests',
           replacement: { ...current.conditions[0], rule: 'Most tests pass.' },
         }),
-        controllerFacts: {},
       };
     case 'CHANGE_GOAL':
       return {
@@ -134,13 +128,11 @@ function fixtureFor(type) {
           goal: { statement: 'Deploy the change.', deliverables: session.goal.deliverables },
           non_goals: [],
         }),
-        controllerFacts: {},
       };
     case 'UNCLASSIFIED':
       return {
         session,
         operation: operation(type, { description: 'free-text change' }),
-        controllerFacts: {},
       };
     default:
       throw new Error(`unknown fixture ${type}`);
@@ -154,10 +146,10 @@ const cases = [
   ['NARROW_ACTIVE_BOUNDARY', 'auto_apply'],
   ['EXPAND_WITHIN_AUTHORITY', 'auto_apply'],
   ['REFRESH_CONTEXT', 'auto_apply'],
-  ['REPLACE_EQUIVALENT_VERIFIER', 'auto_apply'],
-  ['CONTROLLER_CORRECTION', 'auto_apply'],
+  ['REPLACE_EQUIVALENT_VERIFIER', 'reject'],
+  ['CONTROLLER_CORRECTION', 'reject'],
   ['EXPAND_AUTHORITY', 'reauthorize'],
-  ['WEAKEN_CONDITION', 'reauthorize'],
+  ['WEAKEN_CONDITION', 'successor_required'],
   ['CHANGE_GOAL', 'successor_required'],
   ['UNCLASSIFIED', 'reject'],
 ];
@@ -171,10 +163,85 @@ test('ADD_CONDITION with an unknown deliverable requires a successor', () => {
   assert.equal(evaluateRevision(fixture).decision, 'successor_required');
 });
 
-test('EXPAND_WITHIN_AUTHORITY outside the maximum envelope requires reauthorization', () => {
+test('EXPAND_WITHIN_AUTHORITY outside the maximum envelope is rejected until an explicit AuthorityRevision is supplied', () => {
   const fixture = fixtureFor('EXPAND_WITHIN_AUTHORITY');
   fixture.operation.payload.active_boundary.target_roots.push('/srv/not-authorized');
-  assert.equal(evaluateRevision(fixture).decision, 'reauthorize');
+  const result = evaluateRevision(fixture);
+  assert.equal(result.decision, 'reject');
+  assert.deepEqual(result.reason_codes, ['AUTHORITY_EXPANSION_REQUIRES_EXPLICIT_REVISION']);
+});
+
+test('ADD_AND_VERIFIER preserves every prior Condition byte-for-byte and appends exactly one unique Condition', () => {
+  const fixture = fixtureFor('ADD_AND_VERIFIER');
+  const before = structuredClone(fixture.session.design_revisions.at(-1).conditions);
+  const result = evaluateRevision(fixture);
+  assert.equal(result.decision, 'auto_apply');
+  assert.deepEqual(result.next_design.conditions.slice(0, before.length), before);
+  assert.equal(result.next_design.conditions.length, before.length + 1);
+  assert.equal(new Set(result.next_design.conditions.map((item) => item.id)).size, before.length + 1);
+});
+
+test('typed revision payloads are closed-world at the live policy boundary', () => {
+  const fixture = fixtureFor('ADD_AND_VERIFIER');
+  fixture.operation.payload.unexpected_caller_field = { controller_owned: true };
+  assert.deepEqual(evaluateRevision(fixture), {
+    decision: 'reject', reason_codes: ['OPERATION_INVALID'], next_design: null, invalidations: [],
+  });
+  delete fixture.operation.payload.unexpected_caller_field;
+  fixture.operation.reason = '';
+  assert.equal(evaluateRevision(fixture).decision, 'reject');
+  fixture.operation.reason = 'valid';
+  fixture.operation.evidence_refs = ['evidence-1', 'evidence-1'];
+  assert.equal(evaluateRevision(fixture).decision, 'reject');
+});
+
+test('CONTROLLER_CORRECTION rejects caller-selected projection values without an independent controller proof API', () => {
+  const fixture = fixtureFor('CONTROLLER_CORRECTION');
+  const result = evaluateRevision(fixture);
+  assert.equal(result.decision, 'reject');
+  assert.deepEqual(result.reason_codes, ['CONTROLLER_CORRECTION_PROOF_REQUIRED']);
+});
+
+test('Authority expansion appends a hash-chained revision and changes the authorization hash', () => {
+  const session = baseSession();
+  const authority = structuredClone(session.authority_revisions.at(-1).authority);
+  authority.target_roots.push('/work/second-project');
+  authority.maximum_risk = 'medium';
+  const next = appendAuthorityRevision(session, authority);
+  assert.equal(next.authority_revisions.length, 2);
+  assert.equal(next.authority_revisions[1].revision, 2);
+  assert.equal(
+    next.authority_revisions[1].previous_authority_revision_hash,
+    session.authority_revisions[0].authority_revision_hash,
+  );
+  assert.notEqual(next.authorization_hash, session.authorization_hash);
+});
+
+test('Authority revision cannot remove roots, actions, or hard prohibitions', () => {
+  const session = baseSession();
+  const authority = structuredClone(session.authority_revisions.at(-1).authority);
+  authority.actions = ['read'];
+  authority.hard_prohibitions = [];
+  assert.throws(
+    () => appendAuthorityRevision(session, authority),
+    (error) => error.code === 'AUTHORITY_EXPANSION_NOT_MONOTONIC',
+  );
+});
+
+test('Authority budget grants use null as no grant and remain expansion-only', () => {
+  const withoutBudget = baseSession();
+  const grant = structuredClone(withoutBudget.authority_revisions.at(-1).authority);
+  grant.maximum_budget = 10;
+  const granted = appendAuthorityRevision(withoutBudget, grant);
+  assert.equal(granted.authority_revisions.at(-1).authority.maximum_budget, 10);
+  assert.notEqual(granted.authorization_hash, withoutBudget.authorization_hash);
+
+  const removeGrant = structuredClone(grant);
+  removeGrant.maximum_budget = null;
+  assert.throws(
+    () => appendAuthorityRevision(granted, removeGrant),
+    (error) => error.code === 'AUTHORITY_EXPANSION_NOT_MONOTONIC',
+  );
 });
 
 test('TIGHTEN_TYPED_THRESHOLD rejects a decreasing gte threshold', () => {
@@ -185,14 +252,18 @@ test('TIGHTEN_TYPED_THRESHOLD rejects a decreasing gte threshold', () => {
 
 test('REPLACE_EQUIVALENT_VERIFIER rejects missing controller proof', () => {
   const fixture = fixtureFor('REPLACE_EQUIVALENT_VERIFIER');
-  fixture.controllerFacts = {};
   assert.equal(evaluateRevision(fixture).decision, 'reject');
 });
 
-test('executor monotonic claims are not controller facts', () => {
+test('executor monotonic claims cannot replace controller-owned state comparison', () => {
   const fixture = fixtureFor('TIGHTEN_TYPED_THRESHOLD');
-  fixture.controllerFacts = {};
   fixture.operation.monotonic = true;
+  assert.equal(evaluateRevision(fixture).decision, 'reject');
+});
+
+test('REFRESH_CONTEXT rejects a caller claim that lacks controller-read bytes', () => {
+  const fixture = fixtureFor('REFRESH_CONTEXT');
+  delete fixture.controllerProof;
   assert.equal(evaluateRevision(fixture).decision, 'reject');
 });
 
@@ -224,7 +295,8 @@ test('session transitions reject no-receipt Ready, false Complete, and reconcili
     type: 'AUTHORIZATION_CONFIRMED',
     receipt: confirmationReceipt(awaiting),
   });
-  const running = transitionSession(ready, { type: 'ATTEMPT_LAUNCHED', turn_started: true });
+  const dispatching = transitionSession(ready, { type: 'ATTEMPT_DISPATCHING' });
+  const running = transitionSession(dispatching, { type: 'ATTEMPT_LAUNCHED', turn_started: true });
   const evaluating = transitionSession(running, { type: 'ATTEMPT_CANDIDATE' });
   assert.throws(
     () => transitionSession(evaluating, { type: 'CERTIFIED' }),
@@ -249,9 +321,37 @@ test('attempt transitions are exact and pre-turn failure creates no attempt', ()
   const candidate = transitionAttempt(launched, { type: 'RUNTIME_COMPLETED' });
   assert.equal(candidate.status, 'Candidate');
   assert.equal(transitionAttempt(candidate, { type: 'POSTFLIGHT_VERIFIED' }).status, 'Verified');
+  assert.equal(transitionAttempt(launched, { type: 'RUNTIME_TERMINATED' }).status, 'Rejected');
   assert.throws(
     () => transitionAttempt(prepared, { type: 'POSTFLIGHT_VERIFIED' }),
     (error) => error.code === 'ILLEGAL_ATTEMPT_TRANSITION',
+  );
+});
+
+test('controller-owned close recovers dispatch, runtime, reconciliation, and blocked states to Ready', () => {
+  for (const status of ['Dispatching', 'Running', 'ReconciliationRequired', 'Blocked']) {
+    const session = { ...baseSession(), status };
+    assert.equal(transitionSession(session, {
+      type: 'CONTROLLER_CLOSED', cleanup: { controller_owned: true },
+    }).status, 'Ready');
+  }
+  assert.throws(
+    () => transitionSession({ ...baseSession(), status: 'Running' }, { type: 'CONTROLLER_CLOSED' }),
+    (error) => error.code === 'CONTROLLER_CLEANUP_REQUIRED',
+  );
+});
+
+test('a reviewer-triggered revision rejects the current Candidate before a new Attempt', () => {
+  const session = { status: 'Evaluating', attempts: [
+    { attempt_id: 'attempt-old', status: 'Candidate', completion_level: null },
+  ] };
+  const rejected = rejectCurrentCandidateForRevision(session);
+  assert.equal(rejected.attempts[0].status, 'Rejected');
+  assert.equal(rejected.attempts[0].completion_level, 'candidate');
+  assert.equal(session.attempts[0].status, 'Candidate');
+  assert.throws(
+    () => rejectCurrentCandidateForRevision({ status: 'Ready', attempts: session.attempts }),
+    (error) => error.code === 'CURRENT_CANDIDATE_REQUIRED',
   );
 });
 

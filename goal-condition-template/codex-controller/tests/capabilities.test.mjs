@@ -46,3 +46,18 @@ test('unknown, declared, or merely detected mechanisms cannot satisfy a hard pro
     'HARD_PROHIBITION_NOT_ENFORCED:native-turn-readback',
   ]);
 });
+
+test('an exact read-only sandbox is a stronger workspace boundary and still denies network', () => {
+  const report = assessCapabilities({
+    probes: {
+      ...enforcedProbes,
+      sandbox: { type: 'readOnly', networkAccess: false },
+    },
+    hardProhibitions: [
+      { id: 'target-only', capability: 'workspace-write-boundary' },
+      { id: 'no-network', capability: 'network-deny' },
+    ],
+  });
+  assert.equal(report.launchable, true);
+  assert.deepEqual(report.hard_prohibitions.map((item) => item.level), ['ENFORCED', 'ENFORCED']);
+});

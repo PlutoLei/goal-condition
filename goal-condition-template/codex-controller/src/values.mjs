@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
 
 import { canonicalJson, isTemporaryPath } from '../../scripts/lib/contract.mjs';
@@ -40,6 +41,62 @@ function pathsOverlap(left, right) {
   return delta === '' || (!delta.startsWith('..') && !isAbsolute(delta));
 }
 
+function prospectiveRealpath(path) {
+  const suffix = [];
+  let cursor = path;
+  while (!existsSync(cursor)) {
+    const parent = resolve(cursor, '..');
+    if (parent === cursor) throw valueError('PATH_IDENTITY_UNAVAILABLE', 'path has no existing ancestor');
+    suffix.unshift(cursor.slice(parent.length + (parent.endsWith('/') ? 0 : 1)));
+    cursor = parent;
+  }
+  return resolve(realpathSync(cursor), ...suffix);
+}
+
+export function captureRootIdentities(roots) {
+  if (!Array.isArray(roots) || roots.length === 0) {
+    throw valueError('TARGET_ROOT_INVALID', 'at least one target root is required', 'targetRoots');
+  }
+  return roots.map((root, index) => {
+    if (typeof root !== 'string' || !isAbsolute(root) || resolve(root) !== root) {
+      throw valueError('TARGET_ROOT_INVALID', 'target roots must be normalized absolute paths', `targetRoots[${index}]`);
+    }
+    let physical;
+    let info;
+    try {
+      physical = realpathSync(root);
+      info = statSync(root);
+    } catch {
+      throw valueError('TARGET_ROOT_INVALID', 'target roots must exist and be readable', `targetRoots[${index}]`);
+    }
+    if (physical !== root) {
+      throw valueError(
+        'TARGET_ROOT_SYMLINKED',
+        'target roots and every ancestor must use their canonical physical path',
+        `targetRoots[${index}]`,
+      );
+    }
+    if (!info.isDirectory()) {
+      throw valueError('TARGET_ROOT_INVALID', 'target roots must be directories', `targetRoots[${index}]`);
+    }
+    return { path: root, device: String(info.dev), inode: String(info.ino) };
+  });
+}
+
+export function assertRootIdentities(expected) {
+  if (!Array.isArray(expected) || expected.length === 0) {
+    throw valueError('TARGET_ROOT_IDENTITY_INVALID', 'target root identities are required');
+  }
+  const current = captureRootIdentities(expected.map((identity) => identity?.path));
+  if (canonicalJson(current) !== canonicalJson(expected)) {
+    throw valueError(
+      'TARGET_ROOT_IDENTITY_CHANGED',
+      'a target root physical identity changed after the LaunchIntent was signed',
+    );
+  }
+  return true;
+}
+
 export function assertStableStateRoot({ stateRoot, targetRoots = [] }) {
   if (typeof stateRoot !== 'string' || !isAbsolute(stateRoot) || resolve(stateRoot) !== stateRoot) {
     throw valueError('STATE_ROOT_INVALID', 'controller stateRoot must be a normalized absolute path', 'stateRoot');
@@ -47,9 +104,23 @@ export function assertStableStateRoot({ stateRoot, targetRoots = [] }) {
   if (isTemporaryPath(stateRoot)) {
     throw valueError('STATE_ROOT_TEMPORARY', 'controller stateRoot must not use a temporary directory', 'stateRoot');
   }
-  for (const targetRoot of targetRoots) {
+  if (prospectiveRealpath(stateRoot) !== stateRoot) {
+    throw valueError(
+      'STATE_ROOT_SYMLINKED',
+      'controller stateRoot and every ancestor must use their canonical physical path',
+      'stateRoot',
+    );
+  }
+  for (const [index, targetRoot] of targetRoots.entries()) {
     if (typeof targetRoot !== 'string' || !isAbsolute(targetRoot) || resolve(targetRoot) !== targetRoot) {
-      throw valueError('TARGET_ROOT_INVALID', 'target roots must be normalized absolute paths', 'targetRoots');
+      throw valueError('TARGET_ROOT_INVALID', 'target roots must be normalized absolute paths', `targetRoots[${index}]`);
+    }
+    if (prospectiveRealpath(targetRoot) !== targetRoot) {
+      throw valueError(
+        'TARGET_ROOT_SYMLINKED',
+        'target roots and every existing ancestor must use their canonical physical path',
+        `targetRoots[${index}]`,
+      );
     }
     if (pathsOverlap(targetRoot, stateRoot) || pathsOverlap(stateRoot, targetRoot)) {
       throw valueError(

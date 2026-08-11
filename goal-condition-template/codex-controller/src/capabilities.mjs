@@ -25,11 +25,24 @@ function exactWorkspaceSandbox(value) {
     && value.excludeSlashTmp === false;
 }
 
+function exactReadOnlySandbox(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  try {
+    exactFields(value, ['type', 'networkAccess'], 'sandbox');
+  } catch {
+    return false;
+  }
+  return value.type === 'readOnly' && value.networkAccess === false;
+}
+
 export function assessCapabilities({ probes = {}, hardProhibitions = [] } = {}) {
-  const sandboxExact = exactWorkspaceSandbox(probes.sandbox);
+  const workspaceSandboxExact = exactWorkspaceSandbox(probes.sandbox);
+  const readOnlySandboxExact = exactReadOnlySandbox(probes.sandbox);
+  const sandboxExact = workspaceSandboxExact || readOnlySandboxExact;
+  const sandboxDescription = readOnlySandboxExact ? 'readOnly' : 'workspaceWrite';
   const capabilities = {
     'workspace-write-boundary': sandboxExact
-      ? capability('ENFORCED', 'Codex workspaceWrite sandbox is exact and closed-world verified.')
+      ? capability('ENFORCED', `Codex ${sandboxDescription} sandbox is exact and closed-world verified.`)
       : capability('UNAVAILABLE', 'The workspace sandbox cannot be verified exactly.'),
     'network-deny': sandboxExact && probes.sandbox.networkAccess === false
       ? capability('ENFORCED', 'The verified Codex sandbox disables network access.')

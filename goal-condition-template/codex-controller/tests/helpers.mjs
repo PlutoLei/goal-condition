@@ -22,7 +22,7 @@ export function validDraft() {
       destructive: false,
       maximum_risk: 'low',
       maximum_budget: null,
-      hard_prohibitions: ['No production deployment.'],
+      hard_prohibitions: ['network-deny'],
     },
     initial_design: {
       active_boundary: {

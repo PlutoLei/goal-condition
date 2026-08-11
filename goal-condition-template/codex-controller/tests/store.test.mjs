@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
@@ -53,7 +53,21 @@ test('target-root leases are exclusive and expired owners require reconciliation
     }),
     (error) => error.code === 'TARGET_ROOT_LEASE_RECONCILIATION_REQUIRED',
   );
+  assert.equal(store.readRootLease(target, { runId: 'run-a' }).status, 'reconciliation_required');
   store.close();
+});
+
+test('controller state rejects a symlinked ancestor that resolves inside an executor target', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-store-symlink-state-test-'));
+  roots.push(root);
+  const target = join(root, 'target');
+  const alias = join(root, 'alias');
+  await mkdir(target);
+  await symlink(target, alias, 'dir');
+  assert.throws(
+    () => openSessionStore({ stateRoot: join(alias, 'controller-state'), targetRoots: [target] }),
+    (error) => ['STATE_ROOT_SYMLINKED', 'STATE_ROOT_OVERLAPS_TARGET'].includes(error.code),
+  );
 });
 
 test('read-only leases can share a target root while writable leases remain exclusive', async () => {
@@ -81,6 +95,41 @@ test('read-only leases can share a target root while writable leases remain excl
       ownerToken: 'owner-c', expiresAt: '2026-08-11T00:01:00.000Z', writable: true,
     }),
     (error) => error.code === 'TARGET_ROOT_LEASE_CONFLICT',
+  );
+  store.close();
+});
+
+test('launch intent claim is a one-way pending to dispatching CAS and enforces expiry', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-store-intent-test-'));
+  roots.push(root);
+  const target = join(root, 'target-root');
+  await mkdir(target);
+  let now = new Date('2026-08-11T00:00:00.000Z');
+  const store = openSessionStore({ stateRoot: join(root, 'state'), targetRoots: [target], clock: () => now });
+  const session = store.create(createGoalSession(validDraft()));
+  const intent = {
+    intent_version: 1, session_id: session.session_id, attempt_id: 'attempt-a', run_id: 'run-a',
+    expires_at: '2026-08-11T00:01:00.000Z', payload: 'opaque-for-store',
+  };
+  store.persistLaunchIntent({ intent, roots: [target], ownerToken: 'owner-a' });
+  assert.equal(store.claimLaunchIntent({ runId: 'run-a' }).status, 'dispatching');
+  assert.throws(
+    () => store.claimLaunchIntent({ runId: 'run-a' }),
+    (error) => error.code === 'LAUNCH_INTENT_NOT_PENDING',
+  );
+  assert.throws(
+    () => store.updateLaunchIntentStatus({ runId: 'run-a', status: 'pending' }),
+    (error) => error.code === 'LAUNCH_INTENT_TRANSITION_INVALID',
+  );
+  store.updateLaunchIntentStatus({ runId: 'run-a', status: 'closed' });
+  store.releaseRootLeases({ runId: 'run-a', ownerToken: 'owner-a' });
+
+  const expired = { ...intent, run_id: 'run-b', attempt_id: 'attempt-b' };
+  store.persistLaunchIntent({ intent: expired, roots: [target], ownerToken: 'owner-b' });
+  now = new Date('2026-08-11T00:02:00.000Z');
+  assert.throws(
+    () => store.claimLaunchIntent({ runId: 'run-b' }),
+    (error) => error.code === 'LAUNCH_INTENT_EXPIRED',
   );
   store.close();
 });

@@ -112,10 +112,12 @@ export const RPC_TIMEOUT_MS = 60_000;
 const DIGEST = /^[0-9a-f]{64}$/;
 // launch.mjs 的 GoalRpcClient.threadStart 把 sandbox 钉死在这个值（S6 finalize receipt 可信的前提）。
 export const CODEX_SANDBOX_MODE = 'workspace-write';
+export const CODEX_READ_ONLY_SANDBOX_MODE = 'read-only';
 // 同一个沙箱模式在协议两侧是两个词形：请求参数写 kebab 的 `workspace-write`（上面那个常量），
 // 响应体里的 `sandbox.type` 回的是 camel 的 `workspaceWrite`（0.147.0-alpha.6.5 实测，`thread/start`
 // 与 `thread/resume` 的 config 块逐字一致）。两个都得存在——拿请求词形去比响应会永远红。
 export const CODEX_SANDBOX_TYPE = 'workspaceWrite';
+export const CODEX_READ_ONLY_SANDBOX_TYPE = 'readOnly';
 
 // `thread/start` 产出的沙箱块的逐字形态（同一次实测，start 与 resume 两侧的 config 块相同）。
 // 续跑校验比的是**整块**而不是 `type` 一个字段：同 type 而可写面被放大的沙箱（`writableRoots` 多出
@@ -131,6 +133,10 @@ export const CODEX_SANDBOX_PROFILE = Object.freeze({
   networkAccess: false,
   excludeTmpdirEnvVar: false,
   excludeSlashTmp: false,
+});
+export const CODEX_READ_ONLY_SANDBOX_PROFILE = Object.freeze({
+  type: CODEX_READ_ONLY_SANDBOX_TYPE,
+  networkAccess: false,
 });
 
 // prepare 的探测失败会把 `probe failed: …` 原样写进 probes.codexVersionRaw。它非空，所以只判
@@ -212,7 +218,12 @@ export function assertLaunchable(contract, probes) {
     reasons.push('codex version has not been collected: prepare could not read a version out of '
       + '`codex --version` (install codex or fix PATH so the launcher can find it, then re-run prepare)');
   }
-  if (probes?.sandboxMode !== CODEX_SANDBOX_MODE) reasons.push(`sandbox mode must be ${CODEX_SANDBOX_MODE}`);
+  const expectedSandboxMode = probes?.expectedSandboxMode ?? CODEX_SANDBOX_MODE;
+  if (![CODEX_SANDBOX_MODE, CODEX_READ_ONLY_SANDBOX_MODE].includes(expectedSandboxMode)) {
+    reasons.push('expected sandbox mode is not a controller-supported mode');
+  } else if (probes?.sandboxMode !== expectedSandboxMode) {
+    reasons.push(`sandbox mode must be ${expectedSandboxMode}`);
+  }
   reasons.push(...stateDirReasons(probes?.targetRoots, probes?.stateDir, probes?.temporaryRoot));
   // spec §5 的「逐条对应」指每一条 physical 约束，不是「每一条提到 sandbox 的」。此前不提
   // sandbox 的 mechanism（proxy、只读凭证）与缺失 mechanism 都被 continue 放过，等于 physical

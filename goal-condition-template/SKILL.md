@@ -5,12 +5,15 @@ description: 当用户要求把任务、边界包或已有完成条件编译成�
 
 # goal-condition
 
-本 skill 是平台无关的 router/compiler。它把输入编译为同一份 run contract，交给所选 runtime adapter 启动，并由当前主会话独立终验。它不复制平台 CLI 帮助，不保存项目私有锚点，也不递归创建另一个 goal。
+本 skill 是平台无关的 router/compiler。Claude 与 legacy Codex 继续使用 v1 run contract；新 Codex 任务默认使用 GoalSession v2。它不保存项目私有锚点，也不递归创建另一个 goal。
 
-唯一合法顺序如下，催促、已有 launcher 或表面成功都不能跳步：
+先 Classify，再按 runtime 分流：
 
 ```text
-Classify → Compile → Validate → Preview → Confirm(hash)
+Codex v2: Compile Goal+Authority+Design → Preview → Confirm(authorization_hash)
+→ Prepare Attempt → Launch → Verify → Revise/Next Attempt → Finalize → Close
+
+Claude/legacy: Compile v1 → Validate → Preview → Confirm(contract hash)
 → Preflight → Launch(adapter) → Postflight → Close
 ```
 
@@ -20,13 +23,19 @@ Classify → Compile → Validate → Preview → Confirm(hash)
 
 一个 contract 只能有一个 single objective。输入若含多个可独立完成的目标，必须让用户选择一个；不得静默合并，也不得在本 skill 内启动子 goal 来拆分。
 
-## Codex v2 Shadow 分支
+## Codex GoalSession v2
 
-仅当 `runtime="codex"` 且本地 GoalSession v2 controller 能力可用时，并行生成 Codex-only shadow classification；详细模型与边界见 [Codex adapter](references/adapters/codex.md)。v2 的授权语义是一次确认稳定的 Goal、Non-goals、Maximum Authority、Hard Prohibitions 与最大风险/预算；Boundary 和 Condition 是可随 controller-owned Evidence 演化的 typed Design Revisions。
+当 `runtime="codex"`、controller 可用且 rollout mode 为 `default`，新任务走 [GoalSession v2 操作协议](references/codex-goal-session-v2.md)；`opt-in` 仅在用户选择时使用，`shadow` 保留 v1 live，`legacy-freeze` 禁止新建 v1。`opt-in→default` 必须绑定当前安装 manifest digest、controller-owned Certified live canary receipt；换 release 后旧 receipt 失效。已有 v1 task 默认继续 legacy，只有用户明确 Adopt 才迁移。Claude 不进入本分支。
 
-Authority 内的单调收紧、Context refresh、受证 verifier 等价替换和 controller correction 不重开整包授权；扩大 Authority、提高风险/预算、弱化 Condition 或改变 Goal 必须 reauthorization 或 successor。只在缺失信息会导致两个实质不同且都不能保守默认的编译结果时产生 `CompilationGap`；Grill 只可作为设计评审方法，不得进入运行时提问循环。
+一次确认稳定的 Goal、Non-goals、Maximum Authority、机械 Hard Prohibition capability 与最大风险/预算；初始 Boundary 与 Conditions 会展示但不冻结进授权哈希。Authority 内的单调收紧、只追加 Condition、controller 读取 bytes 后的 Context refresh 形成 typed Design Revision，并在新的不可变 Attempt 继续，不重复确认整包。扩大 Authority 会追加 AuthorityRevision、生成新 authorization hash 并重新确认；弱化 Condition 或改变 Goal 必须 successor。verifier 等价替换与 controller correction 在独立 proof API 落地前 fail closed。
 
-本阶段 v2 **只运行 shadow**：它只给出 proposal、decision 与审计摘要，不替代下文 v1 的完整 hash confirmation，不调用 launch/resume/finalize/close，也不把 revision 应用到 live run。能力不可用时明确报告 legacy mode；不得假装动态 revision 已生效。Claude 路径完全沿用下文 v1 顺序与语义。
+Compiler 只在缺失信息会导致两个实质不同、且不能采用保守默认时产生一个 blocking `CompilationGap`。Brainstorm/Grill 只用于设计前或对本 skill 做压力测试，绝不成为 runtime 命令、开放式访谈或 mandatory checklist。输入完整时直接编译。
+
+每个 Attempt 必须先持久化 LaunchIntent 与 target-root lease；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path、device、inode，再在同一事务把 intent/session 置为 `dispatching/Dispatching`，之后才能调用既有 Codex launcher；dispatch 前版本和物理身份再核，claim 后任何崩溃或重试只 readback，绝不重发。没有 `write` Authority 的 Attempt 使用 `read-only` sandbox；获授 `write` 才能使用 `workspace-write`。LaunchReceipt 只绑定 controller 发出的 `turn/start` 响应 ID；首次、finalize 前后或其他 readback 出现额外 turn 都是 `CONTROL_PLANE_BYPASS`，不能 Certified。
+
+Hard Prohibition 只能是 controller schema 枚举的 capability ID，且 `rule===capability`；只有 `ENFORCED` 才能启动，`DETECTED`、`DECLARED` 或 `UNAVAILABLE` 一律阻断。Context dependency 必须位于当前 Active Boundary 内并在首次预览展示路径与内容哈希。verifier 在 default-deny Seatbelt、最小环境与有界进程/CPU/文件资源下运行，只读实际 executable/dependency closure 与 target，临时目录唯一可写，不能读其他宿主路径、联网、检查或 signal 宿主进程；executor/runtime 只能给出 Candidate，controller Evidence 当前有效、无旁路/未对账变化且 finalize 原生读回归因成立，才可 Certified Complete。
+
+## Claude 与 legacy v1
 
 ## Compile
 

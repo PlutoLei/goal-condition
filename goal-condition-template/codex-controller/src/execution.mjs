@@ -9,6 +9,7 @@ import {
 import { transitionAttempt, transitionSession } from './domain.mjs';
 import { projectAttempt } from './projector.mjs';
 import { reconcileLaunch } from './recovery.mjs';
+import { assertRootIdentities, captureRootIdentities } from './values.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
 
@@ -42,7 +43,7 @@ export function attemptRuntimePrompt(projection) {
 
 export function prepareControlledAttempt({
   store, sessionId, attemptId, workspaceDigest, runId, expiresAt, nonce,
-  capabilityReport,
+  capabilityReport, controllerReleaseDigest,
 }) {
   if (capabilityReport?.launchable !== true) {
     throw executionError('CAPABILITY_PREFLIGHT_FAILED', 'required runtime capabilities are not enforced');
@@ -71,6 +72,10 @@ export function prepareControlledAttempt({
     contextPackageHash: projection.contextPackage.sha256,
     projectionProofHash: projection.projectionProof.sha256,
     workspaceDigest,
+    controllerReleaseDigest,
+    targetRootIdentities: captureRootIdentities(
+      session.design_revisions.at(-1).active_boundary.target_roots,
+    ),
     runId,
     nonce,
     expiresAt,
@@ -127,11 +132,34 @@ async function reconcileAmbiguous({ store, prepared, readback }) {
   return { ...reconciliation, session: committed };
 }
 
-export async function launchControlledAttempt({ store, prepared, launch, readback, now }) {
-  const stored = intentWithoutStatus(store.readLaunchIntent(prepared.run_id));
+export async function launchControlledAttempt({
+  store, prepared, launch, readback, now, controllerReleaseDigest,
+}) {
+  if (typeof controllerReleaseDigest !== 'string' || !HASH.test(controllerReleaseDigest)
+    || prepared.intent.controller_release_digest !== controllerReleaseDigest) {
+    throw executionError(
+      'CONTROLLER_RELEASE_CHANGED',
+      'the controller release changed after this LaunchIntent was prepared',
+    );
+  }
+  const storedRecord = store.readLaunchIntent(prepared.run_id);
+  if (storedRecord.status !== 'pending') {
+    throw executionError('LAUNCH_INTENT_NOT_PENDING', 'a claimed launch intent must never be replayed');
+  }
+  const stored = intentWithoutStatus(storedRecord);
   if (canonicalJson(stored) !== canonicalJson(prepared.intent)) {
     throw executionError('LAUNCH_INTENT_MISMATCH', 'prepared intent does not match durable state');
   }
+  assertRootIdentities(prepared.intent.target_root_identities);
+  const ready = store.read(prepared.session_id);
+  const dispatching = transitionSession(ready, { type: 'ATTEMPT_DISPATCHING' });
+  const { session: dispatched } = store.claimLaunchIntentAndCommitSession({
+    runId: prepared.run_id,
+    sessionId: ready.session_id,
+    expectedRevision: ready.revision,
+    eventType: 'ATTEMPT_DISPATCHING',
+    nextState: dispatching,
+  });
   let runtime;
   try {
     runtime = await launch({ prepared });
@@ -148,28 +176,40 @@ export async function launchControlledAttempt({ store, prepared, launch, readbac
     return reconcileAmbiguous({ store, prepared, readback });
   }
   const turns = Array.isArray(native?.turns) ? native.turns : [];
-  const turn = turns.at(-1);
-  if (native?.available !== true || native.thread_id !== runtime.threadId || typeof turn?.id !== 'string') {
+  const authorizedTurnIds = [runtime?.turnId];
+  if (native?.available !== true
+    || native.thread_id !== runtime.threadId
+    || typeof runtime?.turnId !== 'string'
+    || runtime.turnId.length === 0
+    || turns.length !== 1
+    || turns[0]?.id !== runtime.turnId) {
     return reconcileAmbiguous({ store, prepared, readback: async () => native });
   }
   const receipt = createLaunchReceipt({
     intent: prepared.intent,
     threadId: runtime.threadId,
-    turnId: turn.id,
+    turnId: runtime.turnId,
+    authorizedTurnIds,
     startedAt: now,
   });
   let attempt = realizeAttempt({ intent: prepared.intent, receipt });
-  let next = store.read(prepared.session_id);
+  let next = dispatched;
   next = transitionSession(next, { type: 'ATTEMPT_LAUNCHED', turn_started: true });
   if (runtime.outcome === 'candidate') {
     attempt = transitionAttempt(attempt, { type: 'RUNTIME_COMPLETED' });
-    attempt.candidate = structuredClone(runtime.candidate ?? { status: 'ready_for_postflight' });
+    attempt.candidate = structuredClone(runtime.candidate ?? {
+      status: 'ready_for_postflight', remaining_work: false,
+    });
     next = transitionSession(next, { type: 'ATTEMPT_CANDIDATE' });
+  } else {
+    attempt = transitionAttempt(attempt, { type: 'RUNTIME_TERMINATED' });
+    attempt.completion_level = 'candidate';
+    next = transitionSession(next, { type: 'ATTEMPT_TERMINAL' });
   }
   next.attempts.push(attempt);
   const committed = store.compareAndCommit({
     sessionId: next.session_id,
-    expectedRevision: store.read(next.session_id).revision,
+    expectedRevision: dispatched.revision,
     eventType: runtime.outcome === 'candidate' ? 'ATTEMPT_CANDIDATE' : 'ATTEMPT_LAUNCHED',
     nextState: next,
     blobs: [{ kind: 'launch-receipt', bytes: canonicalJson(receipt) }],

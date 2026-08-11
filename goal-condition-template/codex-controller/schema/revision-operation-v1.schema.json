@@ -39,11 +39,54 @@
             { "$ref": "#/$defs/verifierPayload" },
             { "$ref": "#/$defs/correctionPayload" },
             { "$ref": "#/$defs/authorityPayload" },
+            { "$ref": "#/$defs/weakeningPayload" },
             { "$ref": "#/$defs/goalPayload" },
             { "$ref": "#/$defs/unclassifiedPayload" }
           ]
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "enum": ["ADD_CONDITION", "ADD_AND_VERIFIER"] } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/conditionPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "TIGHTEN_TYPED_THRESHOLD" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/thresholdPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "enum": ["NARROW_ACTIVE_BOUNDARY", "EXPAND_WITHIN_AUTHORITY"] } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/boundaryPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "REFRESH_CONTEXT" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/contextPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "REPLACE_EQUIVALENT_VERIFIER" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/verifierPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "CONTROLLER_CORRECTION" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/correctionPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "EXPAND_AUTHORITY" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/authorityPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "WEAKEN_CONDITION" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/weakeningPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "CHANGE_GOAL" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/goalPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "UNCLASSIFIED" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/unclassifiedPayload" } } }
+        }
+      ]
     },
     "conditionPayload": {
       "type": "object",
@@ -122,6 +165,15 @@
       "required": ["authority"],
       "properties": {
         "authority": { "$ref": "goal-session-v2.schema.json#/$defs/authority" }
+      }
+    },
+    "weakeningPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition_id", "replacement"],
+      "properties": {
+        "condition_id": { "type": "string", "minLength": 1 },
+        "replacement": { "$ref": "goal-session-v2.schema.json#/$defs/condition" }
       }
     },
     "goalPayload": {

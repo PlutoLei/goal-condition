@@ -10,6 +10,7 @@ const codexV2EvidenceUrl = new URL(
 );
 const codexV2SkillUrl = new URL('../SKILL.md', import.meta.url);
 const codexV2ReferenceUrl = new URL('../references/adapters/codex.md', import.meta.url);
+const codexV2ProtocolUrl = new URL('../references/codex-goal-session-v2.md', import.meta.url);
 
 function digest(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -68,6 +69,11 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
     evidence.v2_guidance.codex_reference_sha256,
     digest(await readFile(codexV2ReferenceUrl, 'utf8')),
     'GREEN samples must bind the exact Codex reference bytes they read',
+  );
+  assert.equal(
+    evidence.v2_guidance.protocol_reference_sha256,
+    digest(await readFile(codexV2ProtocolUrl, 'utf8')),
+    'GREEN samples must bind the exact GoalSession protocol bytes they read',
   );
 
   const expectedScenarios = [

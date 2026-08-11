@@ -74,7 +74,11 @@ test('a design with no observable success Condition returns a blocking gap', () 
 });
 
 test('preview shows authorization, initial design, policy summary, and only a short fingerprint', () => {
-  const result = compileDraft(validDraft());
+  const draft = validDraft();
+  draft.initial_design.context_dependencies = [
+    { id: 'context-readme', path: '/work/project/README.md', sha256: 'b'.repeat(64) },
+  ];
+  const result = compileDraft(draft);
   const preview = renderAuthorizationPreview(result.session);
   for (const heading of [
     'Goal',
@@ -83,6 +87,7 @@ test('preview shows authorization, initial design, policy summary, and only a sh
     'Hard Prohibitions',
     'Initial Active Boundary',
     'Initial Conditions',
+    'Initial Context Dependencies',
     'Automatic Design Revisions',
     'Reauthorization Triggers',
   ]) {
@@ -90,7 +95,9 @@ test('preview shows authorization, initial design, policy summary, and only a sh
   }
   assert.equal(preview.short_fingerprint, result.session.authorization_hash.slice(0, 12));
   assert.match(preview.markdown, new RegExp(preview.short_fingerprint));
-  assert.doesNotMatch(preview.markdown, /\b[0-9a-f]{64}\b/);
+  assert.doesNotMatch(preview.markdown, new RegExp(result.session.authorization_hash));
+  assert.match(preview.markdown, /context-readme: \/work\/project\/README\.md/);
+  assert.match(preview.markdown, new RegExp('b'.repeat(64)));
   assert.doesNotMatch(preview.markdown, /grill/i);
 });
 

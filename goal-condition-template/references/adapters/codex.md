@@ -2,7 +2,7 @@
 
 此 adapter 只处理 `runtime="codex"` 的已确认 run contract。字段语义、hash 与 snapshot 握手见 [run-contract reference](../run-contract.md)。它描述调用边界；本文与测试不调用任何真实 goal tool 或真实 daemon。
 
-## GoalSession v2 Shadow 控制面
+## GoalSession v2 受控执行面
 
 GoalSession v2 是 Codex-only 的独立 controller 包；Claude adapter、共享 v1 schema 与共享状态机语义不变。它把生命周期不同的对象拆开：Goal 与 Non-goals 在整个 session 内稳定；Maximum Authority、Hard Prohibitions、最大风险和预算由用户授权；Active Boundary 与 ConditionSet 形成可演化的 Design Revision；每次 Attempt 则是不可变投影。独立是权限边界，不是再找一个 LLM 审批。
 
@@ -14,20 +14,24 @@ GoalSession v2 是 Codex-only 的独立 controller 包；Claude adapter、共享
 |---|---|
 | `ADD_CONDITION`、`ADD_AND_VERIFIER`、`TIGHTEN_TYPED_THRESHOLD` | Authority 内且结构证明成立时自动 |
 | `NARROW_ACTIVE_BOUNDARY`、`EXPAND_WITHIN_AUTHORITY` | 包络内自动；越界转再授权 |
-| `REFRESH_CONTEXT`、`REPLACE_EQUIVALENT_VERIFIER`、`CONTROLLER_CORRECTION` | 局部失效 Evidence 后自动；verifier 替换必须有 parity 或 mutation proof |
-| `EXPAND_AUTHORITY`、`WEAKEN_CONDITION` | `AwaitingReauthorization` |
+| `REFRESH_CONTEXT` | controller 实读 bytes/当前 hash 后局部失效 Evidence |
+| `CONTROLLER_CORRECTION`、`REPLACE_EQUIVALENT_VERIFIER` | 独立 correction/parity proof API 未实现前 fail closed |
+| `EXPAND_AUTHORITY` | 追加 AuthorityRevision、生成新 hash 后 `AwaitingReauthorization` |
+| `WEAKEN_CONDITION` | successor GoalSession（authorization hash 不覆盖 Design） |
 | `CHANGE_GOAL` | successor GoalSession |
 | `UNCLASSIFIED` | fail closed |
 
 Contract Compiler 只编译结构化任务、上下文事实与保守默认值，不进行开放式访谈。只有缺失或矛盾字段会产生两种实质不同结果、且不存在更保守默认时，才返回一个 blocking `CompilationGap`。Brainstorm/Grill 是设计阶段压力测试方法，绝不是每次运行必经的提问、访谈或换名后的 mandatory checklist。
 
-Attempt projector 保持 v1 只读：原生 Codex objective 只承载短而稳定的 Goal，完整 Boundary、Conditions、content-bound Context、Non-goals 与 Hard Prohibitions 放入 hash-bound Context Package；Projection Proof 必须为每个 Active Condition 给出 v1 contract 位置、运行时 context pointer、verifier 与 Evidence 依赖。任何漏映射都阻止投影。
+Attempt projector 保持 v1 只读：原生 Codex objective 只承载短而稳定的 Goal，完整 Boundary、Conditions、content-bound Context、Non-goals 与 Hard Prohibitions 放入 hash-bound Context Package；Context dependency 的 stable path 必须位于 Active Boundary 内，并在首次授权预览显示 path/content hash。Projection Proof 必须为每个 Active Condition 给出 v1 contract 位置、运行时 context pointer、verifier 与 Evidence 依赖。任何漏映射都阻止投影。
 
 完成等级分三层：executor/runtime 输出只能形成 `Candidate`；当前 controller-owned Evidence 全部有效可到 `Verified`；没有 control-plane bypass、unmediated turn 或未对账变化时才可 `Certified`。reviewer 文字、executor 的 all-green 或模型自报都不能直接认证完成。
 
-Plan 1 仅提供 [GoalSession v2 controller](../../codex-controller/) 的 `init`、`confirm`、`revise`、`project`、`evaluate`、`shadow`、`status`、`export`；没有 live execution 命令，也不调用本 adapter 的 GoalRpcClient 或任何 `runCodex*`。shadow 可并行分类旧 contract/candidate/postflight，但不写 legacy state、不替代 v1 hash confirmation、不应用 live revision、不启动或续跑。Node.js 低于 24.15 或 controller 不可用时必须明确报告 legacy mode，不能静默退化后仍声称动态 revision 生效。
+GoalSession v2 controller 通过 `capabilities`、`adopt`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层创建新的不可变 Attempt；它不复用已经被拒绝的 candidate，也不修改共享 v1 schema。
 
-因此在当前阶段，同一稳定 Goal 内遇到 context refresh、等价 verifier 替换或 Authority 内边界调整时，shadow 应推荐 typed Design Revision 并给审计摘要；同时必须明确：live 路径仍按下文 v1 规则重新 Validate、Preview、Confirm(hash)。这项临时双轨限制会在 Controlled Execution 增量接管 live adapter 后才解除。
+controller 不复制 app-server 执行器：live 副作用仍只经本 adapter 的 `runCodexLaunch` / `runCodexFinalize` / `runCodexClose`。v2 在同一写事务检查租约并保存 LaunchIntent；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path/device/inode，dispatch 时在一个事务内原子 claim `dispatching` 与 Session `Dispatching`，重核版本及物理身份后才调用 launcher。LaunchReceipt 只授权 controller 发出的 `turn/start` 响应 ID；首次、后续以及 finalize 前后的 `thread/read(includeTurns=true)` 出现其他 ID 都是旁路。claim 后读回不明不重发，转 `ReconciliationRequired`。完整命令与状态顺序见 [GoalSession v2 操作协议](../codex-goal-session-v2.md)。
+
+同一稳定 Goal 内遇到 context refresh、增加/加强 Condition 或 Authority 内边界调整时，controller 应应用 typed Design Revision、局部失效 Evidence，并创建新 Attempt；不再回到 v1 的完整 Preview/Confirm。等价 verifier 替换属于同一目标生命周期，但在独立 parity/mutation proof API 落地前保持 fail closed。只有 Authority、风险/预算或 Goal 语义变化才重新授权或建立 successor。
 
 ## Launch 前置条件
 
@@ -43,11 +47,11 @@ Plan 1 仅提供 [GoalSession v2 controller](../../codex-controller/) 的 `init`
 
 goal 由控制器创建，不是模型的 `create_goal`：objective 文本必须明令禁止模型调用 `create_goal`，并内联关键 judgment criteria、success criteria、constraints 与 allowed mutations，不得把第二个目标塞进 objective。原生“一个 thread 已有未完成 goal 时 create 失败”提供了额外护栏，但不能替代 objective 层面的显式禁令。
 
-只有用户明确提供 token 上限且 contract 含 `budget.user_provided=true` 与 `budget.max_tokens` 时，才把该值映射为 `thread/goal/set` 的 `tokenBudget` 参数；没有明确用户来源时必须省略。turn、时间或费用限制若不是原生参数，只作为监控条件，不冒充 tool 字段。
+只有用户明确提供 token 上限且 contract 含 `budget.user_provided=true` 与 `budget.max_tokens` 时，才把该值映射为 `thread/goal/set` 的 `tokenBudget` 参数；没有明确用户来源时必须省略。GoalSession Authority 的 `maximum_budget:null` 同样表示未授予预算，不是无限预算；首次授予有限值要产生新 authorization hash，已有有限授权不能靠改回 null 删除。turn、时间或费用限制若不是原生参数，只作为监控条件，不冒充 tool 字段。
 
-无法在当前 Codex 环境物理限制的外部动作必须标为 `audit_only`。如果用户要求 physical 保证，应在只读凭证、proxy、sandbox 或可验证 deny mechanism 就绪前停止 launch。本 adapter 侧唯一可核的物理面是 `thread/start` 钉死的 `--sandbox workspace-write`：launch 前置闸逐条比对 `enforcement="physical"` 的 constraint，`mechanism` 指向 sandbox 但与实际模式不符即红，`mechanism` 指不到 sandbox（egress proxy、只读凭证等）或干脆缺失同样红——那些机制运行在 controller 视野之外，无从验证，只能写成 `audit_only`。
+无法在当前 Codex 环境物理限制的外部动作必须标为 `audit_only`。如果用户要求 physical 保证，应在只读凭证、proxy、sandbox 或可验证 deny mechanism 就绪前停止 launch。本 adapter 侧唯一可核的物理面是 `thread/start` 的 `--sandbox`：legacy v1 固定 `workspace-write`；GoalSession v2 从 Active Boundary 投影，actions 不含 `write` 时必须是 `read-only`，包含 `write` 才允许 `workspace-write`。launch 前置闸逐条比对 `enforcement="physical"` 的 constraint，`mechanism` 指向 sandbox 但与实际模式不符即红，`mechanism` 指不到 sandbox（egress proxy、只读凭证等）或干脆缺失同样红——那些机制运行在 controller 视野之外，无从验证，只能写成 `audit_only`。
 
-这句声明在两条路径上的成立方式不同，必须分开读：`launch` 靠的是**请求参数**（`thread/start` 显式传 `sandbox`）；`resume` 只传 `{threadId}`，沙箱是服务端从持久化 thread 状态恢复的，控制器既不指定也不校验，所以它靠的只能是**读回来核**——见下文 resume 小节的第 0 步。同一个沙箱模式在协议两侧是两个词形：请求参数写 `workspace-write`，响应体的 `sandbox.type` 回 `workspaceWrite`。
+legacy v1 的两条路径必须分开读：`launch` 靠**请求参数**（`thread/start` 显式传 `sandbox`）；底层 `runCodexResume` 只传 `{threadId}`，沙箱从持久化 thread 恢复，只能读回来核——见下文 resume 小节第 0 步。同一个 workspace-write 模式在协议两侧是两个词形：请求参数写 `workspace-write`，响应体写 `workspaceWrite`。GoalSession v2 的 `resume` 不走这条可变 continuation；它建立新的 immutable Attempt 和 thread/start，因此每次都重新投影 `read-only | workspace-write`。
 
 ## 姿态：app-server 是外部编排的唯一表面
 
@@ -133,7 +137,7 @@ S4 实测：`thread/inject_items` 本身不驱动执行，只把内容追加进�
 
 控制器提交 candidate 后，状态机只会请求 `postflight`。主会话独立重跑结构化 verifier，并对照原始 `baseline_digest` 做 snapshot verify；全绿后提交与 `runBinding` 相同的 `postflightEvidence={ok,reasons,binding}`。只有 postflight 全绿且没有 remaining work，`nextAction` 才返回 `finalize_runtime`。
 
-收到该 action 后，主会话调用 `thread/goal/set {threadId, status:'complete'}`——不是 `update_goal`：控制器对这个模型侧 tool 没有调用通道。即使模型此前已自行调用 `update_goal` 把状态写成 `complete`，也不构成 finalize。注意这里的机制**不是** no-op：实测服务端对同状态写入照样刷新 `updatedAt`（goal 已是 `complete` 时再 set 一次，`updatedAt` 从 `1786257720` 推进到 `1786257793`），所以控制器的 set 虽然在状态维度是同值写入，仍会在 envelope 上留下一个新的时间戳，归因因此比“完全无痕”要强。但这不足以单独承载 finalize：RPC 层拿不到 goal_id，`updatedAt` 又是秒级精度、同一秒内两次 set 会撞值。finalize 证据必须来自控制器自己发起的 set 与随后的 readback 绑定，并叠加下文的单调序列号，不能只看“状态已经是 complete”这件事本身。
+收到该 action 后，GoalSession v2 先以 `thread/read(includeTurns=true)` 核 LaunchReceipt 的 exact turn set；任何缺失、重复或额外 turn 都在 terminal mutation 前 fail closed。通过后，主会话调用 `thread/goal/set {threadId, status:'complete'}`——不是 `update_goal`：控制器对这个模型侧 tool 没有调用通道。即使模型此前已自行调用 `update_goal` 把状态写成 `complete`，也不构成 finalize。注意这里的机制**不是** no-op：实测服务端对同状态写入照样刷新 `updatedAt`（goal 已是 `complete` 时再 set 一次，`updatedAt` 从 `1786257720` 推进到 `1786257793`），所以控制器的 set 虽然在状态维度是同值写入，仍会在 envelope 上留下一个新的时间戳，归因因此比“完全无痕”要强。但这不足以单独承载 finalize：RPC 层拿不到 goal_id，`updatedAt` 又是秒级精度、同一秒内两次 set 会撞值。finalize 证据必须来自控制器自己发起的 set 与随后的 readback 绑定，并叠加下文的单调序列号，不能只看“状态已经是 complete”这件事本身。
 
 `ThreadGoal` envelope 在 RPC 层不含 `goal_id`/`goalId`（schema 与实测 `Object.keys` 都只有 `threadId`/`objective`/`status`/`tokenBudget`/`tokensUsed`/`timeUsedSeconds`/`createdAt`/`updatedAt`），归因因此改绑三项：`threadId` 一致、两侧 status 均为 `complete`、readback 的 `updatedAt` 等于 set 响应的 `updatedAt`。`updatedAt` 是秒级精度，同一秒内连续两次 set 会撞值，所以必须再叠加控制器侧维护的 goal-set 单调序列号（每次 set 递增记账，finalize 时核对最后一条记录的序列号与 requestedStatus）才能构成严格归因。
 
@@ -164,7 +168,7 @@ S4 实测：`thread/inject_items` 本身不驱动执行，只把内容追加进�
 }
 ```
 
-只有 candidate、`postflightEvidence`、`finalizationReceipt` 与 `runtimeReadback` 全部存在、顺序正确且 binding 相同，状态机才返回 `complete` 并允许 Close。缺 receipt、set 失败、get error/permission failure、blocked、仍有工作、cross-binding 或未知字段都 fail closed。
+goal-set/get 后，GoalSession v2 再执行一次 exact turn fence，防止 verify 与 finalize 或 terminal mutation 期间出现未收据 turn。只有前后 fence、candidate、`postflightEvidence`、`finalizationReceipt` 与 `runtimeReadback` 全部存在、顺序正确且 binding 相同，状态机才返回 `complete` 并允许 Close。缺 receipt、额外 turn、set 失败、get error/permission failure、blocked、仍有工作、cross-binding 或未知字段都 fail closed。
 
 ## attempt 配额口径
 
@@ -204,7 +208,7 @@ exit 3 里那三类必须分开读：**只有连接阶段失败这一类可以�
 
 上表之外还有一格：进程**死于信号**（操作员 Ctrl-C 或 `kill`）。它不是一个自造的退出码，shell 看到的是 130/143 这类 `128+signum`，父进程看到的是「died by signal」。编排器不必给它专门的分支——它落在四格之外，本来就只能 fail-closed。
 
-`close` 同样不由退出码承载：即使清理明确没做成（例如落盘的 `codex-home.path` 已不是自己 mkdtemp 出来的隔离目录形态），进程仍 exit 0，判据是 stdout 里的 `reasons`、`goalCleared` 与 `leaseReleased`——`goalCleared:false` 且 `reasons` 非空就是「goal 这一格没清成」。三个字段各管一格残留（活 goal / 隔离 `CODEX_HOME` / 租约），不要拿其中一格推断另外两格：读不到 `codex-home.path` 时前两格确实无事可做，租约那一格仍然会被释放。已知缺口：`leaseReleased:false` 时进程仍 exit 0，只读退出码的编排器在这一格上看不出「租约没释放」，必须读 stdout。
+`close` 同样不由退出码承载：判据是 stdout 的 `cleanupComplete`、`runtimeQuiesced`、`reasons`、`goalCleared` 与 `leaseReleased`。三个资源字段分别管活 goal、隔离 `CODEX_HOME` 与 runtime 租约，但 controller 只有在 `cleanupComplete=true` 且 `runtimeQuiesced=true` 时才能释放自己的 target-root lease。读不到 `codex-home.path` 时仍会独立检查 residual lease；foreign live lease 必须返回未静默、保留 controller lease 并进入 `ReconciliationRequired`，不能让新 Attempt 与旧 runtime 重叠。只读退出码仍不够，编排器必须读完整 JSON。
 
 `snapshot.mjs` 的 `verify` 判否时同样把完整报告体打到 stdout、但 `exitCode` 走的是 1，与上表把「完整报告体」钉在 3、把 1 定义成「stdout 空」不是同一套约定——上表已显式限定 `scripts/launch.mjs`，跨脚本编排退出码时不要混用。
 

@@ -15,6 +15,10 @@ const RECORD_FIELDS = Object.freeze([
   'expiresAt',
   'controllerOwned',
 ]);
+const STORED_RECORD_FIELDS = Object.freeze([
+  'evidence_id', 'condition_id', 'verifier_id', 'verifier_version_hash', 'attempt_id',
+  'input_hashes', 'result', 'output_hash', 'captured_at', 'expires_at', 'controller_owned',
+]);
 const INPUT_FIELDS = Object.freeze(['kind', 'id', 'sha256']);
 const INPUT_KINDS = new Set([
   'root_baseline',
@@ -106,6 +110,30 @@ export function recordEvidence(args) {
     expires_at: timestamp(expiresAt, 'expiresAt', { nullable: true }),
     controller_owned: controllerOwned,
   };
+}
+
+export function validateEvidenceRecord(record) {
+  exactFields(record, STORED_RECORD_FIELDS, 'evidence_record');
+  for (const field of ['evidence_id', 'condition_id', 'verifier_id', 'attempt_id']) {
+    if (typeof record[field] !== 'string' || !ID.test(record[field])) {
+      throw evidenceError('EVIDENCE_ID_INVALID', `${field} must be stable kebab-case`);
+    }
+  }
+  for (const field of ['verifier_version_hash', 'output_hash']) {
+    if (typeof record[field] !== 'string' || !SHA256.test(record[field])) {
+      throw evidenceError('EVIDENCE_HASH_INVALID', `${field} must be lowercase SHA-256`);
+    }
+  }
+  validateInputs(record.input_hashes);
+  if (!['pass', 'fail', 'error'].includes(record.result)) {
+    throw evidenceError('EVIDENCE_RESULT_INVALID', 'stored evidence result is invalid');
+  }
+  timestamp(record.captured_at, 'captured_at');
+  timestamp(record.expires_at, 'expires_at', { nullable: true });
+  if (typeof record.controller_owned !== 'boolean') {
+    throw evidenceError('CONTROLLER_OWNERSHIP_REQUIRED', 'stored evidence ownership must be explicit');
+  }
+  return true;
 }
 
 function bindingMap(bindings) {

@@ -28,10 +28,53 @@ test('active boundary must stay inside confirmed maximum authority', () => {
   );
 });
 
+test('hard prohibitions are closed mechanical capability identifiers, not prose', () => {
+  const draft = validDraft();
+  draft.authority.hard_prohibitions = ['No production deployment.'];
+  assert.throws(
+    () => createGoalSession(draft),
+    (error) => error.code === 'HARD_PROHIBITION_CAPABILITY_INVALID',
+  );
+});
+
+test('budget grants are either absent or strictly positive across domain and schema', async () => {
+  const zeroMaximum = validDraft();
+  zeroMaximum.authority.maximum_budget = 0;
+  zeroMaximum.initial_design.active_boundary.budget = 0;
+  assert.throws(
+    () => createGoalSession(zeroMaximum),
+    (error) => error.code === 'BUDGET_INVALID' && error.path === 'authority.maximum_budget',
+  );
+
+  const zeroActive = validDraft();
+  zeroActive.authority.maximum_budget = 10;
+  zeroActive.initial_design.active_boundary.budget = 0;
+  assert.throws(
+    () => createGoalSession(zeroActive),
+    (error) => error.code === 'BUDGET_INVALID'
+      && error.path === 'initial_design.active_boundary.budget',
+  );
+
+  const schema = JSON.parse(
+    await readFile(new URL('../schema/goal-session-v2.schema.json', import.meta.url), 'utf8'),
+  );
+  assert.equal(schema.$defs.authority.properties.maximum_budget.oneOf[0].exclusiveMinimum, 0);
+  assert.equal(schema.$defs.activeBoundary.properties.budget.oneOf[0].exclusiveMinimum, 0);
+});
+
 test('conditions keep stable identity and definitions contain no satisfaction flag', () => {
   const condition = validDraft().initial_design.conditions[0];
   assert.equal('satisfied' in condition, false);
   assert.match(condition.id, /^[a-z0-9][a-z0-9-]*$/);
+});
+
+test('condition verifier cwd must remain inside the active executor boundary', () => {
+  const draft = validDraft();
+  draft.initial_design.conditions[0].verifier.cwd = '/work/other-project';
+  assert.throws(
+    () => createGoalSession(draft),
+    (error) => error.code === 'VERIFIER_CWD_OUTSIDE_BOUNDARY',
+  );
 });
 
 test('authorization hash is independent from design revisions', () => {
@@ -68,6 +111,18 @@ test('context dependencies are content-bound closed-world records', () => {
   );
 });
 
+test('context dependencies cannot disclose paths outside the active boundary', () => {
+  const draft = validDraft();
+  draft.initial_design.context_dependencies = [
+    { id: 'context-private', path: '/srv/private/context.txt', sha256: 'b'.repeat(64) },
+  ];
+  assert.throws(
+    () => createGoalSession(draft),
+    (error) => error.code === 'CONTEXT_OUTSIDE_BOUNDARY'
+      && error.path === 'initial_design.context_dependencies[0].path',
+  );
+});
+
 test('stored authority and design hashes are checked independently', () => {
   const session = createGoalSession(validDraft());
   const authorityChanged = structuredClone(session);
@@ -100,6 +155,7 @@ test('session statuses and attempt hashes are closed and canonical', () => {
     'Drafting',
     'AwaitingConfirmation',
     'Ready',
+    'Dispatching',
     'Running',
     'Evaluating',
     'Revising',
@@ -133,6 +189,7 @@ test('audit schemas are closed-world and pin the public versions', async () => {
   assert.equal(sessionSchema.$defs.condition.additionalProperties, false);
   assert.equal(sessionSchema.$defs.authority.additionalProperties, false);
   assert.equal(sessionSchema.$defs.contextDependency.additionalProperties, false);
+  assert.ok(sessionSchema.$defs.launchReceipt.required.includes('authorized_turn_ids'));
   assert.equal(operationSchema.$id, 'https://goal-condition.dev/schema/codex/revision-operation-v1.schema.json');
   assert.equal(operationSchema.$defs.operationBase.additionalProperties, false);
   assert.deepEqual(operationSchema.$defs.operationType.enum, [

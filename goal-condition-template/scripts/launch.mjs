@@ -676,7 +676,9 @@ function leaseHolderAlive(lease) {
 // 坏字节按残留处理：它没有心跳也没有 pid 可读，而 launch 侧的 leaseResidue 把它判成 'stale' 并
 // 拦住——close 不清它就没有任何一条路径清得掉。
 export function releaseResidualLease({ leasePath }) {
-  if (!existsSync(leasePath)) return { released: false, reasons: [] };
+  if (!existsSync(leasePath)) {
+    return { present: false, released: false, runtimeQuiesced: true, reasons: [] };
+  }
   let lease = null;
   try {
     lease = JSON.parse(readFileSync(leasePath, 'utf8'));
@@ -686,7 +688,9 @@ export function releaseResidualLease({ leasePath }) {
   const alive = leaseHolderAlive(lease);
   if (alive) {
     return {
+      present: true,
       released: false,
+      runtimeQuiesced: false,
       reasons: [`lease.json belongs to a run that is still alive (pid=${lease?.pid}, ${alive}): left in place, `
         + 'nothing was released. Confirm that run is really gone (or start fresh under a different '
         + '--controller name) before relaunching'],
@@ -694,7 +698,9 @@ export function releaseResidualLease({ leasePath }) {
   }
   rmSync(leasePath, { force: true });
   return {
+    present: true,
     released: true,
+    runtimeQuiesced: true,
     reasons: [`released a residual lease.json (pid=${lease?.pid ?? 'unreadable'}) left behind by a run that is no longer running`],
   };
 }
@@ -1084,14 +1090,17 @@ async function pollGoalUntilTerminal({
 
 // launch/resume 共用的 codex 侧前置判定：probes.json 存的是 prepare 时刻的观测，这里补上现场
 // 重算的 contractHash、binding 交叉项与残留租约再交纯函数 assertLaunchable 下结论。
-async function codexLaunchVerdict({ contract, stateDir, binding }) {
+async function codexLaunchVerdict({
+  contract, stateDir, binding, sandboxMode = CODEX_SANDBOX_MODE,
+}) {
   const storedProbes = JSON.parse(await readFile(join(stateDir, 'probes.json'), 'utf8'));
   return assertCodexLaunchable(contract, {
     contractHash: contractHash(contract),
     confirmedHash: binding?.contractHash,
     baselineDigestStored: typeof binding?.baselineDigest === 'string' && HEX64.test(binding.baselineDigest),
     codexVersionRaw: storedProbes.codexVersionRaw,
-    sandboxMode: CODEX_SANDBOX_MODE,
+    sandboxMode,
+    expectedSandboxMode: sandboxMode,
     // 位置判定要比路径，两侧都先归一（contract 与 --state 各可能拿 symlink 的一边）。
     stateDir: canonicalPath(stateDir),
     targetRoots: (contract?.target_roots ?? []).map(canonicalPath),
@@ -1227,6 +1236,7 @@ async function readCodexSession(stateDir) {
 export async function runCodexLaunch({
   contract, stateDir, prompt, turnText, binding, clientFactory = defaultCodexClientFactory,
   authSource = DEFAULT_AUTH_SOURCE, deadlineMs, pollIntervalMs = POLL_INTERVAL_MS,
+  sandboxMode = CODEX_SANDBOX_MODE,
 }) {
   // binding（主会话持有的 runBinding）缺失、损坏、或对不上 stateDir 末段一律 fail-closed，不起 client。
   if (binding?.contractHash !== basename(stateDir)) {
@@ -1236,7 +1246,7 @@ export async function runCodexLaunch({
     };
   }
 
-  const verdict = await codexLaunchVerdict({ contract, stateDir, binding });
+  const verdict = await codexLaunchVerdict({ contract, stateDir, binding, sandboxMode });
   if (!verdict.ok) {
     return { outcome: 'terminal_report', reasons: verdict.reasons };
   }
@@ -1263,7 +1273,7 @@ export async function runCodexLaunch({
       // 不换 contract hash 也就不换 state 目录，占在前面等于连撞三次就把这份 contract 锁死。
       const attemptNumber = await nextAttempt(stateDir);
 
-      ({ threadId } = await client.threadStart({ sandbox: CODEX_SANDBOX_MODE }));
+      ({ threadId } = await client.threadStart({ sandbox: sandboxMode }));
       // cwd 一并落盘：finalize/close 不读 contract，重连 daemon 时要拿回同一个工作目录。
       // codex-home.path 与 thread.json 在同一时刻落盘：这一刻之前，state 目录里的两个指针都还
       // 指向上一次成功的那套；这一刻之后，两个都指向本次。中间不存在「thread 坐标说重连旧
@@ -1288,12 +1298,12 @@ export async function runCodexLaunch({
         };
       }
 
-      await client.turnStart({
+      const turnEnvelope = await client.turnStart({
         threadId,
         text: `${turnText ?? prompt}\n\nKeep working the thread until the goal reaches status "complete", then stop.`,
       });
-
-      return pollGoalUntilTerminal({
+      const turnId = turnEnvelope?.result?.turn?.id ?? null;
+      const terminal = await pollGoalUntilTerminal({
         client,
         threadId,
         stateDir,
@@ -1308,6 +1318,7 @@ export async function runCodexLaunch({
         turnCap: effectiveCap(MAX_TURNS_PER_ATTEMPT, contract, 'max_turns'),
         tokenCap: effectiveCap(MAX_TOKENS_PER_ATTEMPT, contract, 'max_tokens'),
       });
+      return { ...terminal, turnId };
     });
   } catch (error) {
     if (error instanceof AttemptClaimError) throw error;
@@ -1473,13 +1484,42 @@ export async function runCodexResume({
 // 把关，本函数不自证（CLI 看不到 postflight 结论，自证只会造出一个假的顺序证据）。
 // 产物是两份 controller-owned 证据文件，字段与 workflow.mjs 的闭世界形状逐字对齐；归因不过就把
 // 两份都写成 ok:false + 安全 reasons（fail-closed：主会话再喂 nextAction 自然被拒，而不是缺文件）。
+function verifyNativeTurnFence(envelope, threadId, expectedTurnIds) {
+  if (!Array.isArray(expectedTurnIds)
+    || expectedTurnIds.length === 0
+    || new Set(expectedTurnIds).size !== expectedTurnIds.length
+    || expectedTurnIds.some((id) => typeof id !== 'string' || id.length === 0)) {
+    return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_INVALID'] };
+  }
+  const thread = envelope?.result?.thread;
+  if (thread?.id !== threadId || !Array.isArray(thread.turns)) {
+    return { ok: false, reason_codes: ['FINALIZE_NATIVE_READBACK_UNAVAILABLE'] };
+  }
+  const observed = thread.turns.map((turn) => turn?.id);
+  if (observed.some((id) => typeof id !== 'string') || new Set(observed).size !== observed.length) {
+    return { ok: false, reason_codes: ['FINALIZE_NATIVE_TURN_HISTORY_INVALID'] };
+  }
+  const expected = new Set(expectedTurnIds);
+  if (observed.some((id) => !expected.has(id))) {
+    return { ok: false, reason_codes: ['UNRECEIPTED_NATIVE_TURN'] };
+  }
+  if (expectedTurnIds.some((id) => !observed.includes(id))) {
+    return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_MISMATCH'] };
+  }
+  return { ok: true, reason_codes: [] };
+}
+
 export async function runCodexFinalize({
-  stateDir, binding, clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
+  stateDir, binding, expectedTurnIds,
+  clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
 }) {
   const receiptPath = join(stateDir, 'finalization-receipt.json');
   const readbackPath = join(stateDir, 'runtime-readback.json');
 
-  const writeEvidence = async (attribution, { setStatus = null, readStatus = null } = {}) => {
+  const writeEvidence = async (
+    attribution,
+    { setStatus = null, readStatus = null, turnFence = null } = {},
+  ) => {
     const { ok } = attribution;
     const reasons = ok ? [] : attribution.reasons;
     await writeFile(receiptPath, `${JSON.stringify({
@@ -1496,7 +1536,7 @@ export async function runCodexFinalize({
       reasons,
       binding: binding ?? null,
     }, null, 2)}\n`);
-    return { receiptPath, readbackPath, attribution };
+    return { receiptPath, readbackPath, attribution, turnFence };
   };
 
   // --binding-file 与 --state 是两个独立入参：对不上意味着这份 receipt 会把某个 run 的 finalize
@@ -1526,6 +1566,17 @@ export async function runCodexFinalize({
     return await withCodexClient({
       stateDir, codexHome, cwd, authSource, clientFactory,
     }, async ({ client }) => {
+      let turnFence = null;
+      if (expectedTurnIds !== undefined) {
+        turnFence = verifyNativeTurnFence(
+          await client.threadRead({ threadId, includeTurns: true }),
+          threadId,
+          expectedTurnIds,
+        );
+        if (!turnFence.ok) {
+          return writeEvidence({ ok: false, reasons: turnFence.reason_codes }, { turnFence });
+        }
+      }
       const setEnvelope = await client.goalSet({ threadId, status: 'complete' });
       const sequence = (await readLedger(stateDir)).length + 1;
       await appendLedgerEntry(stateDir, {
@@ -1535,12 +1586,21 @@ export async function runCodexFinalize({
         threadId,
       });
       const readbackEnvelope = await client.goalGet({ threadId });
-      const attribution = verifyFinalizeAttribution({
+      let attribution = verifyFinalizeAttribution({
         setEnvelope, readbackEnvelope, threadId, sequence, ledger: await readLedger(stateDir),
       });
+      if (expectedTurnIds !== undefined) {
+        turnFence = verifyNativeTurnFence(
+          await client.threadRead({ threadId, includeTurns: true }),
+          threadId,
+          expectedTurnIds,
+        );
+        if (!turnFence.ok) attribution = { ok: false, reasons: turnFence.reason_codes };
+      }
       return writeEvidence(attribution, {
         setStatus: setEnvelope?.result?.goal?.status ?? null,
         readStatus: readbackEnvelope?.result?.goal?.status ?? null,
+        turnFence,
       });
     });
   } catch (error) {
@@ -1568,6 +1628,8 @@ export async function runCodexClose({
     codexHome = (await readFile(join(stateDir, 'codex-home.path'), 'utf8')).trim();
   } catch {
     return {
+      cleanupComplete: lease.runtimeQuiesced,
+      runtimeQuiesced: lease.runtimeQuiesced,
       codexHome: null,
       goalCleared: false,
       leaseReleased: lease.released,
@@ -1578,10 +1640,26 @@ export async function runCodexClose({
     };
   }
 
+  // A live foreign runtime lease is proof that the runtime is not quiescent. Do not clear its goal,
+  // delete its CODEX_HOME, or tell the controller that cleanup completed: any of those would let the
+  // controller release the target-root lease and overlap a new Attempt with the still-running one.
+  if (!lease.runtimeQuiesced) {
+    return {
+      cleanupComplete: false,
+      runtimeQuiesced: false,
+      codexHome,
+      goalCleared: false,
+      leaseReleased: false,
+      reasons: lease.reasons,
+    };
+  }
+
   // 这是全流程唯一的递归删除。路径来自磁盘文件，损坏或被改写就会把 rm -rf 指向任意目录——
   // 只删自己 mkdtemp 出来的那种形态（绝对路径 + gc-codex-home- 前缀），其余一律拒绝并留 reason。
   if (!isAbsolute(codexHome) || !basename(codexHome).startsWith(CODEX_HOME_PREFIX)) {
     return {
+      cleanupComplete: false,
+      runtimeQuiesced: true,
       codexHome,
       goalCleared: false,
       leaseReleased: lease.released,
@@ -1615,7 +1693,12 @@ export async function runCodexClose({
   rmSync(codexHome, { recursive: true, force: true });
   rmSync(join(stateDir, 'codex-home.path'), { force: true });
   return {
-    codexHome, goalCleared, leaseReleased: lease.released, reasons,
+    cleanupComplete: true,
+    runtimeQuiesced: true,
+    codexHome,
+    goalCleared,
+    leaseReleased: lease.released,
+    reasons,
   };
 }
 
@@ -1769,6 +1852,7 @@ async function runFinalizeCommand(values) {
 async function runCloseCommand(values) {
   const result = await runCodexClose({ stateDir: values['--state'] });
   process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (result.cleanupComplete !== true) process.exitCode = 3;
 }
 
 async function runCli() {

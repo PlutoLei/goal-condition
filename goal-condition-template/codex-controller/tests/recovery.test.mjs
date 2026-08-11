@@ -30,9 +30,30 @@ test('an unreceipted native turn is a control-plane bypass', () => {
 test('a matching receipt and native turn safely continue evaluation', () => {
   const result = reconcileLaunch({
     intent: { run_id: 'run-1', attempt_id: 'attempt-1' },
-    receipt: { run_id: 'run-1', thread_id: 'thread-1', turn_id: 'turn-1' },
+    receipt: {
+      run_id: 'run-1', thread_id: 'thread-1', turn_id: 'turn-1',
+      authorized_turn_ids: ['turn-1'],
+    },
     native: { available: true, thread_id: 'thread-1', turns: [{ id: 'turn-1' }] },
   });
   assert.equal(result.disposition, 'continue_evaluating');
   assert.equal(result.relaunch_allowed, false);
+});
+
+test('a native turn added after the controller receipt is a control-plane bypass', () => {
+  const result = reconcileLaunch({
+    intent: { run_id: 'run-1', attempt_id: 'attempt-1' },
+    receipt: {
+      run_id: 'run-1', thread_id: 'thread-1', turn_id: 'turn-1',
+      authorized_turn_ids: ['turn-1'],
+    },
+    native: {
+      available: true,
+      thread_id: 'thread-1',
+      turns: [{ id: 'turn-1' }, { id: 'turn-unreceipted' }],
+    },
+  });
+  assert.equal(result.disposition, 'control_plane_bypass');
+  assert.equal(result.relaunch_allowed, false);
+  assert.deepEqual(result.reason_codes, ['UNRECEIPTED_NATIVE_TURN']);
 });
