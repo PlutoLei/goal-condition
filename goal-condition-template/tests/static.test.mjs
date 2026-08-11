@@ -97,9 +97,15 @@ test('Codex shadow control-plane detail stays in the linked adapter reference', 
 // 实际不是：那条断言两侧都读同一个 REQUIRED_CORE_FILES，是自证的，测不出常量本身漂移。删掉这条
 // 磁盘对账测试，就等于原地恢复 task-16-report.md 记录的「删 12/15 项零反应」那个盲区。
 test('REQUIRED_CORE_FILES matches every script, schema, and adapter reference actually shipped on disk', () => {
+  const codexControllerCore = [
+    'codex-controller/package.json',
+    ...coreCandidateFiles(templateRoot, 'codex-controller/schema'),
+    ...coreCandidateFiles(templateRoot, 'codex-controller/src'),
+  ];
   const onDisk = [
     ...(existsSync(skillPath) ? ['SKILL.md'] : []),
     ...['scripts', 'references', 'schema'].flatMap((dir) => coreCandidateFiles(templateRoot, dir)),
+    ...codexControllerCore,
   ].filter((relativePath) => relativePath !== PROFILE_PATH);
   assert.deepEqual(
     [...onDisk].sort(),

@@ -45,7 +45,10 @@ async function createSourceRepository(t) {
   // 文件不用再手改这份清单；常量真正的完整性守护见 static.test.mjs 的磁盘对账。
   for (const relativePath of REQUIRED_CORE_FILES) {
     if (relativePath === 'SKILL.md') continue; // 上面已用固定内容写过，下面的断言依赖那个字面值
-    await writeSourceFile(repo, relativePath, `export const marker = ${JSON.stringify(relativePath)};\n`);
+    const content = relativePath === 'codex-controller/package.json'
+      ? await readFile(new URL('../codex-controller/package.json', import.meta.url), 'utf8')
+      : `export const marker = ${JSON.stringify(relativePath)};\n`;
+    await writeSourceFile(repo, relativePath, content);
   }
   await writeSourceFile(repo, 'references/anchors-and-rules.md', '# public template\n');
   await chmod(join(repo, 'goal-condition-template', 'scripts', 'install.mjs'), 0o755);
@@ -94,6 +97,19 @@ test('materializes an immutable release from the requested commit without profil
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('tests/')), false);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('README')), false);
   assert.equal(manifest.source_files.find((entry) => entry.path === 'scripts/install.mjs').mode, '100755');
+  const controllerEntries = manifest.source_files
+    .filter((entry) => entry.path.startsWith('codex-controller/'));
+  assert.ok(controllerEntries.length > 0, 'release manifest must include the Codex controller');
+  assert.equal(controllerEntries.some((entry) => entry.path.includes('/tests/')), false);
+  for (const entry of controllerEntries) {
+    const installedBytes = await readFile(join(result.releaseDir, entry.path));
+    assert.equal(createHash('sha256').update(installedBytes).digest('hex'), entry.sha256, entry.path);
+    assert.match(entry.mode, /^100(?:644|755)$/);
+  }
+  const installedControllerPackage = JSON.parse(
+    await readFile(join(result.releaseDir, 'codex-controller', 'package.json'), 'utf8'),
+  );
+  assert.equal(installedControllerPackage.engines.node, '>=24.15.0');
   // 安装器正确性断言，不构成闭包守卫：两侧同源，都是同一个 REQUIRED_CORE_FILES（一侧是
   // installRelease 内部拿它去过滤 git tree，另一侧是这里直接读常量），测的是「安装器有没有
   // 老实按常量转录」，不是「常量本身有没有漂移」——常量真正的独立守护在 static.test.mjs 那条
@@ -105,7 +121,10 @@ test('materializes an immutable release from the requested commit without profil
   );
   assert.equal(await mode(releaseRoot), 0o755);
   assert.equal(await mode(result.releaseDir), 0o755);
-  for (const directory of ['references', 'references/adapters', 'schema', 'scripts', 'scripts/lib']) {
+  for (const directory of [
+    'references', 'references/adapters', 'schema', 'scripts', 'scripts/lib',
+    'codex-controller', 'codex-controller/schema', 'codex-controller/src',
+  ]) {
     assert.equal(await mode(join(result.releaseDir, directory)), 0o755, directory);
   }
   assert.equal(await mode(join(result.releaseDir, 'SKILL.md')), 0o644);
@@ -163,6 +182,31 @@ test('reports release drift after a core file mode is modified', async (t) => {
   assert.equal(verification.ok, false);
   assert.ok(verification.drift.some((entry) => entry.code === 'SOURCE_FILE_MODE_MISMATCH'
     && entry.path === 'SKILL.md'));
+});
+
+test('Codex controller production bytes and mode remain externally manifest-bound', async (t) => {
+  const { root, repo, oldCommit } = await createSourceRepository(t);
+  const profile = join(root, 'private-profile.md');
+  await writeFile(profile, '# private project anchors\n');
+  const { releaseDir, manifestDigest } = await installRelease({
+    repo, ref: oldCommit, profile, releaseRoot: join(root, 'releases'),
+    links: { claude: join(root, 'claude-skill'), codex: join(root, 'codex-skill') },
+  });
+  const controllerPath = join(releaseDir, 'codex-controller', 'src', 'domain.mjs');
+  const original = await readFile(controllerPath);
+
+  await writeFile(controllerPath, 'export const tampered = true;\n');
+  const hashDrift = await verifyRelease(releaseDir, { expectedManifestDigest: manifestDigest });
+  assert.equal(hashDrift.ok, false);
+  assert.ok(hashDrift.drift.some((entry) => entry.code === 'SOURCE_FILE_HASH_MISMATCH'
+    && entry.path === 'codex-controller/src/domain.mjs'));
+
+  await writeFile(controllerPath, original);
+  await chmod(controllerPath, 0o755);
+  const modeDrift = await verifyRelease(releaseDir, { expectedManifestDigest: manifestDigest });
+  assert.equal(modeDrift.ok, false);
+  assert.ok(modeDrift.drift.some((entry) => entry.code === 'SOURCE_FILE_MODE_MISMATCH'
+    && entry.path === 'codex-controller/src/domain.mjs'));
 });
 
 test('rejects setuid, setgid, and sticky mode bits on every release policy class', async (t) => {
