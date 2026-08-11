@@ -8,6 +8,8 @@ const codexV2EvidenceUrl = new URL(
   '../evidence/codex-goal-session-v2-pressure-evidence.json',
   import.meta.url,
 );
+const codexV2SkillUrl = new URL('../SKILL.md', import.meta.url);
+const codexV2ReferenceUrl = new URL('../references/adapters/codex.md', import.meta.url);
 
 function digest(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -57,6 +59,16 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
   assert.ok(['red_captured', 'green_verified'].includes(evidence.campaign_status));
   assert.equal(evidence.protocol.fresh_context_per_sample, true);
   assert.match(evidence.protocol.limitation, /observational.*not deterministic proof/i);
+  assert.equal(
+    evidence.v2_guidance.skill_sha256,
+    digest(await readFile(codexV2SkillUrl, 'utf8')),
+    'GREEN samples must bind the exact Skill bytes they read',
+  );
+  assert.equal(
+    evidence.v2_guidance.codex_reference_sha256,
+    digest(await readFile(codexV2ReferenceUrl, 'utf8')),
+    'GREEN samples must bind the exact Codex reference bytes they read',
+  );
 
   const expectedScenarios = [
     'repeated-contract-pressure',
@@ -102,7 +114,7 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
   );
 
   if (evidence.campaign_status === 'green_verified') {
-    for (const group of groups) {
+    for (const group of evidence.scenarios) {
       const variants = new Set(group.samples.map((sample) => sample.variant));
       assert.equal(variants.has('no-v2-guidance'), true);
       assert.equal(variants.has('with-v2-guidance'), true);

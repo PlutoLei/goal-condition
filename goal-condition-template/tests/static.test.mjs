@@ -75,6 +75,14 @@ test('core skill exposes every required reference and every relative Markdown li
   }
 });
 
+test('Codex shadow control-plane detail stays in the linked adapter reference', () => {
+  const skill = read(skillPath);
+  const adapter = read(join(referencesRoot, 'adapters/codex.md'));
+  assert.match(skill, /\]\(references\/adapters\/codex\.md(?:#[^)]+)?\)/);
+  assert.ok(skill.split('\n').length <= 201, 'SKILL.md must contain at most 200 lines');
+  assert.match(adapter, /^## GoalSession v2 Shadow 控制面$/m);
+});
+
 // REQUIRED_CORE_FILES 既是「安装闭包该包含什么」的声明又是校验时的对照表——自建型自证：
 // 常量少一项，install.test.mjs 的旧字面 fixture 清单不会跟着变小，测试照样全绿（见
 // task-16-report.md 盲区 2 的 15 项逐一实测）。这里换一个独立于常量本身的真相源——checkout 里

@@ -2,6 +2,33 @@
 
 此 adapter 只处理 `runtime="codex"` 的已确认 run contract。字段语义、hash 与 snapshot 握手见 [run-contract reference](../run-contract.md)。它描述调用边界；本文与测试不调用任何真实 goal tool 或真实 daemon。
 
+## GoalSession v2 Shadow 控制面
+
+GoalSession v2 是 Codex-only 的独立 controller 包；Claude adapter、共享 v1 schema 与共享状态机语义不变。它把生命周期不同的对象拆开：Goal 与 Non-goals 在整个 session 内稳定；Maximum Authority、Hard Prohibitions、最大风险和预算由用户授权；Active Boundary 与 ConditionSet 形成可演化的 Design Revision；每次 Attempt 则是不可变投影。独立是权限边界，不是再找一个 LLM 审批。
+
+用户确认的是 `authorization_hash = hash(goal_hash, authority_revision_hash)`。初始 `presented_design_hash` 只进入 ConfirmationReceipt 供审计，不把初始设计冻结成授权对象。Condition 使用稳定 ID，定义内不保存 `satisfied`；是否满足只由绑定 verifier 版本、输入哈希、Attempt、结果与期限的 controller-owned Evidence 决定。root baseline 全 session 唯一，Attempt 只能另取增量 snapshot，不能用新 baseline 洗掉历史 mutation。
+
+自动调整只接受封闭的 typed operation，不能采信执行器写出的 `monotonic=true`：
+
+| 分类 | 决策 |
+|---|---|
+| `ADD_CONDITION`、`ADD_AND_VERIFIER`、`TIGHTEN_TYPED_THRESHOLD` | Authority 内且结构证明成立时自动 |
+| `NARROW_ACTIVE_BOUNDARY`、`EXPAND_WITHIN_AUTHORITY` | 包络内自动；越界转再授权 |
+| `REFRESH_CONTEXT`、`REPLACE_EQUIVALENT_VERIFIER`、`CONTROLLER_CORRECTION` | 局部失效 Evidence 后自动；verifier 替换必须有 parity 或 mutation proof |
+| `EXPAND_AUTHORITY`、`WEAKEN_CONDITION` | `AwaitingReauthorization` |
+| `CHANGE_GOAL` | successor GoalSession |
+| `UNCLASSIFIED` | fail closed |
+
+Contract Compiler 只编译结构化任务、上下文事实与保守默认值，不进行开放式访谈。只有缺失或矛盾字段会产生两种实质不同结果、且不存在更保守默认时，才返回一个 blocking `CompilationGap`。Brainstorm/Grill 是设计阶段压力测试方法，绝不是每次运行必经的提问、访谈或换名后的 mandatory checklist。
+
+Attempt projector 保持 v1 只读：原生 Codex objective 只承载短而稳定的 Goal，完整 Boundary、Conditions、content-bound Context、Non-goals 与 Hard Prohibitions 放入 hash-bound Context Package；Projection Proof 必须为每个 Active Condition 给出 v1 contract 位置、运行时 context pointer、verifier 与 Evidence 依赖。任何漏映射都阻止投影。
+
+完成等级分三层：executor/runtime 输出只能形成 `Candidate`；当前 controller-owned Evidence 全部有效可到 `Verified`；没有 control-plane bypass、unmediated turn 或未对账变化时才可 `Certified`。reviewer 文字、executor 的 all-green 或模型自报都不能直接认证完成。
+
+Plan 1 仅提供 [GoalSession v2 controller](../../codex-controller/) 的 `init`、`confirm`、`revise`、`project`、`evaluate`、`shadow`、`status`、`export`；没有 live execution 命令，也不调用本 adapter 的 GoalRpcClient 或任何 `runCodex*`。shadow 可并行分类旧 contract/candidate/postflight，但不写 legacy state、不替代 v1 hash confirmation、不应用 live revision、不启动或续跑。Node.js 低于 24.15 或 controller 不可用时必须明确报告 legacy mode，不能静默退化后仍声称动态 revision 生效。
+
+因此在当前阶段，同一稳定 Goal 内遇到 context refresh、等价 verifier 替换或 Authority 内边界调整时，shadow 应推荐 typed Design Revision 并给审计摘要；同时必须明确：live 路径仍按下文 v1 规则重新 Validate、Preview、Confirm(hash)。这项临时双轨限制会在 Controlled Execution 增量接管 live adapter 后才解除。
+
 ## Launch 前置条件
 
 只有 canonical contract 文件通过 byte-identical 检查、Validate 通过、包含 authoritative canonical JSON 的完整 Preview 已展示、用户明确确认当前 confirmed hash、Preflight 全绿，并且 `baseline_digest` 已保存到 baseline 文件之外的可信编排状态后，才允许控制器经 `thread/goal/set` 创建 goal。主会话必须先建立下文所示的 controller-owned `runBinding`，再提交同一 binding 的 closed-world `preflightEvidence={ok,reasons,binding}`；它不能来自执行会话输出。缺项、失败或 cross-binding 都停止 launch。用户说“直接跑”不替代 hash 确认。

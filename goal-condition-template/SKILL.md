@@ -20,6 +20,14 @@ Classify → Compile → Validate → Preview → Confirm(hash)
 
 一个 contract 只能有一个 single objective。输入若含多个可独立完成的目标，必须让用户选择一个；不得静默合并，也不得在本 skill 内启动子 goal 来拆分。
 
+## Codex v2 Shadow 分支
+
+仅当 `runtime="codex"` 且本地 GoalSession v2 controller 能力可用时，并行生成 Codex-only shadow classification；详细模型与边界见 [Codex adapter](references/adapters/codex.md)。v2 的授权语义是一次确认稳定的 Goal、Non-goals、Maximum Authority、Hard Prohibitions 与最大风险/预算；Boundary 和 Condition 是可随 controller-owned Evidence 演化的 typed Design Revisions。
+
+Authority 内的单调收紧、Context refresh、受证 verifier 等价替换和 controller correction 不重开整包授权；扩大 Authority、提高风险/预算、弱化 Condition 或改变 Goal 必须 reauthorization 或 successor。只在缺失信息会导致两个实质不同且都不能保守默认的编译结果时产生 `CompilationGap`；Grill 只可作为设计评审方法，不得进入运行时提问循环。
+
+本阶段 v2 **只运行 shadow**：它只给出 proposal、decision 与审计摘要，不替代下文 v1 的完整 hash confirmation，不调用 launch/resume/finalize/close，也不把 revision 应用到 live run。能力不可用时明确报告 legacy mode；不得假装动态 revision 已生效。Claude 路径完全沿用下文 v1 顺序与语义。
+
 ## Compile
 
 按 [run contract 字段与编译规则](references/run-contract.md) 生成 JSON，并读取安装实例的 [项目 profile](references/anchors-and-rules.md)。落盘文件必须是 `canonicalJson(parsed)` 生成的 canonical JSON bytes；它是后续确认、snapshot 与 launch 共用的唯一权威 artifact。所有事实性上下文必须来自 content-bound stable context：`context_sources` 的每项都含唯一 `id`、非临时绝对 `path` 与该文件 bytes 的小写 SHA-256 `sha256`；禁止依赖“上文”或仅存在于会话压缩前的内容。
