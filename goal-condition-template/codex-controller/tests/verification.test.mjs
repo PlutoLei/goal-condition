@@ -20,7 +20,8 @@ test('controller verifier hashes bounded output and can certify a clean Attempt'
   assert.equal(result.completion.level, 'certified');
   assert.equal(result.evidence.length, 1);
   assert.equal(result.evidence[0].output_hash.length, 64);
-  assert.equal(JSON.stringify(result.evidence).includes('pass'), false);
+  assert.equal(result.evidence[0].stdout, undefined);
+  assert.equal(result.evidence[0].output_bytes, undefined);
 });
 
 test('a bypass caps completion at Verified even when all verifiers pass', async () => {

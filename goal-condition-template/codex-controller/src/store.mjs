@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -9,6 +9,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -39,6 +40,18 @@ function timestamp(clock) {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) throw storeError('CLOCK_INVALID', 'store clock returned an invalid timestamp');
   return date.toISOString();
+}
+
+function canonicalRoot(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    throw storeError('TARGET_ROOT_INVALID', 'target roots must exist and resolve without symlinks');
+  }
+}
+
+function overlaps(left, right) {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 function ensurePrivateDirectory(path) {
@@ -184,6 +197,28 @@ export class SessionStore {
         kind TEXT NOT NULL,
         byte_length INTEGER NOT NULL,
         created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS launch_intents (
+        run_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        intent_json TEXT NOT NULL,
+        intent_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (session_id) REFERENCES sessions(session_id)
+      ) STRICT;
+      CREATE TABLE IF NOT EXISTS target_leases (
+        root TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        run_id TEXT NOT NULL,
+        owner_token TEXT NOT NULL,
+        writable INTEGER NOT NULL CHECK (writable IN (0, 1)),
+        status TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
       ) STRICT;
     `);
     this.db.enableDefensive(true);
@@ -362,6 +397,155 @@ export class SessionStore {
       'INSERT OR IGNORE INTO blobs (hash, kind, byte_length, created_at) VALUES (?, ?, ?, ?)',
     ).run(descriptor.hash, descriptor.kind, descriptor.byte_length, createdAt);
     return descriptor;
+  }
+
+  controllerKeyId() {
+    return `key-${sha256(readFileSync(join(this.stateRoot, 'controller.key'))).slice(0, 16)}`;
+  }
+
+  controllerMac(value) {
+    const key = readFileSync(join(this.stateRoot, 'controller.key'));
+    return createHmac('sha256', key).update(canonicalJson(value)).digest('hex');
+  }
+
+  #leaseConflicts(roots, now) {
+    const current = this.db.prepare(
+      "SELECT * FROM target_leases WHERE writable = 1 AND status IN ('active', 'reconciliation_required')",
+    ).all();
+    for (const row of current) {
+      if (!roots.some((root) => overlaps(root, row.root))) continue;
+      if (row.status === 'active' && new Date(row.expires_at).getTime() <= new Date(now).getTime()) {
+        this.db.prepare(
+          "UPDATE target_leases SET status = 'reconciliation_required', updated_at = ? WHERE root = ?",
+        ).run(now, row.root);
+        throw storeError(
+          'TARGET_ROOT_LEASE_RECONCILIATION_REQUIRED',
+          'an expired writable lease must be reconciled before takeover',
+        );
+      }
+      if (row.status === 'reconciliation_required') {
+        throw storeError(
+          'TARGET_ROOT_LEASE_RECONCILIATION_REQUIRED',
+          'a writable lease requires reconciliation before takeover',
+        );
+      }
+      throw storeError('TARGET_ROOT_LEASE_CONFLICT', 'a target root already has a writable controller owner');
+    }
+  }
+
+  #insertLeases({ roots, sessionId, attemptId, runId, ownerToken, expiresAt, writable, now }) {
+    const insert = this.db.prepare(`
+      INSERT INTO target_leases (
+        root, session_id, attempt_id, run_id, owner_token, writable, status, expires_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    `);
+    for (const root of roots) {
+      insert.run(root, sessionId, attemptId, runId, ownerToken, writable ? 1 : 0, expiresAt, now);
+    }
+  }
+
+  acquireRootLeases({ roots, sessionId, attemptId, runId, ownerToken, expiresAt, writable }) {
+    if (!Array.isArray(roots) || roots.length === 0) throw storeError('TARGET_ROOTS_INVALID', 'roots are required');
+    const canonical = [...new Set(roots.map(canonicalRoot))].sort();
+    const now = timestamp(this.clock);
+    if (Number.isNaN(new Date(expiresAt).getTime()) || new Date(expiresAt).getTime() <= new Date(now).getTime()) {
+      throw storeError('TARGET_ROOT_LEASE_EXPIRY_INVALID', 'lease expiry must be in the future');
+    }
+    this.#leaseConflicts(canonical, now);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#insertLeases({
+        roots: canonical, sessionId, attemptId, runId, ownerToken, expiresAt, writable, now,
+      });
+      this.db.exec('COMMIT');
+      return canonical.map((root) => this.readRootLease(root));
+    } catch (error) {
+      rollback(this.db);
+      if (error.code === 'ERR_SQLITE_CONSTRAINT_PRIMARYKEY') {
+        throw storeError('TARGET_ROOT_LEASE_CONFLICT', 'a target root already has a controller owner');
+      }
+      throw error;
+    }
+  }
+
+  persistLaunchIntent({ intent, roots, ownerToken, writable = true }) {
+    const canonical = [...new Set(roots.map(canonicalRoot))].sort();
+    const now = timestamp(this.clock);
+    this.#leaseConflicts(canonical, now);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#insertLeases({
+        roots: canonical,
+        sessionId: intent.session_id,
+        attemptId: intent.attempt_id,
+        runId: intent.run_id,
+        ownerToken,
+        expiresAt: intent.expires_at,
+        writable,
+        now,
+      });
+      const intentJson = canonicalJson(intent);
+      this.db.prepare(`
+        INSERT INTO launch_intents (
+          run_id, session_id, attempt_id, status, intent_json, intent_hash, created_at, updated_at
+        ) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+      `).run(
+        intent.run_id, intent.session_id, intent.attempt_id,
+        intentJson, digestCanonical(intent), now, now,
+      );
+      this.db.exec('COMMIT');
+      return this.readLaunchIntent(intent.run_id);
+    } catch (error) {
+      rollback(this.db);
+      if (error.code === 'ERR_SQLITE_CONSTRAINT_PRIMARYKEY') {
+        throw storeError('LAUNCH_INTENT_CONFLICT', 'run id or target root already exists');
+      }
+      throw error;
+    }
+  }
+
+  readLaunchIntent(runId) {
+    const row = this.db.prepare('SELECT * FROM launch_intents WHERE run_id = ?').get(runId);
+    if (row === undefined) throw storeError('LAUNCH_INTENT_NOT_FOUND', 'launch intent was not found');
+    let intent;
+    try {
+      intent = JSON.parse(row.intent_json);
+    } catch {
+      throw storeError('STATE_INTEGRITY_FAILURE', 'launch intent JSON is corrupt');
+    }
+    if (digestCanonical(intent) !== row.intent_hash) {
+      throw storeError('STATE_INTEGRITY_FAILURE', 'launch intent hash does not match');
+    }
+    return { ...intent, status: row.status };
+  }
+
+  updateLaunchIntentStatus({ runId, status }) {
+    if (!['pending', 'launched', 'ambiguous', 'reconciled', 'closed'].includes(status)) {
+      throw storeError('LAUNCH_INTENT_STATUS_INVALID', 'launch intent status is invalid');
+    }
+    const now = timestamp(this.clock);
+    const result = this.db.prepare(
+      'UPDATE launch_intents SET status = ?, updated_at = ? WHERE run_id = ?',
+    ).run(status, now, runId);
+    if (result.changes !== 1) throw storeError('LAUNCH_INTENT_NOT_FOUND', 'launch intent was not found');
+    return this.readLaunchIntent(runId);
+  }
+
+  readRootLease(root) {
+    const canonical = canonicalRoot(root);
+    const row = this.db.prepare('SELECT * FROM target_leases WHERE root = ?').get(canonical);
+    if (row === undefined) throw storeError('TARGET_ROOT_LEASE_NOT_FOUND', 'target root lease was not found');
+    return { ...row, writable: row.writable === 1 };
+  }
+
+  releaseRootLeases({ runId, ownerToken }) {
+    const rows = this.db.prepare(
+      'SELECT root FROM target_leases WHERE run_id = ? AND owner_token = ?',
+    ).all(runId, ownerToken);
+    this.db.prepare(
+      'DELETE FROM target_leases WHERE run_id = ? AND owner_token = ?',
+    ).run(runId, ownerToken);
+    return rows.map((row) => row.root);
   }
 
   getBlob(hash) {

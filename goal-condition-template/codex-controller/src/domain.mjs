@@ -1,6 +1,7 @@
 import { isAbsolute, relative, resolve } from 'node:path';
 
 import { digestCanonical, exactFields } from './values.mjs';
+import { validateAttemptRecord } from './attempt.mjs';
 
 const ID = /^[a-z0-9][a-z0-9-]*$/;
 const SHA256 = /^[0-9a-f]{64}$/;
@@ -541,6 +542,25 @@ export function validateGoalSession(session) {
     ['decision_ledger', session.decision_ledger],
   ]) {
     if (!Array.isArray(value)) diagnostics.push({ code: 'ARRAY_REQUIRED', path: field });
+  }
+  if (Array.isArray(session.attempts)) {
+    const ids = new Set();
+    const runs = new Set();
+    session.attempts.forEach((attempt, index) => {
+      try {
+        validateAttemptRecord(attempt);
+        if (attempt.session_id !== session.session_id) {
+          throw domainError('ATTEMPT_SESSION_MISMATCH', 'attempt belongs to another session');
+        }
+        if (ids.has(attempt.attempt_id) || runs.has(attempt.run_id)) {
+          throw domainError('ATTEMPT_DUPLICATE', 'attempt and run ids must be unique');
+        }
+        ids.add(attempt.attempt_id);
+        runs.add(attempt.run_id);
+      } catch (error) {
+        diagnostics.push({ ...diagnosticFrom(error), path: `attempts[${index}]` });
+      }
+    });
   }
   return diagnostics;
 }

@@ -275,11 +275,44 @@
     "attempt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["attempt_id", "status", "attempt_hash"],
+      "required": [
+        "attempt_id", "status", "attempt_hash", "session_id", "design_revision_hash",
+        "contract_hash", "context_package_hash", "projection_proof_hash", "workspace_digest",
+        "run_id", "launch_receipt", "candidate", "completion_level", "bypasses"
+      ],
       "properties": {
         "attempt_id": { "$ref": "#/$defs/id" },
-        "status": { "enum": ["Prepared", "Launched", "Candidate", "Rejected", "Verified"] },
-        "attempt_hash": { "$ref": "#/$defs/hash" }
+        "status": { "enum": ["Launched", "Candidate", "Rejected", "Verified"] },
+        "attempt_hash": { "$ref": "#/$defs/hash" },
+        "session_id": { "$ref": "#/$defs/id" },
+        "design_revision_hash": { "$ref": "#/$defs/hash" },
+        "contract_hash": { "$ref": "#/$defs/hash" },
+        "context_package_hash": { "$ref": "#/$defs/hash" },
+        "projection_proof_hash": { "$ref": "#/$defs/hash" },
+        "workspace_digest": { "$ref": "#/$defs/hash" },
+        "run_id": { "$ref": "#/$defs/id" },
+        "launch_receipt": { "$ref": "#/$defs/launchReceipt" },
+        "candidate": { "oneOf": [{ "type": "object" }, { "type": "null" }] },
+        "completion_level": { "oneOf": [{ "enum": ["candidate", "verified", "certified"] }, { "type": "null" }] },
+        "bypasses": { "type": "array", "items": { "type": "object" } }
+      }
+    },
+    "launchReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_version", "session_id", "attempt_id", "run_id", "intent_hash",
+        "thread_id", "turn_id", "started_at"
+      ],
+      "properties": {
+        "receipt_version": { "const": 1 },
+        "session_id": { "$ref": "#/$defs/id" },
+        "attempt_id": { "$ref": "#/$defs/id" },
+        "run_id": { "$ref": "#/$defs/id" },
+        "intent_hash": { "$ref": "#/$defs/hash" },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "turn_id": { "type": "string", "minLength": 1 },
+        "started_at": { "type": "string", "format": "date-time" }
       }
     },
     "evidence": {
