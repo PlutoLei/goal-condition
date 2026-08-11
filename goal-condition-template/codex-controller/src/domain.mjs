@@ -572,7 +572,7 @@ function validatedReceipt(session, receipt) {
     && typeof receipt.confirmed_at === 'string'
     && typeof receipt.thread_id === 'string'
     && typeof receipt.turn_or_message_ref === 'string'
-    && receipt.confirmation_source === 'user_message';
+    && ['user_message', 'codex-task'].includes(receipt.confirmation_source);
   if (!valid) throw domainError('CONFIRMATION_RECEIPT_INVALID', 'receipt does not bind the current authorization');
   return structuredClone(receipt);
 }

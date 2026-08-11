@@ -338,7 +338,7 @@
         "confirmed_at": { "type": "string", "format": "date-time" },
         "thread_id": { "type": "string", "minLength": 1 },
         "turn_or_message_ref": { "type": "string", "minLength": 1 },
-        "confirmation_source": { "enum": ["user_message", "migration_unverified"] }
+        "confirmation_source": { "enum": ["user_message", "codex-task", "migration_unverified"] }
       }
     },
     "ledgerEntry": {
