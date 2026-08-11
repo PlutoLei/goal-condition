@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
@@ -23,6 +23,37 @@ async function openTestStore(options = {}) {
 
 test.afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+test('target-root leases are exclusive and expired owners require reconciliation', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-store-lease-test-'));
+  roots.push(root);
+  const stateRoot = join(root, 'state');
+  const target = join(root, 'target-root');
+  await mkdir(target);
+  let now = new Date('2026-08-11T00:00:00.000Z');
+  const store = openSessionStore({ stateRoot, targetRoots: [target], clock: () => now });
+  const lease = store.acquireRootLeases({
+    roots: [target], sessionId: 'session-a', attemptId: 'attempt-a', runId: 'run-a',
+    ownerToken: 'owner-a', expiresAt: '2026-08-11T00:01:00.000Z', writable: true,
+  });
+  assert.equal(lease.length, 1);
+  assert.throws(
+    () => store.acquireRootLeases({
+      roots: [target], sessionId: 'session-b', attemptId: 'attempt-b', runId: 'run-b',
+      ownerToken: 'owner-b', expiresAt: '2026-08-11T00:01:00.000Z', writable: true,
+    }),
+    (error) => error.code === 'TARGET_ROOT_LEASE_CONFLICT',
+  );
+  now = new Date('2026-08-11T00:02:00.000Z');
+  assert.throws(
+    () => store.acquireRootLeases({
+      roots: [target], sessionId: 'session-b', attemptId: 'attempt-b', runId: 'run-b',
+      ownerToken: 'owner-b', expiresAt: '2026-08-11T00:03:00.000Z', writable: true,
+    }),
+    (error) => error.code === 'TARGET_ROOT_LEASE_RECONCILIATION_REQUIRED',
+  );
+  store.close();
 });
 
 test('compareAndCommit atomically advances one revision and rejects stale writers', async () => {
