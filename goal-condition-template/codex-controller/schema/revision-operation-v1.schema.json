@@ -59,9 +59,23 @@
       "required": ["condition_id", "comparator", "from", "to"],
       "properties": {
         "condition_id": { "type": "string", "minLength": 1 },
-        "comparator": { "enum": ["gte", "lte"] },
-        "from": { "type": "number" },
-        "to": { "type": "number" }
+        "comparator": { "enum": ["gte", "lte", "eq", "subset"] },
+        "from": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "boolean" },
+            { "type": "array", "uniqueItems": true, "items": { "type": "string" } }
+          ]
+        },
+        "to": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "boolean" },
+            { "type": "array", "uniqueItems": true, "items": { "type": "string" } }
+          ]
+        }
       }
     },
     "boundaryPayload": {

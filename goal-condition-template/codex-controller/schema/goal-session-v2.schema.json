@@ -199,7 +199,25 @@
         "projection": { "$ref": "#/$defs/projection" },
         "depends_on": { "$ref": "#/$defs/stringArray" },
         "introduced_by": { "type": "string", "minLength": 1 },
-        "strengthens": { "$ref": "#/$defs/stringArray" }
+        "strengthens": { "$ref": "#/$defs/stringArray" },
+        "predicate": { "$ref": "#/$defs/typedPredicate" }
+      }
+    },
+    "typedPredicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "comparator", "value"],
+      "properties": {
+        "metric": { "type": "string", "minLength": 1 },
+        "comparator": { "enum": ["gte", "lte", "eq", "subset"] },
+        "value": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "boolean" },
+            { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+          ]
+        }
       }
     },
     "contextDependency": {
