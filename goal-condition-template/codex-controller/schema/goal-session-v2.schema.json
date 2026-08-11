@@ -303,12 +303,34 @@
         "verifier_id": { "$ref": "#/$defs/id" },
         "verifier_version_hash": { "$ref": "#/$defs/hash" },
         "attempt_id": { "$ref": "#/$defs/id" },
-        "input_hashes": { "type": "array", "items": { "$ref": "#/$defs/hash" } },
+        "input_hashes": { "type": "array", "items": { "$ref": "#/$defs/inputHashBinding" } },
         "result": { "enum": ["pass", "fail", "error"] },
         "output_hash": { "$ref": "#/$defs/hash" },
         "captured_at": { "type": "string", "format": "date-time" },
         "expires_at": { "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
         "controller_owned": { "type": "boolean" }
+      }
+    },
+    "inputHashBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id", "sha256"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "root_baseline",
+            "context",
+            "artifact",
+            "runtime",
+            "boundary",
+            "snapshot",
+            "preflight",
+            "authority",
+            "projection"
+          ]
+        },
+        "id": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/hash" }
       }
     },
     "confirmationReceipt": {
