@@ -1,0 +1,340 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://goal-condition.dev/schema/codex/goal-session-v2.schema.json",
+  "title": "Codex GoalSession v2 audit shape",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "session_id",
+    "revision",
+    "status",
+    "goal",
+    "non_goals",
+    "goal_hash",
+    "root_baseline",
+    "root_baseline_hash",
+    "authority_revisions",
+    "authorization_hash",
+    "design_revisions",
+    "attempts",
+    "evidence",
+    "confirmation_receipts",
+    "decision_ledger",
+    "predecessor_session_id",
+    "successor_session_id"
+  ],
+  "properties": {
+    "schema_version": { "const": 2 },
+    "session_id": { "$ref": "#/$defs/id" },
+    "revision": { "type": "integer", "minimum": 0 },
+    "status": {
+      "enum": [
+        "Drafting",
+        "AwaitingConfirmation",
+        "Ready",
+        "Running",
+        "Evaluating",
+        "Revising",
+        "AwaitingReauthorization",
+        "ReconciliationRequired",
+        "Blocked",
+        "Complete",
+        "Superseded"
+      ]
+    },
+    "goal": { "$ref": "#/$defs/goal" },
+    "non_goals": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "goal_hash": { "$ref": "#/$defs/hash" },
+    "root_baseline": { "$ref": "#/$defs/rootBaseline" },
+    "root_baseline_hash": { "$ref": "#/$defs/hash" },
+    "authority_revisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/authorityRevision" }
+    },
+    "authorization_hash": { "$ref": "#/$defs/hash" },
+    "design_revisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/designRevision" }
+    },
+    "attempts": { "type": "array", "items": { "$ref": "#/$defs/attempt" } },
+    "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+    "confirmation_receipts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/confirmationReceipt" }
+    },
+    "decision_ledger": { "type": "array", "items": { "$ref": "#/$defs/ledgerEntry" } },
+    "predecessor_session_id": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] },
+    "successor_session_id": { "oneOf": [{ "$ref": "#/$defs/id" }, { "type": "null" }] }
+  },
+  "$defs": {
+    "id": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "stringArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "deliverable": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "description"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "goal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["statement", "deliverables"],
+      "properties": {
+        "statement": { "type": "string", "minLength": 1 },
+        "deliverables": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/deliverable" }
+        }
+      }
+    },
+    "rootBaseline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "digest"],
+      "properties": {
+        "kind": { "type": "string", "minLength": 1 },
+        "digest": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_roots",
+        "actions",
+        "external_effects",
+        "secret_refs",
+        "destructive",
+        "maximum_risk",
+        "maximum_budget",
+        "hard_prohibitions"
+      ],
+      "properties": {
+        "target_roots": { "$ref": "#/$defs/stringArray" },
+        "actions": { "$ref": "#/$defs/stringArray" },
+        "external_effects": { "$ref": "#/$defs/stringArray" },
+        "secret_refs": { "$ref": "#/$defs/stringArray" },
+        "destructive": { "type": "boolean" },
+        "maximum_risk": { "enum": ["low", "medium", "high", "critical"] },
+        "maximum_budget": { "oneOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }] },
+        "hard_prohibitions": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "activeBoundary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target_roots",
+        "actions",
+        "external_effects",
+        "secret_refs",
+        "destructive",
+        "risk",
+        "budget"
+      ],
+      "properties": {
+        "target_roots": { "$ref": "#/$defs/stringArray" },
+        "actions": { "$ref": "#/$defs/stringArray" },
+        "external_effects": { "$ref": "#/$defs/stringArray" },
+        "secret_refs": { "$ref": "#/$defs/stringArray" },
+        "destructive": { "type": "boolean" },
+        "risk": { "enum": ["low", "medium", "high", "critical"] },
+        "budget": { "oneOf": [{ "type": "number", "minimum": 0 }, { "type": "null" }] }
+      }
+    },
+    "verifier": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "cwd", "argv", "capture"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "type": { "const": "command" },
+        "cwd": { "type": "string", "minLength": 1 },
+        "argv": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "capture": { "enum": ["text", "json"] }
+      }
+    },
+    "projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterion_id", "command", "expected"],
+      "properties": {
+        "criterion_id": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "expected": { "type": "string", "minLength": 1 }
+      }
+    },
+    "condition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "rule",
+        "deliverable_ref",
+        "verifier",
+        "projection",
+        "depends_on",
+        "introduced_by",
+        "strengthens"
+      ],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["judgment", "success", "invariant"] },
+        "rule": { "type": "string", "minLength": 1 },
+        "deliverable_ref": { "$ref": "#/$defs/id" },
+        "verifier": { "$ref": "#/$defs/verifier" },
+        "projection": { "$ref": "#/$defs/projection" },
+        "depends_on": { "$ref": "#/$defs/stringArray" },
+        "introduced_by": { "type": "string", "minLength": 1 },
+        "strengthens": { "$ref": "#/$defs/stringArray" }
+      }
+    },
+    "contextDependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "path", "sha256"],
+      "properties": {
+        "id": { "$ref": "#/$defs/id" },
+        "path": { "type": "string", "minLength": 1 },
+        "sha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "authorityRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "authority", "previous_authority_revision_hash", "authority_revision_hash"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1 },
+        "authority": { "$ref": "#/$defs/authority" },
+        "previous_authority_revision_hash": {
+          "oneOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }]
+        },
+        "authority_revision_hash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "designRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "revision",
+        "active_boundary",
+        "conditions",
+        "context_dependencies",
+        "projection_version",
+        "reason",
+        "previous_design_revision_hash",
+        "design_revision_hash"
+      ],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1 },
+        "active_boundary": { "$ref": "#/$defs/activeBoundary" },
+        "conditions": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/condition" } },
+        "context_dependencies": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/contextDependency" }
+        },
+        "projection_version": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "previous_design_revision_hash": {
+          "oneOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }]
+        },
+        "design_revision_hash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt_id", "status", "attempt_hash"],
+      "properties": {
+        "attempt_id": { "$ref": "#/$defs/id" },
+        "status": { "enum": ["Prepared", "Launched", "Candidate", "Rejected", "Verified"] },
+        "attempt_hash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "condition_id",
+        "verifier_id",
+        "verifier_version_hash",
+        "attempt_id",
+        "input_hashes",
+        "result",
+        "output_hash",
+        "captured_at",
+        "controller_owned"
+      ],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/id" },
+        "condition_id": { "$ref": "#/$defs/id" },
+        "verifier_id": { "$ref": "#/$defs/id" },
+        "verifier_version_hash": { "$ref": "#/$defs/hash" },
+        "attempt_id": { "$ref": "#/$defs/id" },
+        "input_hashes": { "type": "array", "items": { "$ref": "#/$defs/hash" } },
+        "result": { "enum": ["pass", "fail", "error"] },
+        "output_hash": { "$ref": "#/$defs/hash" },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "expires_at": { "oneOf": [{ "type": "string", "format": "date-time" }, { "type": "null" }] },
+        "controller_owned": { "type": "boolean" }
+      }
+    },
+    "confirmationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_version",
+        "session_id",
+        "goal_hash",
+        "authority_revision_hash",
+        "authorization_hash",
+        "presented_design_hash",
+        "short_fingerprint",
+        "confirmed_at",
+        "thread_id",
+        "turn_or_message_ref",
+        "confirmation_source"
+      ],
+      "properties": {
+        "receipt_version": { "const": 1 },
+        "session_id": { "$ref": "#/$defs/id" },
+        "goal_hash": { "$ref": "#/$defs/hash" },
+        "authority_revision_hash": { "$ref": "#/$defs/hash" },
+        "authorization_hash": { "$ref": "#/$defs/hash" },
+        "presented_design_hash": { "$ref": "#/$defs/hash" },
+        "short_fingerprint": { "type": "string", "pattern": "^[0-9a-f]{12}$" },
+        "confirmed_at": { "type": "string", "format": "date-time" },
+        "thread_id": { "type": "string", "minLength": 1 },
+        "turn_or_message_ref": { "type": "string", "minLength": 1 },
+        "confirmation_source": { "enum": ["user_message", "migration_unverified"] }
+      }
+    },
+    "ledgerEntry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "event_type", "payload_hash", "previous_event_hash", "event_hash", "created_at"],
+      "properties": {
+        "sequence": { "type": "integer", "minimum": 1 },
+        "event_type": { "type": "string", "minLength": 1 },
+        "payload_hash": { "$ref": "#/$defs/hash" },
+        "previous_event_hash": { "oneOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] },
+        "event_hash": { "$ref": "#/$defs/hash" },
+        "created_at": { "type": "string", "format": "date-time" }
+      }
+    }
+  }
+}
