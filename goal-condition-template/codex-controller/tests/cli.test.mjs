@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
@@ -36,17 +36,90 @@ test.afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-test('Plan 1 CLI exposes no live execution command', () => {
+test('controlled CLI exposes the closed GoalSession lifecycle', () => {
   assert.deepEqual(commandNames().sort(), [
+    'adopt',
+    'capabilities',
+    'close',
     'confirm',
     'evaluate',
     'export',
+    'finalize',
     'init',
+    'launch',
+    'mode',
+    'prepare',
     'project',
+    'reconcile',
+    'resume',
     'revise',
     'shadow',
     'status',
+    'verify',
   ]);
+});
+
+test('init can capture a controller-owned root baseline and prepare a durable Attempt', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'target');
+  await mkdir(target);
+  const draft = validDraft();
+  draft.authority.target_roots = [target];
+  draft.authority.hard_prohibitions = [];
+  draft.initial_design.active_boundary.target_roots = [target];
+  draft.initial_design.conditions[0].verifier.cwd = target;
+  draft.initial_design.conditions[0].verifier.argv = [process.execPath, '--version'];
+  const initialized = run([
+    'init', '--state-root', stateRoot, '--input', await writeJson(root, 'draft.json', draft),
+    '--capture-baseline', 'true',
+  ]);
+  assert.equal(initialized.status, 0, initialized.stderr);
+  assert.equal(initialized.stdoutJson.root_baseline_digest.length, 64);
+  const confirmation = await writeJson(root, 'confirmation.json', {
+    authorization_hash: initialized.stdoutJson.authorization_hash,
+    thread_id: 'thread-cli', message_ref: 'message-confirmed', source: 'codex-task',
+    confirmed_at: '2026-08-11T00:00:00.000Z',
+  });
+  assert.equal(run([
+    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
+  ]).status, 0);
+  const prepared = run([
+    'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
+    '--input', await writeJson(root, 'prepare.json', {
+      attempt_id: 'attempt-cli-live',
+      run_id: 'run-cli-live',
+      nonce: '00112233445566778899aabbccddeeff',
+      expires_at: '2099-08-11T00:00:00.000Z',
+      hard_prohibition_capabilities: [],
+    }),
+  ]);
+  assert.equal(prepared.status, 0, prepared.stderr);
+  assert.equal(prepared.stdoutJson.live_execution, false);
+  assert.equal(prepared.stdoutJson.attempt_hash.length, 64);
+});
+
+test('mode and capability commands are closed-world and controller-only', async () => {
+  const { root, stateRoot } = await workspace();
+  const capabilities = run(['capabilities', '--input', await writeJson(root, 'caps.json', {
+    probes: {
+      sandbox: {
+        type: 'workspaceWrite', writableRoots: [], networkAccess: false,
+        excludeTmpdirEnvVar: false, excludeSlashTmp: false,
+      },
+      controller_state_outside_targets: true,
+      thread_read: true,
+      turn_readback: true,
+    },
+    hard_prohibitions: [{ id: 'network', capability: 'network-deny' }],
+  })]);
+  assert.equal(capabilities.status, 0, capabilities.stderr);
+  assert.equal(capabilities.stdoutJson.launchable, true);
+  const get = await writeJson(root, 'mode-get.json', { action: 'get', next: null, changed_at: null });
+  assert.equal(run(['mode', '--state-root', stateRoot, '--input', get]).stdoutJson.mode, 'shadow');
+  const set = await writeJson(root, 'mode-set.json', {
+    action: 'set', next: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z',
+  });
+  assert.equal(run(['mode', '--state-root', stateRoot, '--input', set]).stdoutJson.mode, 'opt-in');
 });
 
 test('init, confirm, revise, project, evaluate, status, and export stay controller-only', async () => {

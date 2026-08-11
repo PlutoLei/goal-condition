@@ -198,6 +198,26 @@ function buildManifest(session, design) {
   return { manifest, mappings };
 }
 
+export function projectBaselineManifest({ session, designRevision = session.design_revisions.at(-1) }) {
+  if (designRevision.design_revision_hash !== hashDesignRevision(designRevision)) {
+    throw projectionError('DESIGN_HASH_MISMATCH', 'design revision bytes do not match their hash');
+  }
+  const authority = session.authority_revisions.at(-1).authority;
+  const design = editableDesign(designRevision);
+  assertDesignWithinAuthority({ goal: session.goal, authority, design });
+  const { manifest, mappings } = buildManifest(session, design);
+  assertProjectionCoverage({ conditions: design.conditions, mappings });
+  const diagnostics = validateContract(manifest);
+  if (diagnostics.length > 0) {
+    throw projectionError(
+      'V1_PROJECTION_INVALID',
+      'projected v1 manifest failed closed-world validation',
+      diagnostics.map((diagnostic) => diagnostic.code),
+    );
+  }
+  return manifest;
+}
+
 export function assertProjectionCoverage({ conditions, mappings }) {
   if (!Array.isArray(conditions) || !Array.isArray(mappings)) {
     throw projectionError('PROJECTION_COVERAGE_INCOMPLETE', 'conditions and mappings must be arrays');
@@ -242,18 +262,8 @@ export function projectAttempt({ session, designRevision, attemptId }) {
   }
   const authority = session.authority_revisions.at(-1).authority;
   const design = editableDesign(designRevision);
-  assertDesignWithinAuthority({ goal: session.goal, authority, design });
-
-  const { manifest, mappings } = buildManifest(session, design);
-  assertProjectionCoverage({ conditions: design.conditions, mappings });
-  const diagnostics = validateContract(manifest);
-  if (diagnostics.length > 0) {
-    throw projectionError(
-      'V1_PROJECTION_INVALID',
-      'projected v1 manifest failed closed-world validation',
-      diagnostics.map((diagnostic) => diagnostic.code),
-    );
-  }
+  const manifest = projectBaselineManifest({ session, designRevision });
+  const { mappings } = buildManifest(session, design);
 
   const sessionBinding = {
     session_id: session.session_id,

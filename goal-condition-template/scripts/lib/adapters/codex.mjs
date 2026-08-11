@@ -542,6 +542,10 @@ export class GoalRpcClient {
     return this.rpc('thread/resume', { threadId });
   }
 
+  threadRead({ threadId, includeTurns = true }) {
+    return this.rpc('thread/read', { threadId, includeTurns });
+  }
+
   turnStart({ threadId, text }) {
     return this.rpc('turn/start', { threadId, input: [{ type: 'text', text }] });
   }

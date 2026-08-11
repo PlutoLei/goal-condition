@@ -251,10 +251,10 @@ Also run deterministic model sequences, crash injection, mutation tests, schema 
 Commit the finished branch. Build a release from the exact commit, verify its manifest digest, and switch only:
 
 ```text
-/Users/lei/.codex/skills/goal-condition
+$CODEX_HOME/skills/goal-condition
 ```
 
-Leave `/Users/lei/.claude/skills/goal-condition` on its previous release. Read both symlinks back and verify the installed files against the release manifest.
+Leave `$CLAUDE_HOME/skills/goal-condition` on its previous release. Read both symlinks back and verify the installed files against the release manifest.
 
 ## Task 11: Run a bounded real Codex canary and enable default
 

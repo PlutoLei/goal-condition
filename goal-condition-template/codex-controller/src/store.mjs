@@ -210,7 +210,7 @@ export class SessionStore {
         FOREIGN KEY (session_id) REFERENCES sessions(session_id)
       ) STRICT;
       CREATE TABLE IF NOT EXISTS target_leases (
-        root TEXT PRIMARY KEY,
+        root TEXT NOT NULL,
         session_id TEXT NOT NULL,
         attempt_id TEXT NOT NULL,
         run_id TEXT NOT NULL,
@@ -218,7 +218,8 @@ export class SessionStore {
         writable INTEGER NOT NULL CHECK (writable IN (0, 1)),
         status TEXT NOT NULL,
         expires_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (root, run_id)
       ) STRICT;
     `);
     this.db.enableDefensive(true);
@@ -408,12 +409,13 @@ export class SessionStore {
     return createHmac('sha256', key).update(canonicalJson(value)).digest('hex');
   }
 
-  #leaseConflicts(roots, now) {
+  #leaseConflicts(roots, now, writable) {
     const current = this.db.prepare(
-      "SELECT * FROM target_leases WHERE writable = 1 AND status IN ('active', 'reconciliation_required')",
+      "SELECT * FROM target_leases WHERE status IN ('active', 'reconciliation_required')",
     ).all();
     for (const row of current) {
       if (!roots.some((root) => overlaps(root, row.root))) continue;
+      if (!writable && row.writable !== 1) continue;
       if (row.status === 'active' && new Date(row.expires_at).getTime() <= new Date(now).getTime()) {
         this.db.prepare(
           "UPDATE target_leases SET status = 'reconciliation_required', updated_at = ? WHERE root = ?",
@@ -451,7 +453,7 @@ export class SessionStore {
     if (Number.isNaN(new Date(expiresAt).getTime()) || new Date(expiresAt).getTime() <= new Date(now).getTime()) {
       throw storeError('TARGET_ROOT_LEASE_EXPIRY_INVALID', 'lease expiry must be in the future');
     }
-    this.#leaseConflicts(canonical, now);
+    this.#leaseConflicts(canonical, now, writable);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.#insertLeases({
@@ -471,7 +473,7 @@ export class SessionStore {
   persistLaunchIntent({ intent, roots, ownerToken, writable = true }) {
     const canonical = [...new Set(roots.map(canonicalRoot))].sort();
     const now = timestamp(this.clock);
-    this.#leaseConflicts(canonical, now);
+    this.#leaseConflicts(canonical, now, writable);
     this.db.exec('BEGIN IMMEDIATE');
     try {
       this.#insertLeases({
@@ -531,9 +533,11 @@ export class SessionStore {
     return this.readLaunchIntent(runId);
   }
 
-  readRootLease(root) {
+  readRootLease(root, { runId } = {}) {
     const canonical = canonicalRoot(root);
-    const row = this.db.prepare('SELECT * FROM target_leases WHERE root = ?').get(canonical);
+    const row = runId === undefined
+      ? this.db.prepare('SELECT * FROM target_leases WHERE root = ? ORDER BY writable DESC, updated_at DESC LIMIT 1').get(canonical)
+      : this.db.prepare('SELECT * FROM target_leases WHERE root = ? AND run_id = ?').get(canonical, runId);
     if (row === undefined) throw storeError('TARGET_ROOT_LEASE_NOT_FOUND', 'target root lease was not found');
     return { ...row, writable: row.writable === 1 };
   }

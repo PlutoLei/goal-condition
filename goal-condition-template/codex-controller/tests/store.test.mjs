@@ -56,6 +56,35 @@ test('target-root leases are exclusive and expired owners require reconciliation
   store.close();
 });
 
+test('read-only leases can share a target root while writable leases remain exclusive', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-store-read-lease-test-'));
+  roots.push(root);
+  const target = join(root, 'target-root');
+  await mkdir(target);
+  const store = openSessionStore({
+    stateRoot: join(root, 'state'),
+    targetRoots: [target],
+    clock: () => new Date('2026-08-11T00:00:00.000Z'),
+  });
+  for (const suffix of ['a', 'b']) {
+    store.acquireRootLeases({
+      roots: [target], sessionId: `session-${suffix}`, attemptId: `attempt-${suffix}`,
+      runId: `run-${suffix}`, ownerToken: `owner-${suffix}`,
+      expiresAt: '2026-08-11T00:01:00.000Z', writable: false,
+    });
+  }
+  assert.equal(store.readRootLease(target, { runId: 'run-a' }).writable, false);
+  assert.equal(store.readRootLease(target, { runId: 'run-b' }).writable, false);
+  assert.throws(
+    () => store.acquireRootLeases({
+      roots: [target], sessionId: 'session-c', attemptId: 'attempt-c', runId: 'run-c',
+      ownerToken: 'owner-c', expiresAt: '2026-08-11T00:01:00.000Z', writable: true,
+    }),
+    (error) => error.code === 'TARGET_ROOT_LEASE_CONFLICT',
+  );
+  store.close();
+});
+
 test('compareAndCommit atomically advances one revision and rejects stale writers', async () => {
   const { store } = await openTestStore();
   const session = store.create(createGoalSession(validDraft()));

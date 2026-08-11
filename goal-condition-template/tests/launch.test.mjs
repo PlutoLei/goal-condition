@@ -14,7 +14,7 @@ import { promisify } from 'node:util';
 import {
   MAX_AUTO_RESUMES, stateDirFor, initStateDir, nextAttempt, AttemptClaimError, classifyPostflightRed,
   compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, runClaudeAttempt,
-  prepareCodexProbesOnly, runCodexLaunch, runCodexResume, runCodexFinalize, runCodexClose,
+  prepareCodexProbesOnly, runCodexLaunch, runCodexReadback, runCodexResume, runCodexFinalize, runCodexClose,
   POLL_INTERVAL_MS, WALL_CLOCK_DEADLINE_MS, LEASE_TTL_MS, releaseOwnLease, releaseResidualLease,
   MAX_TURNS_PER_ATTEMPT, MAX_TOKENS_PER_ATTEMPT,
 } from '../scripts/launch.mjs';
@@ -1021,6 +1021,12 @@ function makeFakeCodexClientFactory({
         emit('thread/goal/get', params, { goal });
         return { result: { goal } };
       },
+      async threadRead(params) {
+        calls.push(['threadRead', params]);
+        const result = { thread: { id: threadId, turns: [{ id: 'turn-1', status: 'completed' }] } };
+        emit('thread/read', params, result);
+        return { result };
+      },
       onNotification(cb) { notifyCbs.push(cb); },
       async stop() { calls.push(['stop']); },
     };
@@ -1071,6 +1077,34 @@ test('runCodexLaunch happy path: active set, polls to complete, candidate + ledg
   ]);
   const goalSetCall = calls.find((c) => c[0] === 'goalSet');
   assert.equal(goalSetCall[1].tokenBudget, 50000);   // budget.user_provided && max_tokens → 带 tokenBudget
+});
+
+test('runCodexLaunch keeps the native objective short and readback attributes the started turn', async () => {
+  const { stateDir, contract, binding } = await setupCodexState();
+  const authSource = await makeFakeAuthSource();
+  const { factory, calls } = makeFakeCodexClientFactory({
+    setGoal: makeGoal('active'),
+    pollGoals: [makeGoal('complete')],
+  });
+  const launched = await runCodexLaunch({
+    contract,
+    stateDir,
+    prompt: 'SHORT GOAL',
+    turnText: 'LONG HASH-BOUND CONTEXT PACKAGE',
+    binding,
+    clientFactory: factory,
+    authSource,
+    pollIntervalMs: 1,
+  });
+  assert.equal(launched.outcome, 'candidate');
+  assert.equal(calls.find(([name]) => name === 'goalSet')[1].objective, 'SHORT GOAL');
+  assert.match(calls.find(([name]) => name === 'turnStart')[1].text, /^LONG HASH-BOUND CONTEXT PACKAGE/);
+  const readback = await runCodexReadback({ stateDir, clientFactory: factory, authSource });
+  assert.deepEqual(readback, {
+    available: true,
+    thread_id: 't-fake',
+    turns: [{ id: 'turn-1', status: 'completed' }],
+  });
 });
 
 test('runCodexLaunch omits tokenBudget from goal.set when the contract budget has no max_tokens', async () => {

@@ -1225,7 +1225,7 @@ async function readCodexSession(stateDir) {
 // turnStart 起首轮 → 轮询（每拍 goalGet + 刷新租约，通知只记 turn 边界计数）→ normalizeTerminal
 // 分派 → deadline / daemon 中途死均 fail-closed 终局（后者报告体显式要求 snapshot verify）。
 export async function runCodexLaunch({
-  contract, stateDir, prompt, binding, clientFactory = defaultCodexClientFactory,
+  contract, stateDir, prompt, turnText, binding, clientFactory = defaultCodexClientFactory,
   authSource = DEFAULT_AUTH_SOURCE, deadlineMs, pollIntervalMs = POLL_INTERVAL_MS,
 }) {
   // binding（主会话持有的 runBinding）缺失、损坏、或对不上 stateDir 末段一律 fail-closed，不起 client。
@@ -1290,7 +1290,7 @@ export async function runCodexLaunch({
 
       await client.turnStart({
         threadId,
-        text: `${prompt}\n\nKeep working the thread until the goal reaches status "complete", then stop.`,
+        text: `${turnText ?? prompt}\n\nKeep working the thread until the goal reaches status "complete", then stop.`,
       });
 
       return pollGoalUntilTerminal({
@@ -1320,6 +1320,37 @@ export async function runCodexLaunch({
     // 每撞一次就留一个无人回收的临时目录。连上之后才失败的那些仍然占号，因而仍受配额封顶。
     if (error instanceof CodexConnectError) rmSync(codexHome, { recursive: true, force: true });
     return codexAttemptFailure(error, threadId);
+  }
+}
+
+// GoalSession v2 recovery/readback. It reuses the same isolated CODEX_HOME and client lifecycle as
+// resume/finalize, but performs no goal mutation and starts no turn.
+export async function runCodexReadback({
+  stateDir, clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
+}) {
+  const session = await readCodexSession(stateDir);
+  if (!session.ok) return { available: false, reasons: session.reasons };
+  try {
+    return await withCodexClient({
+      stateDir,
+      codexHome: session.codexHome,
+      cwd: session.cwd,
+      authSource,
+      clientFactory,
+    }, async ({ client }) => {
+      const envelope = await client.threadRead({ threadId: session.threadId, includeTurns: true });
+      const thread = envelope?.result?.thread;
+      if (thread?.id !== session.threadId || !Array.isArray(thread.turns)) {
+        return { available: false, reasons: ['thread/read returned no attributable turn history'] };
+      }
+      return {
+        available: true,
+        thread_id: thread.id,
+        turns: thread.turns.map((turn) => ({ id: turn?.id, status: turn?.status ?? null })),
+      };
+    });
+  } catch (error) {
+    return { available: false, reasons: [`native readback failed: ${error.message}`] };
   }
 }
 
