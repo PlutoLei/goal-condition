@@ -33,7 +33,7 @@ Codex 侧当前把 Goal、Authority、Boundary、Condition 和 Attempt 聚合为
 - LaunchIntent/Attempt 绑定 controller release digest，prepare 后换版本必须在 dispatch 前拒绝；
 - executor sandbox 由 Active Boundary 的 `write` Authority 投影为 `read-only | workspace-write`；
 - Context dependency 只能位于 Active Boundary 内并在授权预览中显示；
-- LaunchReceipt v2 分别绑定 `turn/start` 响应 ID 与首次 readback 的唯一持久化 ID，并以 controller 新建 thread 的精确 `0→1` turn 集变化证明因果；不能证明该栅栏时 fail closed；
+- LaunchReceipt v2 分别绑定 `turn/start` 响应 ID、带随机 controller correlation 的 exact input SHA-256 与首次 readback 的唯一持久化 ID，并以输入核回加新建 thread 的精确 `0→1` 变化联合证明因果；不能证明该栅栏时 fail closed；
 - finalize 在 terminal mutation 前后执行 exact native turn fence，close 以 runtime quiescence 为释放租约前提。
 
 ## 备选

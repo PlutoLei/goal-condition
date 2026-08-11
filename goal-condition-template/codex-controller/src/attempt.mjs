@@ -14,7 +14,7 @@ const INTENT_FIELDS = Object.freeze([
 ]);
 const RECEIPT_FIELDS = Object.freeze([
   'receipt_version', 'session_id', 'attempt_id', 'run_id', 'intent_hash', 'thread_id',
-  'turn_start_response_id', 'turn_id', 'authorized_turn_ids', 'started_at',
+  'turn_start_response_id', 'turn_input_sha256', 'turn_id', 'authorized_turn_ids', 'started_at',
 ]);
 const CANDIDATE_FIELDS = Object.freeze(['status', 'remaining_work']);
 const BYPASS_FIELDS = Object.freeze(['type', 'reason_codes']);
@@ -117,7 +117,7 @@ export function verifyLaunchCapability({ intent, key }) {
 }
 
 export function createLaunchReceipt({
-  intent, threadId, turnStartResponseId, turnId, authorizedTurnIds, startedAt,
+  intent, threadId, turnStartResponseId, turnInputSha256, turnId, authorizedTurnIds, startedAt,
 }) {
   exactFields(intent, INTENT_FIELDS, 'launch_intent');
   if (typeof threadId !== 'string' || threadId.length === 0
@@ -128,14 +128,13 @@ export function createLaunchReceipt({
       'a receipt requires native thread, start-response, and persisted turn ids',
     );
   }
+  requireHash(turnInputSha256, 'turnInputSha256');
   if (!Array.isArray(authorizedTurnIds)
-    || authorizedTurnIds.length === 0
-    || authorizedTurnIds.some((id) => typeof id !== 'string' || id.length === 0)
-    || new Set(authorizedTurnIds).size !== authorizedTurnIds.length
-    || !authorizedTurnIds.includes(turnId)) {
+    || authorizedTurnIds.length !== 1
+    || authorizedTurnIds[0] !== turnId) {
     throw attemptError(
       'AUTHORIZED_TURNS_INVALID',
-      'a receipt must bind a unique, non-empty set containing the primary native turn',
+      'a receipt must authorize exactly the primary persisted native turn',
     );
   }
   return {
@@ -146,6 +145,7 @@ export function createLaunchReceipt({
     intent_hash: launchIntentHash(intent),
     thread_id: threadId,
     turn_start_response_id: turnStartResponseId,
+    turn_input_sha256: turnInputSha256,
     turn_id: turnId,
     authorized_turn_ids: structuredClone(authorizedTurnIds),
     started_at: requireTime(startedAt, 'startedAt'),
@@ -202,12 +202,11 @@ export function validateAttemptRecord(attempt) {
       throw attemptError('NATIVE_TURN_REQUIRED', `launch receipt ${field} is invalid`);
     }
   }
+  requireHash(attempt.launch_receipt.turn_input_sha256, 'turn_input_sha256');
   const authorized = attempt.launch_receipt.authorized_turn_ids;
   if (!Array.isArray(authorized)
-    || authorized.length === 0
-    || authorized.some((id) => typeof id !== 'string' || id.length === 0)
-    || new Set(authorized).size !== authorized.length
-    || !authorized.includes(attempt.launch_receipt.turn_id)) {
+    || authorized.length !== 1
+    || authorized[0] !== attempt.launch_receipt.turn_id) {
     throw attemptError('AUTHORIZED_TURNS_INVALID', 'launch receipt authorized turns are invalid');
   }
   if (!Array.isArray(attempt.bypasses)) throw attemptError('ATTEMPT_BYPASSES_INVALID', 'bypasses must be an array');

@@ -781,7 +781,10 @@ async function finalize(flags) {
     const result = await runCodexFinalize({
       stateDir: runtime.stateDir,
       binding: runtime.binding,
-      expectedTurnIds: attempt.launch_receipt.authorized_turn_ids,
+      expectedTurns: [{
+        id: attempt.launch_receipt.turn_id,
+        input_sha256: attempt.launch_receipt.turn_input_sha256,
+      }],
     });
     if (result.attribution.ok !== true) {
       let next = structuredClone(session);

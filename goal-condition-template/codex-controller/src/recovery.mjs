@@ -24,29 +24,31 @@ export function reconcileLaunch({ intent, receipt, native }) {
   const nativeTurnIds = turns.map((turn) => turn?.id);
   const authorizedTurnIds = receipt.authorized_turn_ids;
   if (!Array.isArray(authorizedTurnIds)
-    || authorizedTurnIds.length === 0
-    || nativeTurnIds.some((id) => typeof id !== 'string')) {
+    || authorizedTurnIds.length !== 1
+    || authorizedTurnIds[0] !== receipt.turn_id
+    || typeof receipt.turn_input_sha256 !== 'string'
+    || !/^[0-9a-f]{64}$/.test(receipt.turn_input_sha256)
+    || nativeTurnIds.some((id) => typeof id !== 'string' || id.length === 0)
+    || new Set(nativeTurnIds).size !== nativeTurnIds.length
+    || turns.some((turn) => typeof turn?.input_sha256 !== 'string'
+      || !/^[0-9a-f]{64}$/.test(turn.input_sha256))) {
     return {
       disposition: 'reconciliation_required',
       relaunch_allowed: false,
       reason_codes: ['LAUNCH_RECEIPT_READBACK_MISMATCH'],
     };
   }
-  const authorized = new Set(authorizedTurnIds);
-  if (nativeTurnIds.some((id) => !authorized.has(id))) {
+  if (turns.some((turn) => turn.id !== receipt.turn_id
+    || turn.input_sha256 !== receipt.turn_input_sha256)) {
     return {
       disposition: 'control_plane_bypass',
       relaunch_allowed: false,
       reason_codes: ['UNRECEIPTED_NATIVE_TURN'],
     };
   }
-  const nativeIds = new Set(nativeTurnIds);
-  const allAuthorizedFound = authorizedTurnIds.every((id) => nativeIds.has(id));
-  const turnFound = nativeIds.has(receipt.turn_id);
   if (receipt.run_id === intent?.run_id
     && native.thread_id === receipt.thread_id
-    && turnFound
-    && allAuthorizedFound) {
+    && turns.length === 1) {
     return {
       disposition: 'continue_evaluating',
       relaunch_allowed: false,

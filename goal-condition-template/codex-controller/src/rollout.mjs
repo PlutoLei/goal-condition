@@ -75,9 +75,10 @@ export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
     && attempt.bypasses.length === 0
     && receipt?.attempt_id === attempt?.attempt_id
     && receipt?.run_id === attempt?.run_id
+    && HASH.test(receipt?.turn_input_sha256 ?? '')
     && Array.isArray(receipt?.authorized_turn_ids)
-    && receipt.authorized_turn_ids.length > 0
-    && receipt.authorized_turn_ids.includes(receipt.turn_id)
+    && receipt.authorized_turn_ids.length === 1
+    && receipt.authorized_turn_ids[0] === receipt.turn_id
     && conditionIds.size === finalDesign.conditions.length
     && [...conditionIds].every((id) => evidenceIds.has(id))
     && certification?.event_type === 'GOAL_SESSION_CERTIFIED'

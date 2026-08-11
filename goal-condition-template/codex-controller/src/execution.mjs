@@ -177,22 +177,27 @@ export async function launchControlledAttempt({
   }
   const turns = Array.isArray(native?.turns) ? native.turns : [];
   const persistedTurnId = turns[0]?.id;
+  const persistedTurnInputSha256 = turns[0]?.input_sha256;
   const authorizedTurnIds = [persistedTurnId];
   if (native?.available !== true
     || native.thread_id !== runtime.threadId
     || typeof runtime?.turnId !== 'string'
     || runtime.turnId.length === 0
+    || typeof runtime?.turnInputSha256 !== 'string'
+    || !HASH.test(runtime.turnInputSha256)
     || !Array.isArray(runtime.initialTurnIds)
     || runtime.initialTurnIds.length !== 0
     || turns.length !== 1
     || typeof persistedTurnId !== 'string'
-    || persistedTurnId.length === 0) {
+    || persistedTurnId.length === 0
+    || persistedTurnInputSha256 !== runtime.turnInputSha256) {
     return reconcileAmbiguous({ store, prepared, readback: async () => native });
   }
   const receipt = createLaunchReceipt({
     intent: prepared.intent,
     threadId: runtime.threadId,
     turnStartResponseId: runtime.turnId,
+    turnInputSha256: runtime.turnInputSha256,
     turnId: persistedTurnId,
     authorizedTurnIds,
     startedAt: now,

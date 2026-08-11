@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import {
@@ -1023,7 +1024,14 @@ function makeFakeCodexClientFactory({
       },
       async threadRead(params) {
         calls.push(['threadRead', params]);
-        const result = { thread: { id: threadId, turns: [{ id: 'turn-1', status: 'completed' }] } };
+        const text = calls.find(([method]) => method === 'turnStart')?.[1]?.text;
+        const items = typeof text === 'string' ? [{
+          type: 'userMessage',
+          content: [{ type: 'text', text, text_elements: [] }],
+        }] : [];
+        const result = {
+          thread: { id: threadId, turns: [{ id: 'turn-1', status: 'completed', items }] },
+        };
         emit('thread/read', params, result);
         return { result };
       },
@@ -1129,12 +1137,18 @@ test('runCodexLaunch keeps the native objective short and readback attributes th
   });
   assert.equal(launched.outcome, 'candidate');
   assert.equal(calls.find(([name]) => name === 'goalSet')[1].objective, 'SHORT GOAL');
-  assert.match(calls.find(([name]) => name === 'turnStart')[1].text, /^LONG HASH-BOUND CONTEXT PACKAGE/);
+  const sentText = calls.find(([name]) => name === 'turnStart')[1].text;
+  assert.match(sentText, /^LONG HASH-BOUND CONTEXT PACKAGE/);
+  assert.match(sentText, /Controller Turn Correlation: [0-9a-f]{64}/);
+  assert.equal(
+    launched.turnInputSha256,
+    createHash('sha256').update(sentText, 'utf8').digest('hex'),
+  );
   const readback = await runCodexReadback({ stateDir, clientFactory: factory, authSource });
   assert.deepEqual(readback, {
     available: true,
     thread_id: 't-fake',
-    turns: [{ id: 'turn-1', status: 'completed' }],
+    turns: [{ id: 'turn-1', status: 'completed', input_sha256: launched.turnInputSha256 }],
   });
 });
 
@@ -2815,6 +2829,66 @@ test('runCodexFinalize happy path writes both controller-owned evidence files an
   assert.equal(ledger[1].requestedStatus, 'complete');
   assert.equal(ledger[1].threadId, 't-fake');
   assert.equal(ledger[1].updatedAt, 1786000900);
+});
+
+test('runCodexFinalize binds the persisted turn input bytes for GoalSession v2', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const sentText = 'controller turn\n\nController Turn Correlation: ' + '7'.repeat(64);
+  const inputSha256 = createHash('sha256').update(sentText, 'utf8').digest('hex');
+  const persistedTurn = {
+    id: 'turn-1',
+    status: 'completed',
+    items: [{
+      type: 'userMessage',
+      content: [{ type: 'text', text: sentText, text_elements: [] }],
+    }],
+  };
+  const { factory } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal,
+    readbackGoal: completeGoal,
+    threadReadTurns: [[persistedTurn]],
+  });
+
+  const result = await runCodexFinalize({
+    stateDir,
+    binding,
+    clientFactory: factory,
+    authSource,
+    expectedTurns: [{ id: 'turn-1', input_sha256: inputSha256 }],
+  });
+
+  assert.equal(result.attribution.ok, true);
+  assert.equal(result.turnFence.ok, true);
+});
+
+test('runCodexFinalize rejects a matching turn id with different persisted input bytes', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const { factory, calls } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal,
+    readbackGoal: completeGoal,
+    threadReadTurns: [[{
+      id: 'turn-1',
+      status: 'completed',
+      items: [{
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'external turn', text_elements: [] }],
+      }],
+    }]],
+  });
+
+  const result = await runCodexFinalize({
+    stateDir,
+    binding,
+    clientFactory: factory,
+    authSource,
+    expectedTurns: [{ id: 'turn-1', input_sha256: '7'.repeat(64) }],
+  });
+
+  assert.equal(result.attribution.ok, false);
+  assert.deepEqual(result.turnFence.reason_codes, ['UNRECEIPTED_NATIVE_TURN']);
+  assert.equal(calls.some((call) => call.method === 'thread/goal/set'), false);
 });
 
 test('runCodexFinalize refuses an unreceipted turn before terminal mutation', async () => {

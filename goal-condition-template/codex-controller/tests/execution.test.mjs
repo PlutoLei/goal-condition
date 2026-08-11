@@ -14,6 +14,7 @@ import { validDraft } from './helpers.mjs';
 
 const roots = [];
 const RELEASE_DIGEST = '9'.repeat(64);
+const TURN_INPUT_HASH = '7'.repeat(64);
 
 function prepareControlledAttempt(options) {
   return prepareAttempt({ ...options, controllerReleaseDigest: RELEASE_DIGEST });
@@ -80,11 +81,13 @@ test('intent and exclusive root lease are durable before the live launcher is ca
       assert.equal(store.read(session.session_id).status, 'Dispatching');
       return {
         outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-1', initialTurnIds: [],
+        turnInputSha256: TURN_INPUT_HASH,
         candidate: { status: 'ready_for_postflight', remaining_work: false },
       };
     },
     readback: async () => ({
-      available: true, thread_id: 'thread-1', turns: [{ id: 'turn-1' }],
+      available: true, thread_id: 'thread-1',
+      turns: [{ id: 'turn-1', input_sha256: TURN_INPUT_HASH }],
     }),
     now: '2026-08-11T00:01:00.000Z',
   });
@@ -110,10 +113,12 @@ test('a fresh-thread 0-to-1 fence binds the persisted turn when start response i
     launch: async () => ({
       outcome: 'candidate', threadId: 'thread-1',
       turnId: 'turn-start-response-v7', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH,
       candidate: { status: 'ready_for_postflight', remaining_work: false },
     }),
     readback: async () => ({
-      available: true, thread_id: 'thread-1', turns: [{ id: 'turn-persisted-v4' }],
+      available: true, thread_id: 'thread-1',
+      turns: [{ id: 'turn-persisted-v4', input_sha256: TURN_INPUT_HASH }],
     }),
     now: '2026-08-11T00:01:00.000Z',
   });
@@ -121,7 +126,37 @@ test('a fresh-thread 0-to-1 fence binds the persisted turn when start response i
   assert.equal(result.receipt.receipt_version, 2);
   assert.equal(result.receipt.turn_start_response_id, 'turn-start-response-v7');
   assert.equal(result.receipt.turn_id, 'turn-persisted-v4');
+  assert.equal(result.receipt.turn_input_sha256, TURN_INPUT_HASH);
   assert.deepEqual(result.receipt.authorized_turn_ids, ['turn-persisted-v4']);
+  store.close();
+});
+
+test('a lone persisted turn with different input bytes is a control-plane bypass', async () => {
+  const { store, session } = await fixture();
+  const prepared = prepareControlledAttempt({
+    store, sessionId: session.session_id, attemptId: 'attempt-input-mismatch',
+    workspaceDigest: 'b'.repeat(64), runId: 'run-input-mismatch',
+    expiresAt: '2099-08-11T01:00:00.000Z', nonce: '00112233445566778899aabbccddeeff',
+    capabilityReport: { launchable: true },
+  });
+  const result = await launchControlledAttempt({
+    store,
+    prepared,
+    launch: async () => ({
+      outcome: 'candidate', threadId: 'thread-1',
+      turnId: 'turn-start-response-v7', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH,
+      candidate: { status: 'ready_for_postflight', remaining_work: false },
+    }),
+    readback: async () => ({
+      available: true, thread_id: 'thread-1',
+      turns: [{ id: 'turn-external', input_sha256: '8'.repeat(64) }],
+    }),
+    now: '2026-08-11T00:01:00.000Z',
+  });
+  assert.equal(result.disposition, 'control_plane_bypass');
+  assert.equal(result.session.status, 'ReconciliationRequired');
+  assert.equal(result.receipt, undefined);
   store.close();
 });
 
@@ -138,12 +173,16 @@ test('more than one persisted turn before receipt is a control-plane bypass', as
     prepared,
     launch: async () => ({
       outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-authorized', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH,
       candidate: { status: 'ready_for_postflight', remaining_work: false },
     }),
     readback: async () => ({
       available: true,
       thread_id: 'thread-1',
-      turns: [{ id: 'turn-injected-before-receipt' }, { id: 'turn-authorized' }],
+      turns: [
+        { id: 'turn-injected-before-receipt', input_sha256: '8'.repeat(64) },
+        { id: 'turn-authorized', input_sha256: TURN_INPUT_HASH },
+      ],
     }),
     now: '2026-08-11T00:01:00.000Z',
   });
@@ -283,10 +322,14 @@ test('launch completion cannot overwrite a concurrent controller revision', asyn
         });
         return {
           outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-1', initialTurnIds: [],
+          turnInputSha256: TURN_INPUT_HASH,
           candidate: { status: 'ready_for_postflight', remaining_work: false },
         };
       },
-      readback: async () => ({ available: true, thread_id: 'thread-1', turns: [{ id: 'turn-1' }] }),
+      readback: async () => ({
+        available: true, thread_id: 'thread-1',
+        turns: [{ id: 'turn-1', input_sha256: TURN_INPUT_HASH }],
+      }),
       now: '2026-08-11T00:01:00.000Z',
     }),
     (error) => error.code === 'SESSION_REVISION_CONFLICT',
@@ -331,9 +374,13 @@ test('a native terminal report rejects the Attempt and blocks the Session', asyn
     prepared,
     launch: async () => ({
       outcome: 'terminal_report', threadId: 'thread-1', turnId: 'turn-1', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH,
       reasons: ['blocked'],
     }),
-    readback: async () => ({ available: true, thread_id: 'thread-1', turns: [{ id: 'turn-1' }] }),
+    readback: async () => ({
+      available: true, thread_id: 'thread-1',
+      turns: [{ id: 'turn-1', input_sha256: TURN_INPUT_HASH }],
+    }),
     now: '2026-08-11T00:01:00.000Z',
   });
   assert.equal(result.session.status, 'Blocked');

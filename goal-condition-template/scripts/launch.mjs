@@ -8,7 +8,7 @@ import {
 import {
   appendFile, chmod, lstat, mkdir, readdir, readFile, rm, writeFile,
 } from 'node:fs/promises';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import {
   basename, isAbsolute, join,
@@ -28,6 +28,32 @@ import { contractHash, readContract } from './lib/contract.mjs';
 import { runtimeTerminalState } from './lib/workflow.mjs';
 
 const execFile = promisify(execFileCallback);
+
+const SHA256 = /^[0-9a-f]{64}$/;
+
+function sha256Text(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+function nativeTurnInputSha256(turn) {
+  const userMessages = Array.isArray(turn?.items)
+    ? turn.items.filter((item) => item?.type === 'userMessage') : [];
+  const content = userMessages[0]?.content;
+  if (userMessages.length !== 1
+    || !Array.isArray(content)
+    || content.length !== 1
+    || content[0]?.type !== 'text'
+    || typeof content[0]?.text !== 'string') return null;
+  return sha256Text(content[0].text);
+}
+
+function summarizeNativeTurn(turn) {
+  return {
+    id: turn?.id,
+    status: turn?.status ?? null,
+    input_sha256: nativeTurnInputSha256(turn),
+  };
+}
 
 // §6：一次逻辑 run = 1 首发 + ≤2 续跑。
 export const MAX_AUTO_RESUMES = 2;
@@ -1299,10 +1325,11 @@ export async function runCodexLaunch({
         };
       }
 
-      const turnEnvelope = await client.turnStart({
-        threadId,
-        text: `${turnText ?? prompt}\n\nKeep working the thread until the goal reaches status "complete", then stop.`,
-      });
+      const turnCorrelation = randomBytes(32).toString('hex');
+      const turnInputText = `${turnText ?? prompt}\n\nController Turn Correlation: ${turnCorrelation}`
+        + '\n\nKeep working the thread until the goal reaches status "complete", then stop.';
+      const turnInputSha256 = sha256Text(turnInputText);
+      const turnEnvelope = await client.turnStart({ threadId, text: turnInputText });
       const turnId = turnEnvelope?.result?.turn?.id ?? null;
       const terminal = await pollGoalUntilTerminal({
         client,
@@ -1319,7 +1346,7 @@ export async function runCodexLaunch({
         turnCap: effectiveCap(MAX_TURNS_PER_ATTEMPT, contract, 'max_turns'),
         tokenCap: effectiveCap(MAX_TOKENS_PER_ATTEMPT, contract, 'max_tokens'),
       });
-      return { ...terminal, turnId, initialTurnIds };
+      return { ...terminal, turnId, initialTurnIds, turnInputSha256 };
     });
   } catch (error) {
     if (error instanceof AttemptClaimError) throw error;
@@ -1358,7 +1385,7 @@ export async function runCodexReadback({
       return {
         available: true,
         thread_id: thread.id,
-        turns: thread.turns.map((turn) => ({ id: turn?.id, status: turn?.status ?? null })),
+        turns: thread.turns.map(summarizeNativeTurn),
       };
     });
   } catch (error) {
@@ -1485,33 +1512,54 @@ export async function runCodexResume({
 // 把关，本函数不自证（CLI 看不到 postflight 结论，自证只会造出一个假的顺序证据）。
 // 产物是两份 controller-owned 证据文件，字段与 workflow.mjs 的闭世界形状逐字对齐；归因不过就把
 // 两份都写成 ok:false + 安全 reasons（fail-closed：主会话再喂 nextAction 自然被拒，而不是缺文件）。
-function verifyNativeTurnFence(envelope, threadId, expectedTurnIds) {
-  if (!Array.isArray(expectedTurnIds)
-    || expectedTurnIds.length === 0
-    || new Set(expectedTurnIds).size !== expectedTurnIds.length
-    || expectedTurnIds.some((id) => typeof id !== 'string' || id.length === 0)) {
+function verifyNativeTurnFence(envelope, threadId, expectedTurnIds, expectedTurns) {
+  const v2 = expectedTurns !== undefined;
+  const normalizedExpected = v2 ? expectedTurns : expectedTurnIds;
+  if (!Array.isArray(normalizedExpected)
+    || normalizedExpected.length === 0
+    || (v2 && normalizedExpected.length !== 1)
+    || (v2 && normalizedExpected.some((turn) => {
+      const keys = Object.keys(turn ?? {}).sort();
+      return keys.length !== 2
+        || keys[0] !== 'id'
+        || keys[1] !== 'input_sha256'
+        || typeof turn.id !== 'string'
+        || turn.id.length === 0
+        || typeof turn.input_sha256 !== 'string'
+        || !SHA256.test(turn.input_sha256);
+    }))
+    || (!v2 && (new Set(normalizedExpected).size !== normalizedExpected.length
+      || normalizedExpected.some((id) => typeof id !== 'string' || id.length === 0)))) {
     return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_INVALID'] };
   }
   const thread = envelope?.result?.thread;
   if (thread?.id !== threadId || !Array.isArray(thread.turns)) {
     return { ok: false, reason_codes: ['FINALIZE_NATIVE_READBACK_UNAVAILABLE'] };
   }
-  const observed = thread.turns.map((turn) => turn?.id);
-  if (observed.some((id) => typeof id !== 'string') || new Set(observed).size !== observed.length) {
+  const observedTurns = thread.turns.map(summarizeNativeTurn);
+  const observed = observedTurns.map((turn) => turn.id);
+  if (observed.some((id) => typeof id !== 'string' || id.length === 0)
+    || new Set(observed).size !== observed.length
+    || (v2 && observedTurns.some((turn) => !SHA256.test(turn.input_sha256 ?? '')))) {
     return { ok: false, reason_codes: ['FINALIZE_NATIVE_TURN_HISTORY_INVALID'] };
   }
-  const expected = new Set(expectedTurnIds);
-  if (observed.some((id) => !expected.has(id))) {
+  const expected = new Set(v2
+    ? normalizedExpected.map((turn) => `${turn.id}:${turn.input_sha256}`)
+    : normalizedExpected);
+  const observedKeys = v2
+    ? observedTurns.map((turn) => `${turn.id}:${turn.input_sha256}`)
+    : observed;
+  if (observedKeys.some((key) => !expected.has(key))) {
     return { ok: false, reason_codes: ['UNRECEIPTED_NATIVE_TURN'] };
   }
-  if (expectedTurnIds.some((id) => !observed.includes(id))) {
+  if ([...expected].some((key) => !observedKeys.includes(key))) {
     return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_MISMATCH'] };
   }
   return { ok: true, reason_codes: [] };
 }
 
 export async function runCodexFinalize({
-  stateDir, binding, expectedTurnIds,
+  stateDir, binding, expectedTurnIds, expectedTurns,
   clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
 }) {
   const receiptPath = join(stateDir, 'finalization-receipt.json');
@@ -1568,11 +1616,12 @@ export async function runCodexFinalize({
       stateDir, codexHome, cwd, authSource, clientFactory,
     }, async ({ client }) => {
       let turnFence = null;
-      if (expectedTurnIds !== undefined) {
+      if (expectedTurnIds !== undefined || expectedTurns !== undefined) {
         turnFence = verifyNativeTurnFence(
           await client.threadRead({ threadId, includeTurns: true }),
           threadId,
           expectedTurnIds,
+          expectedTurns,
         );
         if (!turnFence.ok) {
           return writeEvidence({ ok: false, reasons: turnFence.reason_codes }, { turnFence });
@@ -1590,11 +1639,12 @@ export async function runCodexFinalize({
       let attribution = verifyFinalizeAttribution({
         setEnvelope, readbackEnvelope, threadId, sequence, ledger: await readLedger(stateDir),
       });
-      if (expectedTurnIds !== undefined) {
+      if (expectedTurnIds !== undefined || expectedTurns !== undefined) {
         turnFence = verifyNativeTurnFence(
           await client.threadRead({ threadId, includeTurns: true }),
           threadId,
           expectedTurnIds,
+          expectedTurns,
         );
         if (!turnFence.ok) attribution = { ok: false, reasons: turnFence.reason_codes };
       }
