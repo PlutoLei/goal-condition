@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
@@ -1062,6 +1062,15 @@ export async function runCli({
   }
 }
 
-if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
+function runningAsMainModule() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    return false;
+  }
+}
+
+if (runningAsMainModule()) {
   process.exitCode = await runCli();
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
@@ -59,6 +59,18 @@ test('controlled CLI exposes the closed GoalSession lifecycle', () => {
     'status',
     'verify',
   ]);
+});
+
+test('controlled CLI executes through the installed release symlink', async () => {
+  const { root } = await workspace();
+  const linkedRoot = join(root, 'goal-condition');
+  const releaseRoot = dirname(dirname(dirname(cliPath)));
+  await symlink(releaseRoot, linkedRoot, 'dir');
+  const linkedCli = join(linkedRoot, 'codex-controller', 'src', 'cli.mjs');
+  const child = spawnSync(process.execPath, [linkedCli], { encoding: 'utf8' });
+  assert.equal(child.status, 1);
+  assert.equal(child.stdout, '');
+  assert.deepEqual(JSON.parse(child.stderr), { ok: false, code: 'CLI_COMMAND_UNKNOWN' });
 });
 
 test('init can capture a controller-owned root baseline and prepare a durable Attempt', async () => {
