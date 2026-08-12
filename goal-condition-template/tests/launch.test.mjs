@@ -274,6 +274,51 @@ test('prepareClaude writes hook (0500), settings (deny normalized path), hook-en
   assert.deepEqual(result.probes, probes);
 });
 
+test('prepareClaude compiles execution permissions with realpath-normalized roots', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-launch-permissions-'));
+  const targetReal = join(root, 'target-real');
+  const targetLink = join(root, 'target-link');
+  const referenceReal = join(root, 'reference-real');
+  const referenceLink = join(root, 'reference-link');
+  await mkdir(targetReal);
+  await mkdir(referenceReal);
+  await symlink(targetReal, targetLink);
+  await symlink(referenceReal, referenceLink);
+  const canonicalTargetReal = realpathSync(targetReal);
+  const canonicalReferenceReal = realpathSync(referenceReal);
+  const stateDir = stateDirFor({ stateRoot: root, contractHash: 'e'.repeat(64) });
+  const previousToken = process.env.GC_LAUNCH_TEST_TOKEN;
+  process.env.GC_LAUNCH_TEST_TOKEN = 'secret-value';
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.GC_LAUNCH_TEST_TOKEN;
+    else process.env.GC_LAUNCH_TEST_TOKEN = previousToken;
+  });
+  const contract = makeContract({
+    target_roots: [workDir, targetLink],
+    execution_permissions: {
+      bash_prefixes: ['git add'],
+      webfetch_domains: ['example.com'],
+      skills: ['review'],
+      additional_read_roots: [referenceLink],
+    },
+  });
+
+  const result = await prepareClaude({ contract, stateDir, collect: stubCollect });
+  const settings = JSON.parse(await readFile(result.settingsPath, 'utf8'));
+  assert.deepEqual(settings.permissions.allow, [
+    'Bash(node:*)', 'Bash(git add:*)', 'WebFetch(domain:example.com)', 'Skill(review)',
+  ]);
+  assert.deepEqual(settings.permissions.additionalDirectories, [canonicalTargetReal, canonicalReferenceReal]);
+  for (const pathname of [
+    join(realpathSync(workDir), '.claude', 'settings.json'),
+    join(realpathSync(workDir), '.claude', 'settings.local.json'),
+    join(canonicalTargetReal, '.claude', 'settings.json'),
+    join(canonicalTargetReal, '.claude', 'settings.local.json'),
+  ]) {
+    assert.ok(settings.permissions.deny.includes(`Edit(/${pathname})`), pathname);
+  }
+});
+
 test('prepareClaude is reentrant on the same stateDir: a missing-env reject followed by a completed retry succeeds', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'gc-launch-reentry-'));
   const contractHashValue = 'e'.repeat(64);
@@ -975,6 +1020,29 @@ test('runClaudeAttempt puts the contract budget max_turns into the actual argv',
 
   const args = stub.calls[0].args;
   assert.equal(args[args.indexOf('--max-turns') + 1], '5');
+});
+
+test('runClaudeAttempt accepts max_turns 200 and refuses 201 before spawn', async (t) => {
+  const allowedContract = makeContract({ budget: { user_provided: true, max_turns: 200 } });
+  const allowed = await setupClaudeState(t, { contract: allowedContract });
+  const allowedStub = stubEchoing(claudeResultFixture);
+  const candidate = await runClaudeAttempt({
+    ...allowed, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: allowedStub.impl,
+  });
+  assert.equal(candidate.outcome, 'candidate');
+  const args = allowedStub.calls[0].args;
+  assert.equal(args[args.indexOf('--max-turns') + 1], '200');
+
+  const refusedContract = makeContract({ budget: { user_provided: true, max_turns: 201 } });
+  const refused = await setupClaudeState(t, { contract: refusedContract });
+  const refusedStub = stubEchoing(claudeResultFixture);
+  const report = await runClaudeAttempt({
+    ...refused, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: refusedStub.impl,
+  });
+  assert.equal(report.outcome, 'terminal_report');
+  assert.equal(report.attemptNumber, null);
+  assert.equal(refusedStub.calls.length, 0);
+  assert.ok(report.reasons.some((reason) => reason.includes('200')));
 });
 
 test('runClaudeAttempt ignores a tampered probes.json: the real hook and the real settings are what launch uses', async (t) => {

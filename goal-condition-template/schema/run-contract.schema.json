@@ -29,6 +29,7 @@
     "success_criteria": {"$ref": "#/$defs/successCriteria", "minItems": 1},
     "constraints": {"type": "array", "items": {"$ref": "#/$defs/constraint"}},
     "allowed_mutations": {"$ref": "#/$defs/allowedMutations"},
+    "execution_permissions": {"$ref": "#/$defs/executionPermissions"},
     "budget": {"$ref": "#/$defs/budget"},
     "preflight": {"type": "array", "items": {"$ref": "#/$defs/preflightEntry"}, "minItems": 1},
     "postflight": {"type": "array", "items": {"$ref": "#/$defs/commandEntry"}, "minItems": 1}
@@ -106,6 +107,16 @@
         "files": {"$ref": "#/$defs/stringList"},
         "git": {"$ref": "#/$defs/stringList"},
         "external": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "executionPermissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bash_prefixes": {"$ref": "#/$defs/stringList"},
+        "webfetch_domains": {"$ref": "#/$defs/stringList"},
+        "skills": {"$ref": "#/$defs/stringList"},
+        "additional_read_roots": {"$ref": "#/$defs/pathList"}
       }
     },
     "budget": {

@@ -9,20 +9,24 @@ export const CONTRACT_FIELD_TABLES = Object.freeze({
   topLevel: Object.freeze([
     'version', 'runtime', 'objective', 'context_sources', 'target_roots',
     'judgment_criteria', 'success_criteria', 'constraints', 'allowed_mutations',
-    'budget', 'preflight', 'postflight',
+    'execution_permissions', 'budget', 'preflight', 'postflight',
   ]),
   contextSource: Object.freeze(['id', 'path', 'sha256']),
   judgmentCriterion: Object.freeze(['id', 'rule', 'why']),
   successCriterion: Object.freeze(['id', 'command', 'expected']),
   constraint: Object.freeze(['id', 'rule', 'enforcement', 'mechanism', 'verify']),
   allowedMutations: Object.freeze(['files', 'git', 'external']),
+  executionPermissions: Object.freeze([
+    'bash_prefixes', 'webfetch_domains', 'skills', 'additional_read_roots',
+  ]),
   budget: Object.freeze(['user_provided', 'max_turns', 'max_minutes', 'max_tokens', 'max_cost_usd']),
   gitPreflight: Object.freeze(['id', 'type', 'target', 'require_branch', 'require_clean', 'require_upstream']),
   pathPreflight: Object.freeze(['id', 'type', 'target', 'require']),
   command: Object.freeze(['id', 'type', 'cwd', 'argv', 'requires_env', 'capture']),
 });
 
-const REQUIRED_TOP_LEVEL = CONTRACT_FIELD_TABLES.topLevel.filter((field) => field !== 'budget');
+const REQUIRED_TOP_LEVEL = CONTRACT_FIELD_TABLES.topLevel
+  .filter((field) => !['budget', 'execution_permissions'].includes(field));
 const TEMPORARY_PATH = /^(?:\/private)?\/tmp(?:\/|$)|^(?:\/private)?\/var\/folders(?:\/|$)/;
 
 // 「这条路径落在临时目录里吗」的唯一真值源。导出是因为 launch 前置闸要问同一个问题（codex 侧的
@@ -264,6 +268,50 @@ function validateAllowedMutations(diagnostics, value) {
   }
 }
 
+function validateExecutionPermissions(diagnostics, value, runtime) {
+  if (value === undefined) return;
+  const path = 'execution_permissions';
+  if (runtime !== 'claude') {
+    diagnostics.push(diagnostic(
+      'CLAUDE_EXECUTION_PERMISSIONS_ONLY', path, value,
+      'execution_permissions omitted unless runtime=claude',
+      'remove execution_permissions or select the claude runtime',
+    ));
+  }
+  if (!isObject(value)) {
+    diagnostics.push(diagnostic(
+      'OBJECT_REQUIRED', path, value, 'execution permissions object',
+      'supply a closed-world object or omit execution_permissions',
+    ));
+    return;
+  }
+  addUnknownFields(diagnostics, value, CONTRACT_FIELD_TABLES.executionPermissions, path);
+  for (const field of ['bash_prefixes', 'webfetch_domains', 'skills']) {
+    if (value[field] === undefined) continue;
+    if (!requireArray(diagnostics, value[field], `${path}.${field}`)) continue;
+    value[field].forEach((entry, index) => {
+      const entryPath = `${path}.${field}[${index}]`;
+      requireString(diagnostics, entry, entryPath);
+      // Claude 权限规则是 Tool(specifier) 字符串 DSL，官方没有转义语法。允许右括号或换行进入
+      // specifier 会越过编译器生成的边界；前后空白也会改变 prefix 匹配语义。因此不可无损表示的
+      // 值在 contract 层直接拒绝，不能到 buildSettings 再猜。
+      if (typeof entry === 'string'
+        && (entry !== entry.trim() || /[()\r\n]/.test(entry))) {
+        diagnostics.push(diagnostic(
+          'PERMISSION_SPECIFIER_UNREPRESENTABLE', entryPath, entry,
+          'trimmed permission specifier without parentheses or line breaks',
+          'use a literal command prefix, domain, or skill name that fits one permission-rule specifier',
+        ));
+      }
+    });
+  }
+  if (value.additional_read_roots !== undefined) {
+    validatePathArray(diagnostics, value.additional_read_roots, `${path}.additional_read_roots`, {
+      temporaryCode: 'TEMP_PATH',
+    });
+  }
+}
+
 function validateBudget(diagnostics, value) {
   if (value === undefined) return;
   const path = 'budget';
@@ -405,9 +453,23 @@ export function validateContract(value) {
   validateCriteria(diagnostics, value.success_criteria, 'success_criteria', 'successCriterion', entryIds);
   validateConstraints(diagnostics, value.constraints, entryIds);
   validateAllowedMutations(diagnostics, value.allowed_mutations);
+  validateExecutionPermissions(diagnostics, value.execution_permissions, value.runtime);
   validateBudget(diagnostics, value.budget);
   validatePreflight(diagnostics, value.preflight, entryIds);
   validatePostflight(diagnostics, value.postflight, entryIds);
+  if (value.runtime === 'claude' && Array.isArray(value.postflight)) {
+    value.postflight.forEach((entry, index) => {
+      const executable = entry?.argv?.[0];
+      if (typeof executable === 'string'
+        && (executable !== executable.trim() || /[()\r\n]/.test(executable))) {
+        diagnostics.push(diagnostic(
+          'PERMISSION_SPECIFIER_UNREPRESENTABLE', `postflight[${index}].argv[0]`, executable,
+          'executable name representable as one Claude Bash permission prefix',
+          'use a stable executable path without permission-rule delimiters',
+        ));
+      }
+    });
+  }
   return diagnostics;
 }
 

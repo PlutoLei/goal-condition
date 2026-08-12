@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { CLAUDE_RESULT_KEYS, CLAUDE_ERROR_MAX_TURNS_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, CLI_MAX_TURNS } from '../scripts/lib/adapters/claude.mjs';
+import { CLAUDE_RESULT_KEYS, CLAUDE_ERROR_MAX_TURNS_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, DEFAULT_MAX_TURNS, MAX_TURNS_CEILING } from '../scripts/lib/adapters/claude.mjs';
 import { runtimeTerminalState } from '../scripts/lib/workflow.mjs';
 
 const fixtureUrl = new URL('./fixtures/claude-result-21key.json', import.meta.url);
@@ -158,6 +158,7 @@ test('diagnostics stay privacy-safe: counts only, never raw key names', () => {
 const hookContract = {
   objective: 'demo',
   budget: { user_provided: true, max_minutes: 30, max_turns: 5 },
+  target_roots: ['/work/root'],
   postflight: [
     { id: 'pf-test', type: 'command', cwd: '/work/root', argv: ['npm', 'test'], capture: 'hash' },
     { id: 'pf-artifact', type: 'command', cwd: '/work/root', argv: ['test', '-f', 'out.txt'], requires_env: ['CI_TOKEN_NAME'] },
@@ -186,12 +187,38 @@ test('buildStopHook maps user budget into embedded limits', () => {
   assert.match(noBudget.script, /maxWallMs = null/);
 });
 
-test('buildSettings wires Stop hook and denies Edit on the hook and state dir', () => {
-  const settings = buildSettings({ hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir' });
+test('buildSettings compiles contract permissions and protects controller and project settings', () => {
+  const contract = {
+    ...hookContract,
+    target_roots: ['/work/root-link', '/work/other-link'],
+    execution_permissions: {
+      bash_prefixes: ['git add', 'npm'],
+      webfetch_domains: ['cloud.langfuse.com'],
+      skills: ['langfuse'],
+      additional_read_roots: ['/reference/link'],
+    },
+  };
+  const settings = buildSettings({
+    contract,
+    hookScriptPath: '/state/dir/stop-hook.mjs',
+    stateDir: '/state/dir',
+    targetRoots: ['/work/root-real', '/work/other-real'],
+    additionalReadRoots: ['/reference/real'],
+  });
   assert.equal(settings.hooks.Stop[0].hooks[0].type, 'command');
   assert.match(settings.hooks.Stop[0].hooks[0].command, /^node '\/state\/dir\/stop-hook\.mjs'$/);
-  assert.ok(settings.permissions.deny.includes('Edit(//state/dir/stop-hook.mjs)'));
-  assert.ok(settings.permissions.deny.includes('Edit(//state/dir/**)'));
+  assert.deepEqual(settings.permissions.allow, [
+    'Bash(npm:*)', 'Bash(test:*)', 'Bash(git add:*)',
+    'WebFetch(domain:cloud.langfuse.com)', 'Skill(langfuse)',
+  ]);
+  assert.deepEqual(settings.permissions.additionalDirectories, ['/work/other-real', '/reference/real']);
+  assert.deepEqual(settings.permissions.deny, [
+    'Edit(//state/dir/stop-hook.mjs)', 'Edit(//state/dir/**)',
+    'Edit(//work/root-real/.claude/settings.json)',
+    'Edit(//work/root-real/.claude/settings.local.json)',
+    'Edit(//work/other-real/.claude/settings.json)',
+    'Edit(//work/other-real/.claude/settings.local.json)',
+  ]);
   assert.equal(JSON.stringify(settings).includes('disableAllHooks'), false);
 });
 
@@ -204,7 +231,10 @@ const goodProbes = Object.freeze({
   contractHash: 'a'.repeat(64), confirmedHash: 'a'.repeat(64), baselineDigestStored: true,
   claudeVersion: '2.1.223',
   claudeSessionIdFlag: true,
-  settings: buildSettings({ hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir' }),
+  settings: buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: ['/work/root'],
+  }),
   hookScript: { path: '/state/dir/stop-hook.mjs', exists: true, sha256: 'f'.repeat(64), mode: '0500' },
   expectedHookSha256: 'f'.repeat(64),
   targetRoots: ['/work/root'],
@@ -218,36 +248,40 @@ test('launchSpec/resumeSpec are pure argv data with settings pinned', () => {
   assert.deepEqual(spec.argv, ['claude', '-p', 'OBJECTIVE TEXT', '--output-format', 'json',
     '--session-id', 'sid-launch',
     '--settings', '/state/dir/settings.json', '--permission-mode', 'acceptEdits',
-    '--max-turns', String(CLI_MAX_TURNS)]);
+    '--max-turns', String(DEFAULT_MAX_TURNS)]);
   const resume = resumeSpec({ sessionId: 'sid-1', settingsPath: '/state/dir/settings.json',
     diagnosticText: 'fix pf-test', cwd: '/work/root' });
   assert.ok(resume.argv.includes('--resume') && resume.argv.includes('sid-1'));
   assert.ok(resume.argv.includes('--settings'));   // S3：resume 不带 settings 则 hook 静默失效
 });
 
-// M1：budget.max_turns 此前只约束 hook 的 block 次数，argv 里恒是 --max-turns 50——用户写了
-// max_turns=5 也拦不住 CLI 跑到第 50 轮。与 launch.mjs 对 max_minutes 取 min 的处置对齐。
-test('launchSpec/resumeSpec clamp --max-turns to the user-provided budget', () => {
+test('explicit Claude turn budgets can raise the default up to a hard preflight ceiling', () => {
   const argvOf = (spec) => spec.argv[spec.argv.indexOf('--max-turns') + 1];
-  const budget = { user_provided: true, max_minutes: 30, max_turns: 5 };
-  assert.equal(argvOf(launchSpec({ prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget })), '5');
-  assert.equal(argvOf(resumeSpec({
-    sessionId: 'sid-1', settingsPath: '/s.json', diagnosticText: 'd', cwd: '/w', budget,
-  })), '5');
-
-  // 用户没给（或没标 user_provided）时退回 CLI 常量；更宽的用户预算不放大 CLI 上限。
+  assert.equal(DEFAULT_MAX_TURNS, 50);
+  assert.equal(MAX_TURNS_CEILING, 200);
   for (const notUserGiven of [undefined, { max_turns: 5 }, { user_provided: true, max_minutes: 30 }]) {
     assert.equal(
       argvOf(launchSpec({ prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget: notUserGiven })),
-      String(CLI_MAX_TURNS),
+      String(DEFAULT_MAX_TURNS),
     );
   }
-  assert.equal(
-    argvOf(launchSpec({
-      prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget: { user_provided: true, max_turns: 500 },
-    })),
-    String(CLI_MAX_TURNS),
-  );
+  for (const max_turns of [5, 50, 51, 200, 201]) {
+    const budget = { user_provided: true, max_turns };
+    assert.equal(argvOf(launchSpec({ prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget })), String(max_turns));
+    assert.equal(argvOf(resumeSpec({
+      sessionId: 'sid-1', settingsPath: '/s.json', diagnosticText: 'd', cwd: '/w', budget,
+    })), String(max_turns));
+  }
+
+  for (const max_turns of [50, 51, 200]) {
+    assert.deepEqual(assertLaunchable({ ...hookContract, budget: { user_provided: true, max_turns } }, goodProbes),
+      { ok: true, reasons: [] });
+  }
+  const over = assertLaunchable({
+    ...hookContract, budget: { user_provided: true, max_turns: 201 },
+  }, goodProbes);
+  assert.equal(over.ok, false);
+  assert.ok(over.reasons.some((reason) => reason.includes('200')));
 });
 
 test('assertLaunchable passes the good probe set and fails each broken one', () => {
@@ -342,7 +376,11 @@ test('assertLaunchable also verifies the state-directory deny rule, not just the
     ...goodProbes,
     settings: {
       hooks: goodProbes.settings.hooks,
-      permissions: { deny: ['Edit(//state/dir/stop-hook.mjs)'] },   // 只摘掉 state 目录那条
+      permissions: {
+        ...goodProbes.settings.permissions,
+        deny: goodProbes.settings.permissions.deny
+          .filter((rule) => rule !== 'Edit(//state/dir/**)'),   // 只摘掉 state 目录那条
+      },
     },
   };
   const verdict = assertLaunchable(hookContract, hookOnlyDeny);
@@ -352,6 +390,16 @@ test('assertLaunchable also verifies the state-directory deny rule, not just the
   const noStateDir = { ...goodProbes };
   delete noStateDir.stateDir;
   assert.equal(assertLaunchable(hookContract, noStateDir).ok, false);
+});
+
+test('assertLaunchable verifies every generated project-settings deny', () => {
+  const settings = structuredClone(goodProbes.settings);
+  settings.permissions.deny = settings.permissions.deny
+    .filter((rule) => rule !== 'Edit(//work/root/.claude/settings.local.json)');
+  const verdict = assertLaunchable(hookContract, { ...goodProbes, settings });
+  assert.deepEqual(verdict.reasons, [
+    'settings must deny Edit on /work/root/.claude/settings.local.json',
+  ]);
 });
 
 // 终审 I3 修的是行为（此前 contract 声明任何 physical 约束都零核验放行），N1 修的是诊断：旧判据

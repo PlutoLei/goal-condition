@@ -35,12 +35,16 @@
 
 **会话身份由控制器预派（claim-before-dispatch）**：launch 的 argv 恒带 `--session-id <uuid>`，UUID 由启动器现场生成；resume 指针 `thread.json`（`{sessionId, cwd, promptSha256, transcriptPath}`）在占号之后、spawn 之前落盘。于是 max-turns 硬停、进程崩溃、stdout 不可解析等一切终局形态下指针都在，「预算耗尽走 resume 续跑」不再依赖成功形态的 envelope（2026-08-10 真实 run 的 resume 死锁根因）。CLI 对重复 UUID 明确拒绝（实测），预派不会静默串台。终局侧有配对的身份核验：envelope 回显的 `session_id` 必须等于控制器持有值，对不上即终局报告，不吞进候选；执行体的回显永远不反向覆写指针。`--session-id` 的可用性由 prepare 采集 `claude --help` 直接探测（`probes.claudeSessionIdFlag`），launch 前置闸对探测不到的一律拒绝——这是直接检查，不是版本代理；旧 state 目录缺探测值同样红，重跑 prepare 即可、不烧配额。
 
-任务级权限收紧通过明确的 `--disallowedTools` 或独立 `--settings` 文件传入。必须先验证 deny/settings 确实覆盖 contract 声称为 `physical` 的动作；仅有文字禁令、auto 分类或未经 fault injection 的 scoped rule 不构成物理拦截，应降为 `audit_only` 或停止 launch。这条验证已机械化，且结论是硬的：本 adapter 生成的 deny 恒为「hook 脚本路径 + 整个 state 目录」两条，护的都是控制器自己的机件，**不存在面向用户约束的物理拦截面**。launch 前置闸因此逐条拒绝 `enforcement="physical"` 的 constraint，`mechanism` 怎么写都红；改写 `mechanism` 不是出路——那两条 deny 含 contract hash 与 prepare 期才确定的 state 路径，把它抄进 contract 会改掉 hash。claude runtime 下的约束一律写 `audit_only`；确需物理保证，就先把 proxy、只读凭证或 sandbox 备好，或改用有物理面的 runtime。
+任务级自动授权由已确认 contract 的可选 `execution_permissions` 编译进独立 `--settings`：postflight 的 executable 首词与显式 `bash_prefixes` 生成 `Bash(<prefix>:*)`，另生成 WebFetch domain、Skill 与额外目录；未知字段、Codex runtime 误用和无法安全放进权限 DSL 的字符串都在 Validate 阶段红。deny 固定保护 hook、整个 state 目录，以及每个 realpath target root 下的 `.claude/settings.json` / `.claude/settings.local.json`（F-B1），防止执行体通过改项目权限文件给后续会话扩权。launch 前置闸独立核对 allow、additionalDirectories 和每条 deny，避免生成器稳定地产错仍被放行。
+
+本实现不使用 `--disallowedTools` 作为第二套权限真值源；并存 CLI deny 与 contract-compiled settings 会制造两份可漂移的授权表。若未来引入，只能由同一份已确认字段投影生成，并纳入同一前置闸。
+
+这仍然不是通用 `physical` constraint 编译器：allow 是免询问授权，F-B1 只保护控制器与 Claude 配置，`additionalDirectories` 在 `acceptEdits` 下也不是只读沙箱；任意业务约束没有对应的 OS enforcement。因此 claude runtime 的 constraint 仍一律写 `audit_only`，实际 mutation 由独立 baseline compare 判定。确需物理保证，须先提供可 fault-inject 的 sandbox、proxy 或只读凭证，或改用有物理面的 runtime。F-B1 的生成与 fail-closed 守卫已由单元/集成 fault injection 覆盖；真实 Claude 尝试改写项目 settings 的 canary 仍是发布前 live gate，不能用单测冒充。
 
 ### 启动姿态里的两个权限事实
 
-- **`--permission-mode acceptEdits`**：`launchSpec`/`resumeSpec` 固定带这个 flag。它意味着除 `--settings` 里那两条 deny（hook 脚本路径、整个 state 目录）之外，编辑一律自动放行、不再逐次询问——无人值守下这是必要的，但它也是本 adapter 的真实权限面：权限收紧只由 deny 列表承担，不要以为还有一层交互确认在兜底。contract 里凡是靠「模型会先问一句」成立的约束都不成立。
-- **`--max-turns`**：固定带上，默认取 adapter 常量 `CLI_MAX_TURNS = 50`；contract 的 `budget.user_provided=true` 且给了更小的 `max_turns` 时取两者较小值。它与 Stop hook 的 block 次数上限（`MAX_HOOK_BLOCKS`）是两层不同的闸：前者由 CLI 硬停单次 attempt 的轮数，后者决定 hook 还愿不愿意把未达标的会话续下去。
+- **`--permission-mode acceptEdits`**：`launchSpec`/`resumeSpec` 固定带这个 flag。除生成的 deny 外，工作目录与 additionalDirectories 内的编辑不会逐次询问；`permissions.allow` 还会免询问批准声明的 Bash/WebFetch/Skill。无人值守需要这层授权，但它不是验收或通用隔离，不能靠“模型会先问一句”成立约束。
+- **`--max-turns`**：固定带上。无显式预算时取 `DEFAULT_MAX_TURNS=50`；用户确认的 `budget.max_turns` 原样进入 argv，可提高到 `MAX_TURNS_CEILING=200`，超过 200 在占号与 spawn 前红，不静默改写成 200。它与 Stop hook 的 `MAX_HOOK_BLOCKS` 是两层不同的闸：前者硬停单次 attempt，后者决定 hook 还愿不愿意把未达标的会话续下去。
 
 ### Stop hook 契约
 
@@ -54,7 +58,7 @@
 
 ### hook 保护定性
 
-`--settings` 对 hook 脚本与整个 state 目录设 Edit deny；实测显示这条 deny 对简单 Bash 重定向（例如把输出直接写进 hook 脚本路径）同样有效，被真实 `permission_denials` 拦下——比早先「仅观测性防线」的假设更强。但 deny 的精确上限（语义级路径解析 vs 字面文本匹配）仍 INCONCLUSIVE，待补测后再收紧措辞，不宣称完全物理保证。deny 路径必须写成 realpath 规范形——字面路径与其符号链接别名不一致会让 deny 落空。
+`--settings` 对 hook 脚本、整个 state 目录和 target root 的两份项目 settings 设 Edit deny；实测显示 controller-path deny 对简单 Bash 重定向同样有效，被真实 `permission_denials` 拦下——比早先「仅观测性防线」的假设更强。但 deny 的精确上限（语义级路径解析 vs 字面文本匹配）仍 INCONCLUSIVE，不宣称完全物理保证。路径必须写成 realpath 规范形；F-B1 的项目 settings 规则目前只有生成/守卫 fault injection，发布前还需真实 Claude canary。
 
 此文只规定 adapter 契约，不在文档或测试中调用真实 launcher。实际启动前仍要向用户展示准确 argv、目标目录和已确认 hash。
 

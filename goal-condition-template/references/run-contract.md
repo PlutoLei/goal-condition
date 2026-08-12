@@ -15,13 +15,16 @@ Run contract 是核心 compiler 与 runtime adapter 之间的平台无关 JSON �
 | `success_criteria` | 每项包含唯一 `id`、人类可读 `command` 与精确 `expected`，承接 success criterion 和验收物。 |
 | `constraints` | 每项包含 `id`、`rule`、`enforcement`；`physical` 还必须有非空 `mechanism` 与 `verify`。 |
 | `allowed_mutations` | 固定包含 `files`、`git`、`external` 三个数组。列入许可不等于动作已经发生或已经通过审计。 |
+| `execution_permissions` | 可选且仅用于 `runtime="claude"`。闭世界包含 `bash_prefixes`、`webfetch_domains`、`skills`、`additional_read_roots` 四个可选数组；它声明自动批准/可达面，不声明验收成功或通用物理隔离。 |
 | `budget` | 可选。存在时 `user_provided` 必须为 `true`，且至少有一个用户明确给出的正数限制；`max_turns` 另须为整数（见下）。 |
 | `preflight` | 启动前的 Git、path 或结构化 command entry，至少一项。 |
 | `postflight` | 主会话独立执行的结构化 command verifier，至少一项。 |
 
 所有 context、criterion、constraint、preflight 与 postflight 的 `id` 在整个 contract 内唯一。未知字段、重复 ID、非规范/相对路径，以及 `/tmp`、`/private/tmp`、`/var/folders`、`/private/var/folders` 或其词法别名均被拒绝。
 
-四个 budget 限制里只有 `max_turns` 额外要求整数，界线是「这个数会不会被我方取整」：`max_turns` 在两处被 floor——CLI 的 `--max-turns` 与 Stop hook 的 `maxBlocks`——写 `0.5` 会让两处**一起塌成 0**，即零轮直接停机且 hook 永不 block，是「什么都不做」而不是 fail-closed。`max_minutes` 与 `max_cost_usd` 的小数有真实语义（`0.5` 分钟 = 30 秒），`max_tokens` 原样透传给 runtime、不经我方取整，因此都不设这条闸。
+`execution_permissions` 的数组元素必须是非空字符串；`additional_read_roots` 另须为绝对、规范、非临时路径。Claude 权限规则是没有转义语法的 `Tool(specifier)` 字符串 DSL，因此 prefix/domain/skill 与 Claude postflight 的 `argv[0]` 含括号、换行或首尾空白时无法安全编译，validator 以 `PERMISSION_SPECIFIER_UNREPRESENTABLE` 拒绝。编译器把 postflight 的 executable 首词与 `bash_prefixes` 去重后生成为 `Bash(<prefix>:*)`，另生成 `WebFetch(domain:<domain>)` 与 `Skill(<skill>)`；除首个工作目录外的 target root 和 `additional_read_roots` 经 realpath 规范后进入 `permissions.additionalDirectories`。字段名里的 `read` 不是 OS 级只读承诺：在固定的 `acceptEdits` 模式下 additional directory 也可能被编辑，实际 mutation 仍由 `allowed_mutations` 与 baseline compare 裁决。
+
+四个 budget 限制里只有 `max_turns` 额外要求整数，因为 CLI turn 数与 Stop hook block 计数都没有小数语义。Claude 未显式给 turn budget 时使用 `DEFAULT_MAX_TURNS=50`；用户显式给出的整数原样进入 `--max-turns`，可高于默认值，但超过 `MAX_TURNS_CEILING=200` 会在 launch 前置闸失败，不静默钳制。`max_minutes` 与 `max_cost_usd` 的小数有真实语义（`0.5` 分钟 = 30 秒），`max_tokens` 原样透传给 runtime，因此都不设整数闸。
 
 ## Boundary package 编译映射
 
@@ -35,6 +38,7 @@ Run contract 是核心 compiler 与 runtime adapter 之间的平台无关 JSON �
 | mechanization | 可执行且可 fault-inject 的约束用 `physical`；其余用 `audit_only` |
 | mutation scope | 分别落入 `allowed_mutations.files/git/external` |
 | verifier | 启动条件放 `preflight`；独立成功核验放 `postflight` |
+| execution authorization | Claude 自动批准的 Bash prefix、WebFetch domain、Skill 与额外目录写入可选 `execution_permissions`；Codex 出现该字段即红 |
 | resource limit | 仅用户明确给出时写 `budget` 并保留 provenance |
 
 `success_criteria.command` 是供人审阅的精确命令说明，不是 shell 执行入口。机器执行只允许 `{id, type:"command", cwd, argv, requires_env?, capture?}`；不得增加 `shell` 字段，不得用 `eval`、`sh -c` 或拼接后的 shell 字符串。`requires_env` 只记录变量名和是否存在，snapshot 不保存变量值。默认 `capture:"hash"`；只有确认输出不含敏感内容时才可显式使用 `capture:"text"`。
@@ -61,7 +65,7 @@ Contract 文件的字节级错误采用隐私安全诊断。`CONTRACT_BOM_FORBID
 
 Canonical JSON 递归排序 object key、保持 array 顺序，并追加恰好一个换行。Compiler 必须把 `canonicalJson(parsed)` 原样写成 launchable 文件；`readContract` 要求原始文件与该结果 byte-identical。空白、key 顺序、缩进或额外换行不同都会产生 `CONTRACT_BYTES_NONCANONICAL`，即使重新解析后的对象和 canonical hash 相同也禁止继续，直到重新生成 artifact、重新 preview 并重新确认。
 
-Contract hash 是 authoritative canonical JSON 的 UTF-8 bytes 的小写 SHA-256。完整 preview 在可读矩阵之外逐字包含这份 authoritative canonical JSON，因此 version、runtime、context_sources、target_roots、budget 以及每个 nested preflight/postflight flag、cwd、argv、requires_env、capture 都可见且被同一 hash 绑定。任何落盘字节编辑都会使当前 artifact 的确认失效；不得只比较解析后的对象来复用确认。
+Contract hash 是 authoritative canonical JSON 的 UTF-8 bytes 的小写 SHA-256。完整 preview 在可读矩阵之外逐字包含这份 authoritative canonical JSON，因此 version、runtime、context_sources、target_roots、execution_permissions、budget 以及每个 nested preflight/postflight flag、cwd、argv、requires_env、capture 都可见且被同一 hash 绑定。任何落盘字节编辑都会使当前 artifact 的确认失效；不得只比较解析后的对象来复用确认。
 
 ## Preflight 与可信 baseline_digest
 

@@ -52,9 +52,9 @@ Hard Prohibition 只能是 controller schema 枚举的 capability ID，且 `rule
 
 ### Compile
 
-按 [run contract 字段与编译规则](references/run-contract.md) 和 [schema](schema/run-contract.schema.json) 生成 canonical JSON，并读取安装实例的 [项目 profile](references/anchors-and-rules.md)。它必须无损包含 single objective、stable context、`judgment_criteria`、`success_criteria`、`constraints`、`allowed_mutations`、`preflight`、`postflight` 与用户明确给出的 `budget.user_provided=true`。
+按 [run contract 字段与编译规则](references/run-contract.md) 和 [schema](schema/run-contract.schema.json) 生成 canonical JSON，并读取安装实例的 [项目 profile](references/anchors-and-rules.md)。它必须无损包含 single objective、stable context、`judgment_criteria`、`success_criteria`、`constraints`、`allowed_mutations`、`preflight`、`postflight`，以及用户明确给出的 `execution_permissions` / `budget.user_provided=true`。
 
-`physical` 只用于已有可执行 mechanism 且有 verifier 的约束；否则写 `audit_only`。Claude 没有面向用户约束的物理面，因此约束一律是 `audit_only`。预算不得推测，`budget.max_turns` 只接受正整数。
+`execution_permissions` 仅用于 Claude，声明自动批准/可达面，不等于 physical constraint；Codex 出现该字段即红。`physical` 只用于已有可执行 mechanism 且有 verifier 的约束；Claude 没有面向用户约束的通用物理面，因此约束一律是 `audit_only`。预算不得推测，`budget.max_turns` 只接受正整数；Claude 默认 50，用户显式值可提高到 200，超过 200 在 launch 前置闸红。
 
 ### Validate、Preview 与 Confirm
 

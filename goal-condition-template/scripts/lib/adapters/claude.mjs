@@ -1,5 +1,7 @@
 // Claude runtime adapter 纯函数。执行豁口在 scripts/launch.mjs；本文件不 spawn、不读写盘。
 
+import { join } from 'node:path';
+
 // 版本闸是**下限**不是精确 allowlist。它想挡的是 result envelope 形状漂移，可那是个代理指标——
 // 真正要防的东西下面的 21-key 全集校验已经**直接**在管：envelope 没变的新版本被精确 allowlist 拦下
 // 是纯误杀，envelope 真变了的新版本直检照样红且诊断更精确。代理指标严于直接指标，代价却是 claude
@@ -133,25 +135,57 @@ function shellSingleQuote(value) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildSettings({ hookScriptPath, stateDir }) {
+function unique(values) {
+  return [...new Set(values)];
+}
+
+export function buildSettings({
+  contract = {}, hookScriptPath, stateDir,
+  targetRoots = contract.target_roots ?? [],
+  additionalReadRoots = contract.execution_permissions?.additional_read_roots ?? [],
+}) {
+  const execution = contract.execution_permissions ?? {};
+  const inferredBashPrefixes = (contract.postflight ?? [])
+    .map((entry) => entry?.argv?.[0])
+    .filter((value) => typeof value === 'string' && value.length > 0);
+  const allow = [
+    ...unique([...inferredBashPrefixes, ...(execution.bash_prefixes ?? [])])
+      .map((prefix) => `Bash(${prefix}:*)`),
+    ...(execution.webfetch_domains ?? []).map((domain) => `WebFetch(domain:${domain})`),
+    ...(execution.skills ?? []).map((skill) => `Skill(${skill})`),
+  ];
+  const canonicalTargets = unique(targetRoots);
+  const additionalDirectories = unique([
+    ...canonicalTargets.slice(1),
+    ...additionalReadRoots,
+  ]);
+  const projectSettingsDeny = canonicalTargets.flatMap((root) => [
+    `Edit(/${join(root, '.claude', 'settings.json')})`,
+    `Edit(/${join(root, '.claude', 'settings.local.json')})`,
+  ]);
   return {
     hooks: { Stop: [{ hooks: [{ type: 'command', command: `node ${shellSingleQuote(hookScriptPath)}` }] }] },
     // S5 实测：Edit deny 对简单 Bash 重定向也有效（permission_denials 实录 tool_name:Bash），
     // 但精确上限（语义级 vs 字面匹配）INCONCLUSIVE——不宣称完全物理保证。
     // deny 路径必须是 realpath 规范形（/var/folders vs /private/var/folders 的字面失配会让 deny 落空）。
-    permissions: { deny: [`Edit(/${hookScriptPath})`, `Edit(/${stateDir}/**)`] },
+    permissions: {
+      allow,
+      deny: [`Edit(/${hookScriptPath})`, `Edit(/${stateDir}/**)`, ...projectSettingsDeny],
+      additionalDirectories,
+    },
   };
 }
 
-export const CLI_MAX_TURNS = 50;
+export const DEFAULT_MAX_TURNS = 50;
+export const MAX_TURNS_CEILING = 200;
 
-// 用户显式给的 max_turns 与 CLI 默认上限取 min——与 launch.mjs 的 effectiveDeadlineMs 对
-// max_minutes 的处置同形，用户明给的预算不能被更宽的默认值盖过。gate 与 buildStopHook 的
-// maxBlocks 逐字一致（user_provided 且是数字才算数），两处不能对同一个字段各认各的。
+// 50 是未声明预算时的默认值，不是用户预算的静默上限。显式值原样进入 argv；超过 200 的形态
+// 由 assertLaunchable 在 spawn 前拒绝。把两者混成 Math.min 会让用户写 51/200 仍只跑 50 轮，
+// contract 与真实执行预算不一致；把 >200 静默钳制则同样是在改写已确认 contract。
 export function effectiveMaxTurns(budget) {
   return budget?.user_provided && typeof budget.max_turns === 'number'
-    ? Math.min(CLI_MAX_TURNS, Math.floor(budget.max_turns))
-    : CLI_MAX_TURNS;
+    ? budget.max_turns
+    : DEFAULT_MAX_TURNS;
 }
 
 export function launchSpec({ prompt, settingsPath, cwd, budget, sessionId }) {
@@ -218,6 +252,11 @@ export function assertLaunchable(contract, probes) {
   if (!DIGEST.test(probes?.contractHash ?? '')) reasons.push('contractHash must be lowercase SHA-256');
   if (probes?.confirmedHash !== probes?.contractHash) reasons.push('confirmed hash does not match contract hash');
   if (probes?.baselineDigestStored !== true) reasons.push('baseline digest is not stored in trusted orchestration state');
+  if (contract?.budget?.user_provided === true
+    && typeof contract.budget.max_turns === 'number'
+    && contract.budget.max_turns > MAX_TURNS_CEILING) {
+    reasons.push(`contract budget.max_turns exceeds the Claude hard ceiling ${MAX_TURNS_CEILING}; reduce the confirmed budget before launch`);
+  }
   const versionReason = versionFloorReason(probes?.claudeVersion);
   if (versionReason !== null) reasons.push(versionReason);
   // --session-id 是恢复模型的前提（指针先于 spawn 存在）。这不是版本代理：prepare 采集
@@ -232,7 +271,8 @@ export function assertLaunchable(contract, probes) {
     reasons.push('settings must not disable or restrict hooks');
   }
   const hook = probes?.hookScript;
-  const deny = probes?.settings?.permissions?.deny ?? [];
+  const permissions = probes?.settings?.permissions ?? {};
+  const deny = permissions.deny ?? [];
   if (!hook?.exists) reasons.push('hook script is not on disk in controller state');
   if (hook?.sha256 !== probes?.expectedHookSha256) reasons.push('hook script bytes do not match the generated script');
   if (hook?.mode !== '0500') reasons.push('hook script mode must be 0500');
@@ -247,21 +287,51 @@ export function assertLaunchable(contract, probes) {
   if (!deny.includes(`Edit(/${probes?.stateDir}/**)`)) {
     reasons.push('settings must deny Edit on the whole controller state directory');
   }
+  for (const root of probes?.targetRoots ?? []) {
+    for (const file of ['settings.json', 'settings.local.json']) {
+      const pathname = join(root, '.claude', file);
+      if (!deny.includes(`Edit(/${pathname})`)) {
+        reasons.push(`settings must deny Edit on ${pathname}`);
+      }
+    }
+  }
+  // allow/additionalDirectories 与 deny 一样属于 buildSettings 的消费面。这里独立重算期望形状，
+  // 防的是生成器回归（生产路径的 settings 是现场重写，磁盘比对本身抓不到“稳定地产错”）。
+  const expectedAllow = [
+    ...unique([
+      ...(contract?.postflight ?? []).map((entry) => entry?.argv?.[0]).filter((value) => typeof value === 'string'),
+      ...(contract?.execution_permissions?.bash_prefixes ?? []),
+    ]).map((prefix) => `Bash(${prefix}:*)`),
+    ...(contract?.execution_permissions?.webfetch_domains ?? [])
+      .map((domain) => `WebFetch(domain:${domain})`),
+    ...(contract?.execution_permissions?.skills ?? []).map((skill) => `Skill(${skill})`),
+  ];
+  if (JSON.stringify(permissions.allow ?? null) !== JSON.stringify(expectedAllow)) {
+    reasons.push('settings allow rules do not exactly match the confirmed contract');
+  }
+  const expectedAdditionalDirectories = unique([
+    ...(probes?.targetRoots ?? []).slice(1),
+    ...(probes?.additionalReadRoots ?? []),
+  ]);
+  if (JSON.stringify(permissions.additionalDirectories ?? null)
+    !== JSON.stringify(expectedAdditionalDirectories)) {
+    reasons.push('settings additionalDirectories do not exactly match the canonical contract roots');
+  }
   if ((probes?.targetRoots ?? []).some((root) => typeof hook?.path === 'string' && hook.path.startsWith(`${root}/`))) {
     reasons.push('hook script must live outside every target root');
   }
-  // buildSettings 不接收 contract：生成的 deny 恒为「hook 脚本 + state 目录」两条，护的都是控制器
-  // 自己的机件。也就是说 claude runtime 上根本不存在面向用户约束的物理拦截面，任何
-  // enforcement:"physical" 都不成立，一律红——降级成 audit_only 是 contract 作者的决定，执行层
-  // 只负责停车。曾经的判据是「mechanism 必须逐字点名一条生成的 deny 规则」：行为同样是红，但
-  // 诊断在骗人——它读起来像「改 mechanism 就能过」，而那两条 deny 含 contractHash（还含 prepare
-  // 才知道的 stateRoot/controller），把它写进 contract 会改掉 hash，是个不动点陷阱。故 reason 直说
-  // 真因，且刻意不提 mechanism（N1）。
+  // execution_permissions 编译的是自动授权，deny 保护的是 controller 与 Claude 项目配置；两者都
+  // 没有把任意业务 constraint 编译成可验证的 OS enforcement。因此 enforcement:"physical" 仍一律
+  // 红——降级成 audit_only 是 contract 作者的决定，执行层只负责停车。曾经的判据是「mechanism
+  // 必须逐字点名一条生成的 deny 规则」：行为同样是红，但诊断在骗人——它读起来像「改 mechanism
+  // 就能过」，而 controller deny 含 contractHash/stateRoot/controller，把它写进 contract 会改 hash，
+  // 是不动点陷阱。故 reason 直说真因，且刻意不提 mechanism（N1）。
   for (const constraint of contract?.constraints ?? []) {
     if (constraint?.enforcement !== 'physical') continue;
     reasons.push(`constraint ${constraint.id ?? '?'} declares physical enforcement, which the claude `
-      + 'runtime cannot support: this adapter generates deny rules only for its own hook script and '
-      + 'state directory, never for user-facing constraints, so rewrite the constraint as audit_only');
+      + 'runtime cannot support: execution permissions authorize tools and generated deny rules protect '
+      + 'controller or Claude settings, but arbitrary user-facing constraints have no physical compiler; '
+      + 'rewrite the constraint as audit_only');
   }
   return { ok: reasons.length === 0, reasons };
 }

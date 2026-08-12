@@ -338,7 +338,11 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
   await writeReplacing(hookEnvPath, JSON.stringify(envValues), 0o600);
 
   // 4. settings.json。
-  const settings = buildSettings({ hookScriptPath, stateDir: realStateDir });
+  const targetRoots = (contract.target_roots ?? []).map(canonicalPath);
+  const additionalReadRoots = (contract.execution_permissions?.additional_read_roots ?? []).map(canonicalPath);
+  const settings = buildSettings({
+    contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
+  });
   const settingsPath = join(realStateDir, 'settings.json');
   await writeReplacing(settingsPath, JSON.stringify(settings, null, 2), 0o600);
 
@@ -443,7 +447,11 @@ export async function runClaudeAttempt({
   const hookScriptPath = join(realStateDir, 'stop-hook.mjs');
   const { script } = buildStopHook({ contract, stateDir: realStateDir });
   const expectedHookSha256 = createHash('sha256').update(script, 'utf8').digest('hex');
-  const settings = buildSettings({ hookScriptPath, stateDir: realStateDir });
+  const targetRoots = (contract.target_roots ?? []).map(canonicalPath);
+  const additionalReadRoots = (contract.execution_permissions?.additional_read_roots ?? []).map(canonicalPath);
+  const settings = buildSettings({
+    contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
+  });
   const settingsPath = join(realStateDir, 'settings.json');
   // hook 脚本走的是「读磁盘 bytes → 与现场重算的 sha256 比对」，settings.json 此前没有同等待遇：
   // 判定的是上一行这个内存对象，交给 claude 的却是磁盘上的 settingsPath（re-review I1b 实测：把
@@ -465,7 +473,8 @@ export async function runClaudeAttempt({
     // baseline digest 外存到了可信编排状态，执行层不再假装替上游验证一件看不到的事实。
     confirmedHash: binding?.contractHash,
     baselineDigestStored: typeof binding?.baselineDigest === 'string' && HEX64.test(binding.baselineDigest),
-    targetRoots: contract.target_roots,
+    targetRoots,
+    additionalReadRoots,
     stateDir: realStateDir,
     settings,
     expectedHookSha256,

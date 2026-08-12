@@ -47,6 +47,41 @@ test('budget is accepted only when its provenance is explicit', () => {
   }), []);
 });
 
+test('execution_permissions is a closed-world Claude-only authorization surface', () => {
+  const execution_permissions = {
+    bash_prefixes: ['npm test', 'git add'],
+    webfetch_domains: ['cloud.langfuse.com'],
+    skills: ['langfuse'],
+    additional_read_roots: ['/opt/goal-condition-example/reference'],
+  };
+  assert.deepEqual(validateContract({ ...valid, runtime: 'claude', execution_permissions }), []);
+
+  const unknown = structuredClone(execution_permissions);
+  unknown.surprise = ['Bash'];
+  assert.ok(validateContract({ ...valid, runtime: 'claude', execution_permissions: unknown })
+    .some((x) => x.code === 'UNKNOWN_FIELD' && x.path.startsWith('execution_permissions.')));
+
+  for (const [field, value] of [
+    ['bash_prefixes', ['']],
+    ['bash_prefixes', ['npm test) Bash(rm -rf /)']],
+    ['webfetch_domains', [42]],
+    ['webfetch_domains', ['safe.example\nWebFetch(domain:evil.example)']],
+    ['skills', 'langfuse'],
+    ['additional_read_roots', ['relative/path']],
+  ]) {
+    const changed = structuredClone(execution_permissions);
+    changed[field] = value;
+    assert.ok(validateContract({ ...valid, runtime: 'claude', execution_permissions: changed })
+      .some((x) => x.path.startsWith(`execution_permissions.${field}`)), field);
+  }
+
+  const codex = validateContract({ ...valid, runtime: 'codex', execution_permissions });
+  assert.ok(codex.some((x) => x.code === 'CLAUDE_EXECUTION_PERMISSIONS_ONLY'));
+
+  assert.ok(Object.hasOwn(schema.properties, 'execution_permissions'));
+  assert.equal(schema.$defs.executionPermissions.additionalProperties, false);
+});
+
 // ③（re-review round 1）：max_turns 是轮数，小数没有可执行语义。实测 max_turns=0.5 会让 CLI 的
 // --max-turns 被 Math.floor 成 0 **且** Stop hook 的 maxBlocks 同时成 0——零轮直接停机、hook 永不
 // block，两处一起退化成「什么都不做」而不是 fail-closed。在 validate 层拒是唯一不撒谎的处置：
@@ -145,7 +180,7 @@ test('canonical preview preserves punctuation without shell interpolation', () =
 function completePreviewContract() {
   return {
     version: 1,
-    runtime: 'codex',
+    runtime: 'claude',
     objective: 'preview-objective-a',
     context_sources: [{
       id: 'CTX-preview-a',
@@ -163,6 +198,12 @@ function completePreviewContract() {
       files: ['/opt/preview/worktree-a/file-a'],
       git: ['commit'],
       external: ['external-a'],
+    },
+    execution_permissions: {
+      bash_prefixes: ['npm test'],
+      webfetch_domains: ['example.com'],
+      skills: ['review'],
+      additional_read_roots: ['/opt/preview/reference-a'],
     },
     budget: {
       user_provided: true,
@@ -198,12 +239,16 @@ test('every material contract field remains visible and hash-bound in preview', 
   const original = completePreviewContract();
   const cases = [
     ['version', (x) => { x.version = 2; }, '"version":2'],
-    ['runtime', (x) => { x.runtime = 'claude'; }, '"runtime":"claude"'],
+    ['runtime', (x) => { x.runtime = 'codex'; }, '"runtime":"codex"'],
     ['objective', (x) => { x.objective = 'preview-objective-b'; }, '"objective":"preview-objective-b"'],
     ['context id', (x) => { x.context_sources[0].id = 'CTX-preview-b'; }, '"id":"CTX-preview-b"'],
     ['context path', (x) => { x.context_sources[0].path = '/opt/preview/worktree-a/context-b.md'; }, '"path":"/opt/preview/worktree-a/context-b.md"'],
     ['context hash', (x) => { x.context_sources[0].sha256 = 'b'.repeat(64); }, `"sha256":"${'b'.repeat(64)}"`],
     ['target_roots', (x) => { x.target_roots[0] = '/opt/preview/worktree-b'; }, '"target_roots":["/opt/preview/worktree-b"]'],
+    ['execution bash', (x) => { x.execution_permissions.bash_prefixes[0] = 'npm run test'; }, '"bash_prefixes":["npm run test"]'],
+    ['execution web', (x) => { x.execution_permissions.webfetch_domains[0] = 'api.example.com'; }, '"webfetch_domains":["api.example.com"]'],
+    ['execution skill', (x) => { x.execution_permissions.skills[0] = 'security-review'; }, '"skills":["security-review"]'],
+    ['execution read root', (x) => { x.execution_permissions.additional_read_roots[0] = '/opt/preview/reference-b'; }, '"additional_read_roots":["/opt/preview/reference-b"]'],
     ['judgment id', (x) => { x.judgment_criteria[0].id = 'J-preview-b'; }, '"id":"J-preview-b"'],
     ['judgment rule', (x) => { x.judgment_criteria[0].rule = 'judgment-rule-b'; }, '"rule":"judgment-rule-b"'],
     ['judgment why', (x) => { x.judgment_criteria[0].why = 'judgment-why-b'; }, '"why":"judgment-why-b"'],
