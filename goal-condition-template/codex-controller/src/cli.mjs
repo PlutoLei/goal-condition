@@ -27,7 +27,6 @@ import {
   snapshotDigest,
   snapshotDiagnostics,
 } from '../../scripts/lib/snapshot.mjs';
-import { adoptLegacyContract } from './adoption.mjs';
 import { assessCapabilities } from './capabilities.mjs';
 import { compileDraft, recordConfirmation, renderAuthorizationPreview } from './compiler.mjs';
 import {
@@ -46,13 +45,13 @@ import { evaluateRevision } from './policy.mjs';
 import { projectAttempt, projectBaselineManifest } from './projector.mjs';
 import { reconcileLaunch } from './recovery.mjs';
 import { currentControllerReleaseDigest } from './release.mjs';
+import { migrateV1Contract } from './migration.mjs';
 import {
   assertLiveRollout,
   certifyRolloutCanary,
-  readRolloutState,
+  ensureRolloutState,
   writeRolloutMode,
 } from './rollout.mjs';
-import { classifyShadowReplay } from './shadow.mjs';
 import { openSessionStore } from './store.mjs';
 import { assertRootIdentities, assertStableStateRoot, exactFields } from './values.mjs';
 import { verifyConditions } from './verification.mjs';
@@ -67,11 +66,10 @@ const COMMANDS = Object.freeze({
   project: { required: ['state-root', 'session-id', 'attempt-id'], optional: [] },
   preview: { required: ['state-root', 'session-id'], optional: [] },
   evaluate: { required: ['state-root', 'session-id', 'input'], optional: [] },
-  shadow: { required: ['input'], optional: [] },
   status: { required: ['state-root', 'session-id'], optional: [] },
   export: { required: ['state-root', 'session-id'], optional: [] },
   capabilities: { required: ['input'], optional: [] },
-  adopt: { required: ['state-root', 'input'], optional: [] },
+  'migrate-v1': { required: ['state-root', 'input'], optional: [] },
   prepare: { required: ['state-root', 'session-id', 'input'], optional: [] },
   launch: { required: ['state-root', 'session-id', 'run-id', 'runtime-root'], optional: ['deadline-ms'] },
   resume: { required: ['state-root', 'session-id', 'runtime-root', 'input'], optional: [] },
@@ -165,10 +163,10 @@ function baselineGitHeads(baseline) {
 }
 
 async function captureCurrent({ manifest, baseline }) {
-  // The root snapshot is immutable across typed Design revisions, while the projected v1 contract hash
+  // The root snapshot is immutable across typed Design revisions, while the projected AttemptManifest hash
   // intentionally changes per Attempt. Rebind only the snapshot's contract identity in a derived view;
   // entries remain the original controller-owned root baseline bytes.
-  // Shared v1 path snapshots compare a recursively captured path entry as one unit. GoalSession v2 grants
+  // Shared path snapshots compare a recursively captured path entry as one unit. GoalSession v2 grants
   // writes to the complete active target root, so add the root itself only to this derived comparison
   // manifest. This keeps the compatibility workaround Codex-only instead of changing v1/Claude semantics.
   const comparisonManifest = {
@@ -372,10 +370,6 @@ async function evaluate(flags) {
   });
 }
 
-async function shadow(flags) {
-  return { ok: true, command: 'shadow', ...classifyShadowReplay(readJson(flags.input)) };
-}
-
 async function status(flags) {
   return withStore(flags['state-root'], (store) => {
     const session = store.read(flags['session-id']);
@@ -414,33 +408,33 @@ async function capabilities(flags) {
   }), live_execution: false };
 }
 
-async function adopt(flags) {
+async function migrateV1(flags) {
   const input = readJson(flags.input);
-  exactFields(input, ['contract', 'session_id', 'original_baseline'], 'adoption_input');
+  exactFields(input, ['contract', 'session_id', 'original_baseline'], 'v1_migration_input');
   const baseline = input.original_baseline ?? await captureSnapshot(input.contract, { phase: 'capture' });
-  const adopted = adoptLegacyContract({
+  const migrated = migrateV1Contract({
     contract: input.contract,
     sessionId: input.session_id,
     currentStateDigest: snapshotDigest(baseline),
     originalBaseline: input.original_baseline,
   });
   return withStore(flags['state-root'], (store) => {
-    const session = store.create(adopted.session);
+    const session = store.create(migrated.session);
     const descriptor = store.putBlob({ kind: 'root-baseline', bytes: canonicalJson(baseline) });
     if (descriptor.hash !== session.root_baseline.digest) throw cliError('ROOT_BASELINE_BLOB_MISMATCH');
-    store.putBlob({ kind: 'legacy-import', bytes: canonicalJson({
+    store.putBlob({ kind: 'v1-migration-input', bytes: canonicalJson({
       contract: input.contract,
-      provenance: adopted.provenance,
+      provenance: migrated.provenance,
     }) });
     return {
       ok: true,
-      command: 'adopt',
+      command: 'migrate-v1',
       session_id: session.session_id,
       status: session.status,
-      provenance: adopted.provenance,
+      provenance: migrated.provenance,
       live_execution: false,
     };
-  }, adopted.session.authority_revisions.at(-1).authority.target_roots);
+  }, migrated.session.authority_revisions.at(-1).authority.target_roots);
 }
 
 function hardProhibitionClaims(session, claims) {
@@ -996,7 +990,9 @@ async function mode(flags) {
   assertStableStateRoot({ stateRoot: flags['state-root'] });
   mkdirSync(flags['state-root'], { recursive: true, mode: 0o700 });
   const path = join(flags['state-root'], 'rollout.json');
-  const currentState = readRolloutState(path);
+  const currentState = ensureRolloutState(path, {
+    releaseManifestDigest: CONTROLLER_RELEASE_DIGEST,
+  });
   const current = currentState.mode;
   if (input.action === 'get') {
     if (input.next !== null || input.changed_at !== null || input.canary_session_id !== null) {
@@ -1015,7 +1011,7 @@ async function mode(flags) {
     throw cliError('MODE_ACTION_INVALID');
   }
   let canaryReceipt = null;
-  if (current === 'opt-in' && input.next === 'default') {
+  if (current === 'canary' && input.next === 'enabled') {
     if (typeof input.canary_session_id !== 'string' || input.canary_session_id.length === 0) {
       throw cliError('ROLLOUT_CANARY_REQUIRED');
     }
@@ -1032,7 +1028,7 @@ async function mode(flags) {
     next: input.next,
     changedAt: input.changed_at,
     canaryReceipt,
-    priorCanaryReceipt: currentState.canary_receipt,
+    releaseManifestDigest: CONTROLLER_RELEASE_DIGEST,
   });
   return {
     ok: true,
@@ -1040,14 +1036,14 @@ async function mode(flags) {
     previous: current,
     mode: next,
     release_manifest_digest: CONTROLLER_RELEASE_DIGEST,
-    canary_session_id: canaryReceipt?.session_id ?? currentState.canary_receipt?.session_id ?? null,
+    canary_session_id: input.next === 'enabled' ? canaryReceipt?.session_id ?? null : null,
     live_execution: false,
   };
 }
 
 const HANDLERS = Object.freeze({
-  init, confirm, revise, project, preview, evaluate, shadow, status, export: exportSession,
-  capabilities, adopt, prepare, launch, resume, verify, finalize, reconcile, close, mode,
+  init, confirm, revise, project, preview, evaluate, status, export: exportSession,
+  capabilities, 'migrate-v1': migrateV1, prepare, launch, resume, verify, finalize, reconcile, close, mode,
 });
 
 export async function runCli({

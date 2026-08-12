@@ -3,7 +3,7 @@ import { compileDraft } from './compiler.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
 
-function adoptionError(code, message) {
+function migrationError(code, message) {
   const error = new Error(message);
   error.code = code;
   return error;
@@ -32,9 +32,9 @@ function uniqueId(value, fallback, used) {
 
 function verifierFor(contract, index, used) {
   const source = contract.postflight[index] ?? contract.postflight[0];
-  if (source === undefined) throw adoptionError('LEGACY_VERIFIER_REQUIRED', 'legacy contract has no command verifier');
+  if (source === undefined) throw migrationError('V1_MIGRATION_VERIFIER_REQUIRED', 'v1 input has no command verifier');
   return {
-    id: uniqueId(source.id, `legacy-verifier-${index + 1}`, used),
+    id: uniqueId(source.id, `v1-verifier-${index + 1}`, used),
     type: 'command',
     cwd: source.cwd,
     argv: structuredClone(source.argv),
@@ -42,22 +42,22 @@ function verifierFor(contract, index, used) {
   };
 }
 
-export function adoptLegacyContract({ contract, sessionId, currentStateDigest, originalBaseline }) {
+export function migrateV1Contract({ contract, sessionId, currentStateDigest, originalBaseline }) {
   const diagnostics = validateContract(contract);
   if (diagnostics.length > 0 || contract.runtime !== 'codex') {
-    throw adoptionError('LEGACY_CONTRACT_INVALID', 'adoption requires a valid Codex v1 contract');
+    throw migrationError('V1_MIGRATION_CONTRACT_INVALID', 'migration requires a valid Codex v1 input contract');
   }
   if (typeof currentStateDigest !== 'string' || !HASH.test(currentStateDigest)) {
-    throw adoptionError('LEGACY_BASELINE_INVALID', 'currentStateDigest must be lowercase SHA-256');
+    throw migrationError('V1_MIGRATION_BASELINE_INVALID', 'currentStateDigest must be lowercase SHA-256');
   }
   const used = new Set();
-  const deliverableId = 'legacy-deliverable';
+  const deliverableId = 'migrated-deliverable';
   const criteria = [
     ...contract.success_criteria.map((item) => ({ source: item, kind: 'success', rule: item.command })),
     ...contract.judgment_criteria.map((item) => ({ source: item, kind: 'judgment', rule: item.rule })),
   ];
   const conditions = criteria.map((entry, index) => {
-    const id = uniqueId(entry.source.id, `legacy-condition-${index + 1}`, used);
+    const id = uniqueId(entry.source.id, `v1-condition-${index + 1}`, used);
     return {
       id,
       kind: entry.kind,
@@ -65,17 +65,17 @@ export function adoptLegacyContract({ contract, sessionId, currentStateDigest, o
       deliverable_ref: deliverableId,
       verifier: verifierFor(contract, index, used),
       projection: {
-        criterion_id: uniqueId(`legacy-${entry.source.id}`, `legacy-criterion-${index + 1}`, used),
+        criterion_id: uniqueId(`v1-${entry.source.id}`, `v1-criterion-${index + 1}`, used),
         command: entry.source.command ?? entry.source.rule,
         expected: entry.source.expected ?? entry.source.why,
       },
       depends_on: [],
-      introduced_by: 'legacy-adoption',
+      introduced_by: 'v1-migration',
       strengthens: [],
     };
   });
   if (!conditions.some((condition) => condition.kind === 'success')) {
-    throw adoptionError('LEGACY_SUCCESS_CONDITION_REQUIRED', 'legacy contract has no success criterion');
+    throw migrationError('V1_MIGRATION_SUCCESS_CONDITION_REQUIRED', 'v1 input has no success criterion');
   }
   const writes = contract.allowed_mutations.files.length > 0 || contract.allowed_mutations.git.length > 0;
   const external = structuredClone(contract.allowed_mutations.external);
@@ -90,8 +90,8 @@ export function adoptLegacyContract({ contract, sessionId, currentStateDigest, o
     },
     non_goals: contract.constraints.map((constraint) => constraint.rule),
     root_baseline: {
-      kind: originalBaseline === null ? 'adopted-current-state' : 'legacy-original',
-      digest: originalBaseline?.digest ?? currentStateDigest,
+      kind: originalBaseline === null ? 'migrated-current-state' : 'v1-original',
+      digest: currentStateDigest,
     },
     authority: {
       target_roots: structuredClone(contract.target_roots),
@@ -101,8 +101,8 @@ export function adoptLegacyContract({ contract, sessionId, currentStateDigest, o
       destructive: false,
       maximum_risk: 'low',
       maximum_budget: budget,
-      // Legacy prose constraints have no trustworthy one-to-one mapping to v2 mechanical capabilities.
-      // Preserve them for confirmation as non-goals; the adopter must explicitly choose v2 capabilities.
+      // V1 prose has no trustworthy one-to-one mapping to V2 mechanical capabilities.
+      // Preserve it for the fresh V2 confirmation instead of manufacturing enforcement.
       hard_prohibitions: [],
     },
     initial_design: {
@@ -117,25 +117,25 @@ export function adoptLegacyContract({ contract, sessionId, currentStateDigest, o
       },
       conditions,
       context_dependencies: contract.context_sources.map((source) => ({
-        id: slug(source.id, 'legacy-context'),
+        id: slug(source.id, 'v1-context'),
         path: source.path,
         sha256: source.sha256,
       })),
-      projection_version: 'v1-adoption',
-      reason: 'explicit legacy v1 adoption',
+      projection_version: 'v1-migration',
+      reason: 'explicit v1 to GoalSession v2 migration',
     },
   };
   const compiled = compileDraft(draft);
   if (compiled.session === null) {
-    throw adoptionError('LEGACY_ADOPTION_COMPILE_FAILED', compiled.gaps.map((item) => item.code).join(','));
+    throw migrationError('V1_MIGRATION_COMPILE_FAILED', compiled.gaps.map((item) => item.code).join(','));
   }
   return {
     session: compiled.session,
     provenance: {
       provenance_version: 1,
-      baseline_provenance: originalBaseline === null ? 'adopted_at_current_state' : 'legacy_original',
+      baseline_provenance: originalBaseline === null ? 'migrated_at_current_state' : 'v1_original',
       legacy_confirmation: 'unverified',
-      certifies_pre_adoption_state: false,
+      certifies_pre_migration_state: false,
     },
   };
 }

@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { compileDraft, recordConfirmation } from '../src/compiler.mjs';
 import { hashDesignRevision, transitionSession } from '../src/domain.mjs';
 import {
+  assertAttemptManifest,
   assertProjectionCoverage,
   projectAttempt,
 } from '../src/projector.mjs';
@@ -59,7 +61,7 @@ test('an unmapped Condition blocks projection coverage', () => {
   );
 });
 
-test('manifest remains exact valid v1 while the envelope stays Codex-only', () => {
+test('AttemptManifest remains closed-world while the envelope stays Codex-only', () => {
   const session = confirmedSession();
   const result = projectAttempt({
     session,
@@ -75,6 +77,24 @@ test('manifest remains exact valid v1 while the envelope stays Codex-only', () =
   ]);
   assert.equal('session_binding' in result.manifest, false);
   assert.equal(result.manifest.runtime, 'codex');
+});
+
+test('invalid AttemptManifest fails with a format-neutral controller error', () => {
+  assert.throws(
+    () => assertAttemptManifest({ version: 1, runtime: 'codex' }),
+    (error) => error.code === 'ATTEMPT_MANIFEST_INVALID'
+      && Array.isArray(error.diagnostics)
+      && error.diagnostics.length > 0,
+  );
+});
+
+test('production projection surface does not expose legacy manifest terminology', () => {
+  const sources = [
+    new URL('../src/projector.mjs', import.meta.url),
+    new URL('../src/execution.mjs', import.meta.url),
+    new URL('../src/cli.mjs', import.meta.url),
+  ].map((path) => readFileSync(path, 'utf8')).join('\n');
+  assert.doesNotMatch(sources, /V1_PROJECTION_INVALID|v1 manifest|legacy Codex/i);
 });
 
 test('non-goals and hard prohibitions remain visible in every Attempt projection', () => {
@@ -119,7 +139,7 @@ test('projection is deterministic and hash-binds context plus proof', () => {
   assert.deepEqual(projectAttempt(input), projectAttempt(structuredClone(input)));
 });
 
-test('condition kinds map to v1 constraints, judgment, and success criteria', () => {
+test('condition kinds map to AttemptManifest constraints, judgment, and success criteria', () => {
   const session = confirmedSession({
     mutateDraft(draft) {
       const success = draft.initial_design.conditions[0];

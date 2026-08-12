@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "campaign_status": "green_verified",
+  "campaign_status": "red_captured",
   "protocol": {
     "collected_at": "2026-08-11",
     "fresh_context_per_sample": true,
@@ -8,7 +8,7 @@
     "limitation": "These model samples are observational pressure evidence, not deterministic proof; controller unit, state-machine, sandbox, and fault-injection tests remain authoritative."
   },
   "v2_guidance": {
-    "source": "Every with-v2-guidance sample used a distinct fresh agent context that read the complete final SKILL.md, Codex adapter reference, and GoalSession v2 protocol before answering the exact scenario prompt.",
+    "source": "Historical GREEN samples below bind the recorded guidance hashes. Those bytes were superseded by the Codex V2-only cutover, so the current campaign is red_captured until a new fresh-context campaign is collected; the old hashes are retained instead of being falsified.",
     "skill_sha256": "2ee36f1d0178e6922545256e30ea9846806be659e917ba4e2c0ae5d87f7bdcb4",
     "codex_reference_sha256": "329834315a93e5c21ab4ceb70fe21295279eb8ef13c0c265ccaa125b476b8c97",
     "protocol_reference_sha256": "6ffabfd19393981352ec4a20ace3025775306c762a79dfe2bfcad446281403c1"

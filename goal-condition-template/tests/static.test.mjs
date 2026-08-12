@@ -151,9 +151,10 @@ test('loader-read Markdown contains no positional-dollar expansion or private da
 
 test('core skill preserves the complete fail-closed workflow and package', () => {
   const skill = read(skillPath);
-  assert.ok(skill.includes('Codex v2: Compile Goal+Authority+Design → Preview → Confirm(authorization_hash)'));
+  assert.ok(skill.includes('Codex: GoalSession v2 only'));
+  assert.ok(skill.includes('Compile Goal+Authority+Design → Preview → Confirm(authorization_hash)'));
   assert.ok(skill.includes('→ Prepare Attempt → Launch → Verify → Revise/Next Attempt → Finalize → Close'));
-  assert.ok(skill.includes('Claude/legacy: Compile v1 → Validate → Preview → Confirm(contract hash)'));
+  assert.ok(skill.includes('Claude: Compile shared run contract → Validate → Preview → Confirm(contract hash)'));
   assert.ok(skill.includes('→ Preflight → Launch(adapter) → Postflight → Close'));
   for (const term of [
     'single objective', 'stable context', 'judgment_criteria', 'success_criteria',
@@ -161,6 +162,25 @@ test('core skill preserves the complete fail-closed workflow and package', () =>
     'postflight', 'budget', 'user_provided', 'hash',
   ]) {
     assert.ok(skill.includes(term), `core skill is missing ${term}`);
+  }
+});
+
+test('Codex production guidance exposes only GoalSession v2 and one-way migration', () => {
+  const skill = read(skillPath);
+  const protocol = read(join(referencesRoot, 'codex-goal-session-v2.md'));
+  const adapter = read(join(referencesRoot, 'adapters/codex.md'));
+  const production = `${skill}\n${protocol}\n${adapter}`;
+  for (const term of [
+    'Codex: GoalSession v2 only', 'disabled', 'canary', 'enabled',
+    'migrate-v1', 'AttemptManifest', '不得回退到 Codex v1',
+  ]) {
+    assert.ok(production.includes(term), `V2-only guidance is missing ${term}`);
+  }
+  for (const retired of [
+    'legacy Codex', 'Claude/legacy', 'shadow 保留 v1 live',
+    '已有 v1 task 默认继续 legacy', '只有用户明确 Adopt 才迁移',
+  ]) {
+    assert.equal(production.includes(retired), false, `retired Codex route remains documented: ${retired}`);
   }
 });
 
@@ -201,7 +221,7 @@ test('public docs expose the external release trust root and complete required c
     'scripts/lib/contract.mjs', 'scripts/lib/snapshot.mjs',
     'scripts/lib/installer.mjs', 'scripts/lib/workflow.mjs',
     'scripts/launch.mjs', 'scripts/lib/adapters/claude.mjs', 'scripts/lib/adapters/codex.mjs',
-    'codex-controller/src/adoption.mjs', 'codex-controller/src/attempt.mjs',
+    'codex-controller/src/migration.mjs', 'codex-controller/src/attempt.mjs',
     'codex-controller/src/capabilities.mjs', 'codex-controller/src/execution.mjs',
     'codex-controller/src/recovery.mjs', 'codex-controller/src/release.mjs',
     'codex-controller/src/rollout.mjs',
@@ -293,7 +313,7 @@ test('Codex adapter is runtime-specific and preserves goal-tool semantics', () =
   const adapter = read(join(referencesRoot, 'adapters/codex.md'));
   for (const term of [
     'create_goal', 'get_goal', 'update_goal', 'token_budget', 'audit_only',
-    'confirmed hash', 'baseline_digest', 'postflight', 'remaining_work',
+    'authorization_hash', 'AttemptManifest', 'baseline_digest', 'postflight', 'remaining_work',
     'ready_for_postflight', 'finalize_runtime', 'verify_runtime', 'runBinding',
     'postflightEvidence', 'finalizationReceipt', 'runtimeReadback',
     'controller-owned', 'untrusted runtimeResult',

@@ -60,21 +60,28 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
   assert.ok(['red_captured', 'green_verified'].includes(evidence.campaign_status));
   assert.equal(evidence.protocol.fresh_context_per_sample, true);
   assert.match(evidence.protocol.limitation, /observational.*not deterministic proof/i);
-  assert.equal(
-    evidence.v2_guidance.skill_sha256,
-    digest(await readFile(codexV2SkillUrl, 'utf8')),
-    'GREEN samples must bind the exact Skill bytes they read',
-  );
-  assert.equal(
-    evidence.v2_guidance.codex_reference_sha256,
-    digest(await readFile(codexV2ReferenceUrl, 'utf8')),
-    'GREEN samples must bind the exact Codex reference bytes they read',
-  );
-  assert.equal(
-    evidence.v2_guidance.protocol_reference_sha256,
-    digest(await readFile(codexV2ProtocolUrl, 'utf8')),
-    'GREEN samples must bind the exact GoalSession protocol bytes they read',
-  );
+  if (evidence.campaign_status === 'green_verified') {
+    assert.equal(
+      evidence.v2_guidance.skill_sha256,
+      digest(await readFile(codexV2SkillUrl, 'utf8')),
+      'GREEN samples must bind the exact Skill bytes they read',
+    );
+    assert.equal(
+      evidence.v2_guidance.codex_reference_sha256,
+      digest(await readFile(codexV2ReferenceUrl, 'utf8')),
+      'GREEN samples must bind the exact Codex reference bytes they read',
+    );
+    assert.equal(
+      evidence.v2_guidance.protocol_reference_sha256,
+      digest(await readFile(codexV2ProtocolUrl, 'utf8')),
+      'GREEN samples must bind the exact GoalSession protocol bytes they read',
+    );
+  } else {
+    assert.match(evidence.v2_guidance.source, /superseded/i);
+    for (const field of ['skill_sha256', 'codex_reference_sha256', 'protocol_reference_sha256']) {
+      assert.match(evidence.v2_guidance[field], /^[0-9a-f]{64}$/);
+    }
+  }
 
   const expectedScenarios = [
     'repeated-contract-pressure',

@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import {
+  ROLLOUT_MODES,
   assertLiveRollout,
   certifyRolloutCanary,
+  ensureRolloutState,
   readRolloutState,
   transitionRollout,
   writeRolloutMode,
@@ -55,27 +57,29 @@ function certifiedCanaryExport() {
   };
 }
 
-test('rollout follows the closed shadow to default sequence', () => {
-  assert.equal(transitionRollout('shadow', 'opt-in'), 'opt-in');
+test('rollout follows the closed V2-only disabled to enabled sequence', () => {
+  assert.deepEqual(ROLLOUT_MODES, ['disabled', 'canary', 'enabled']);
+  assert.equal(transitionRollout('disabled', 'canary'), 'canary');
   const receipt = certifyRolloutCanary(certifiedCanaryExport(), {
     releaseManifestDigest: RELEASE_DIGEST,
   });
-  assert.equal(transitionRollout('opt-in', 'default', { canaryReceipt: receipt }), 'default');
-  assert.equal(transitionRollout('default', 'legacy-freeze', { canaryReceipt: receipt }), 'legacy-freeze');
+  assert.equal(transitionRollout('canary', 'enabled', { canaryReceipt: receipt }), 'enabled');
+  assert.equal(transitionRollout('enabled', 'canary'), 'canary');
+  assert.equal(transitionRollout('canary', 'disabled'), 'disabled');
 });
 
 test('rollout cannot skip recovery gates', () => {
   assert.throws(
-    () => transitionRollout('shadow', 'default'),
+    () => transitionRollout('disabled', 'enabled'),
     (error) => error.code === 'ROLLOUT_TRANSITION_INVALID',
   );
   assert.throws(
-    () => transitionRollout('opt-in', 'default'),
+    () => transitionRollout('canary', 'enabled'),
     (error) => error.code === 'ROLLOUT_CANARY_REQUIRED',
   );
 });
 
-test('default rollout is bound to one live certified dynamic-revision canary receipt', (t) => {
+test('enabled rollout is bound to one live certified dynamic-revision canary receipt', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'goal-condition-rollout-canary-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const path = join(root, 'rollout.json');
@@ -83,18 +87,19 @@ test('default rollout is bound to one live certified dynamic-revision canary rec
     releaseManifestDigest: RELEASE_DIGEST,
   });
   writeRolloutMode({
-    path, current: 'shadow', next: 'opt-in', changedAt: '2026-08-11T00:00:00.000Z',
+    path, current: 'disabled', next: 'canary', changedAt: '2026-08-11T00:00:00.000Z',
+    releaseManifestDigest: RELEASE_DIGEST,
   });
   writeRolloutMode({
-    path, current: 'opt-in', next: 'default', changedAt: '2026-08-11T00:01:00.000Z',
-    canaryReceipt: receipt,
+    path, current: 'canary', next: 'enabled', changedAt: '2026-08-11T00:01:00.000Z',
+    canaryReceipt: receipt, releaseManifestDigest: RELEASE_DIGEST,
   });
   const state = readRolloutState(path);
-  assert.equal(state.mode, 'default');
-  assert.equal(state.schema_version, 3);
+  assert.equal(state.mode, 'enabled');
+  assert.equal(state.schema_version, 4);
   assert.equal(state.release_manifest_digest, RELEASE_DIGEST);
   assert.deepEqual(state.canary_receipt, receipt);
-  assert.equal(assertLiveRollout(root, { releaseManifestDigest: RELEASE_DIGEST }), 'default');
+  assert.equal(assertLiveRollout(root, { releaseManifestDigest: RELEASE_DIGEST }), 'enabled');
   assert.throws(
     () => assertLiveRollout(root, { releaseManifestDigest: '8'.repeat(64) }),
     (error) => error.code === 'ROLLOUT_RELEASE_MISMATCH',
@@ -110,7 +115,7 @@ test('a canary from another controller release cannot promote the current releas
   );
 });
 
-test('live GoalSession commands fail closed in shadow and open only after opt-in', (t) => {
+test('live GoalSession commands fail closed while disabled and open only for this release', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'goal-condition-rollout-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(root, { recursive: true });
@@ -119,8 +124,65 @@ test('live GoalSession commands fail closed in shadow and open only after opt-in
     (error) => error.code === 'ROLLOUT_LIVE_BLOCKED',
   );
   writeRolloutMode({
-    path: join(root, 'rollout.json'), current: 'shadow', next: 'opt-in',
+    path: join(root, 'rollout.json'), current: 'disabled', next: 'canary',
     changedAt: '2026-08-11T00:00:00.000Z',
+    releaseManifestDigest: RELEASE_DIGEST,
   });
-  assert.equal(assertLiveRollout(root), 'opt-in');
+  assert.equal(assertLiveRollout(root, { releaseManifestDigest: RELEASE_DIGEST }), 'canary');
+  assert.throws(
+    () => assertLiveRollout(root, { releaseManifestDigest: '8'.repeat(64) }),
+    (error) => error.code === 'ROLLOUT_RELEASE_MISMATCH',
+  );
+});
+
+test('schema-v3 rollout states migrate once into the V2-only vocabulary', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'goal-condition-rollout-migration-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const receipt = certifyRolloutCanary(certifiedCanaryExport(), {
+    releaseManifestDigest: RELEASE_DIGEST,
+  });
+  const cases = [
+    {
+      before: { schema_version: 3, mode: 'shadow', changed_at: null, release_manifest_digest: null, canary_receipt: null },
+      after: 'disabled',
+    },
+    {
+      before: { schema_version: 3, mode: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z', release_manifest_digest: null, canary_receipt: null },
+      after: 'canary',
+    },
+    {
+      before: { schema_version: 3, mode: 'default', changed_at: '2026-08-11T00:01:00.000Z', release_manifest_digest: RELEASE_DIGEST, canary_receipt: receipt },
+      after: 'enabled',
+    },
+    {
+      before: { schema_version: 3, mode: 'legacy-freeze', changed_at: '2026-08-11T00:02:00.000Z', release_manifest_digest: RELEASE_DIGEST, canary_receipt: receipt },
+      after: 'enabled',
+    },
+  ];
+  cases.forEach(({ before, after }, index) => {
+    const path = join(root, `rollout-${index}.json`);
+    writeFileSync(path, JSON.stringify(before), { mode: 0o600 });
+    const migrated = ensureRolloutState(path, { releaseManifestDigest: RELEASE_DIGEST });
+    assert.equal(migrated.schema_version, 4);
+    assert.equal(migrated.mode, after);
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), migrated);
+    assert.deepEqual(ensureRolloutState(path, { releaseManifestDigest: RELEASE_DIGEST }), migrated);
+  });
+});
+
+test('ambiguous legacy rollout state fails closed instead of being normalized', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'goal-condition-rollout-invalid-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const path = join(root, 'rollout.json');
+  writeFileSync(path, JSON.stringify({
+    schema_version: 3,
+    mode: 'opt-in',
+    changed_at: '2026-08-11T00:00:00.000Z',
+    release_manifest_digest: RELEASE_DIGEST,
+    canary_receipt: null,
+  }), { mode: 0o600 });
+  assert.throws(
+    () => ensureRolloutState(path, { releaseManifestDigest: RELEASE_DIGEST }),
+    (error) => error.code === 'ROLLOUT_STATE_INVALID',
+  );
 });

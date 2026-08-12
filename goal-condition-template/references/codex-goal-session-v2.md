@@ -1,6 +1,6 @@
 # Codex GoalSession v2 操作协议
 
-本协议只适用于新 Codex GoalSession。Claude 和未 Adopt 的 v1 task 不变。controller 入口是：
+本协议适用于所有 Codex live execution。Codex 不再公开或回退到 v1 lifecycle；旧 v1 contract 只能作为 `migrate-v1` 的一次性输入。Claude 走独立共享 contract 分支。controller 入口是：
 
 ```text
 node codex-controller/src/cli.mjs <command> ...
@@ -10,7 +10,7 @@ Controller state 与 runtime state 必须在所有 target root 和系统临时�
 
 ## 1. Rollout 与能力
 
-先用 `mode` 的 `get` 动作读取 `shadow | opt-in | default | legacy-freeze`；输入固定为 `{"action":"get","next":null,"changed_at":null,"canary_session_id":null}`。返回值同时包含 controller 当前核验过的 `release_manifest_digest`。controller 会在 `prepare/launch/resume/verify/finalize` 现场重读 mode：`shadow` 机械阻断 live；新 Codex task 只有在 `default`，或 `opt-in` 且用户明确选择时进入 v2；`legacy-freeze` 只允许 v2 live。`shadow→opt-in` 的 `canary_session_id` 为 null；`opt-in→default` 必须给出同一 controller store 中的 canary Session ID，且该 Session 必须由当前 manifest digest 对应的 release，以一次确认经历单调 Design Revision、旧 Attempt Rejected、新 Attempt Certified、完整 native receipt/Evidence 后 Complete，controller 才写入 v2 promotion receipt。default/legacy-freeze state 与当前 release digest 不一致时 live 命令 fail closed，旧 release 的 canary 不得给新 release 放量。
+先用 `mode get` 读取 `disabled | canary | enabled`；输入固定为 `{"action":"get","next":null,"changed_at":null,"canary_session_id":null}`。缺失状态等于 `disabled`。controller 在 `prepare/launch/resume/verify/finalize` 现场重读 gate：`disabled` 机械阻断 live，`canary` 只供显式 V2 canary，`enabled` 是正常路由；任何状态都不得回退到 Codex v1。`disabled→canary` 绑定当前 controller release digest；`canary→enabled` 还必须给出同一 store 中、同一 release 完成动态 Revision 与完整 native receipt/Evidence 的 Certified Session ID。release digest 不匹配时 fail closed。旧 schema-v3 state 只转换一次：`shadow→disabled`、`opt-in→canary`、`default|legacy-freeze→enabled`；新写入只使用 schema-v4 和新词汇。
 
 `capabilities` 输入包含闭世界 `probes` 与 `hard_prohibitions`。Authority 中的 Hard Prohibition 不是自然语言，而是 `workspace-write-boundary | network-deny | controller-state-isolation` 之一；prepare claim 必须满足 `rule===capability`，不能由调用方把任意规则映射到一个绿能力：
 
@@ -70,7 +70,7 @@ launch --state-root <controller-state> --session-id <session-id> \
   --run-id <run-id> --runtime-root <runtime-state> --deadline-ms <positive-ms>
 ```
 
-prepare 由 controller 读回 root baseline、核当前 workspace、投影 immutable v1 manifest、保存 Context Package/Projection Proof，并在一个写事务内检查/写入 LaunchIntent + root lease。LaunchIntent 同时 MAC 绑定当前 controller release digest 与每个 target root 的 canonical path、device、inode；launch 在 dispatch 前重核版本和物理身份，再于同一 SQLite 事务把 pending intent 改为 `dispatching`、Session 改为 `Dispatching`。Active Boundary 不含 `write` 时 `thread/start` 必须使用 `read-only` sandbox；只有明确获授 `write` 才能使用 `workspace-write`。随后使用短 Goal 作为原生 objective，把完整 hash-bound Context Package 放进 `turn/start`。claim 后崩溃的同 run 重试只做 readback/reconcile，绝不再发副作用。
+prepare 由 controller 读回 root baseline、核当前 workspace、投影 immutable `AttemptManifest`、保存 Context Package/Projection Proof，并在一个写事务内检查/写入 LaunchIntent + root lease。`AttemptManifest.version=1` 只是私有 launcher ABI 的格式版本，不参与 runtime 路由。LaunchIntent 同时 MAC 绑定当前 controller release digest 与每个 target root 的 canonical path、device、inode；launch 在 dispatch 前重核版本和物理身份，再于同一 SQLite 事务把 pending intent 改为 `dispatching`、Session 改为 `Dispatching`。Active Boundary 不含 `write` 时 `thread/start` 必须使用 `read-only` sandbox；只有明确获授 `write` 才能使用 `workspace-write`。随后使用短 Goal 作为原生 objective，把完整 hash-bound Context Package 放进 `turn/start`。claim 后崩溃的同 run 重试只做 readback/reconcile，绝不再发副作用。
 
 若 launch 返回 `reconciliation_required`，只运行 `reconcile` 或 `close`，不重发 launch。`CONTROL_PLANE_BYPASS` 不能自动洗成受控执行。
 
@@ -119,6 +119,6 @@ reconcile --state-root <controller-state> --session-id <session-id> \
 
 顺序固定为 event/blob integrity → lease → native readback → workspace/root baseline → Evidence dependencies。无法证明请求未送达时保持 ReconciliationRequired，绝不自动创建第二个 Turn。
 
-## 6. Legacy adoption
+## 6. V1 单向迁移
 
-已有 v1 task 只有在用户明确 Adopt 时运行 `adopt`。adoption 保存 legacy contract 与 provenance，重新展示并确认一次 Goal + Authority。缺原始 baseline 时标记 `adopted_at_current_state`，只认证 adoption 之后的修改；不得把历史 v1 确认伪造成 v2 Receipt，也不得给 adoption 前状态补发 Certified Complete。
+旧 v1 contract 只有在用户明确迁移时运行 `migrate-v1`。迁移输入保存为 immutable provenance，输出是 `AwaitingConfirmation` 的 V2 Draft；必须重新展示并确认 Goal + Authority。缺原始 baseline 时标记 `migrated_at_current_state`，只认证迁移之后的修改；不得把历史确认、runtime state 或完成证据伪造成 V2 Receipt，也不得给迁移前状态补发 Certified Complete。迁移后只能进入新的 V2 Attempt，不存在 v1 resume。
