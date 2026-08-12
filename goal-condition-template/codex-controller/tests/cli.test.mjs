@@ -344,7 +344,7 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
     operation: {
       version: 1,
       type: 'ADD_CONDITION',
-      reason: 'shadow regression coverage',
+      reason: 'dynamic revision regression coverage',
       evidence_refs: [],
       payload: { condition },
     },

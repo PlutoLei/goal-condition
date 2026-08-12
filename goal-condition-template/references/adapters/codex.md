@@ -1,6 +1,6 @@
 # Codex adapter
 
-此 adapter 只处理 `runtime="codex"` 的已确认 run contract。字段语义、hash 与 snapshot 握手见 [run-contract reference](../run-contract.md)。它描述调用边界；本文与测试不调用任何真实 goal tool 或真实 daemon。
+此 adapter 只处理 GoalSession v2 投影出的 Codex Attempt。Codex 没有公开的 v1 live route；旧 contract 只能通过 `migrate-v1` 变成未确认 V2 Draft。它描述调用边界；真实调用由 controller 和 launcher 完成。
 
 ## GoalSession v2 受控执行面
 
@@ -23,23 +23,23 @@ GoalSession v2 是 Codex-only 的独立 controller 包；Claude adapter、共享
 
 Contract Compiler 只编译结构化任务、上下文事实与保守默认值，不进行开放式访谈。只有缺失或矛盾字段会产生两种实质不同结果、且不存在更保守默认时，才返回一个 blocking `CompilationGap`。Brainstorm/Grill 是设计阶段压力测试方法，绝不是每次运行必经的提问、访谈或换名后的 mandatory checklist。
 
-Attempt projector 保持 v1 只读：原生 Codex objective 只承载短而稳定的 Goal，完整 Boundary、Conditions、content-bound Context、Non-goals 与 Hard Prohibitions 放入 hash-bound Context Package；Context dependency 的 stable path 必须位于 Active Boundary 内，并在首次授权预览显示 path/content hash。Projection Proof 必须为每个 Active Condition 给出 v1 contract 位置、运行时 context pointer、verifier 与 Evidence 依赖。任何漏映射都阻止投影。
+Attempt projector 生成私有 immutable `AttemptManifest`：原生 Codex objective 只承载短而稳定的 Goal，完整 Boundary、Conditions、content-bound Context、Non-goals 与 Hard Prohibitions 放入 hash-bound Context Package；Context dependency 的 stable path 必须位于 Active Boundary 内，并在首次授权预览显示 path/content hash。Projection Proof 必须为每个 Active Condition 给出 manifest 位置、运行时 context pointer、verifier 与 Evidence 依赖。任何漏映射都阻止投影。`AttemptManifest.version=1` 只是私有 ABI 格式，不是 runtime 路由信号。
 
 完成等级分三层：executor/runtime 输出只能形成 `Candidate`；当前 controller-owned Evidence 全部有效可到 `Verified`；没有 control-plane bypass、unmediated turn 或未对账变化时才可 `Certified`。reviewer 文字、executor 的 all-green 或模型自报都不能直接认证完成。
 
-GoalSession v2 controller 通过 `capabilities`、`adopt`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层创建新的不可变 Attempt；它不复用已经被拒绝的 candidate，也不修改共享 v1 schema。
+GoalSession v2 controller 通过 `capabilities`、`migrate-v1`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层创建新的不可变 Attempt；它不复用已经被拒绝的 candidate，也不修改共享 schema。
 
 controller 不复制 app-server 执行器：live 副作用仍只经本 adapter 的 `runCodexLaunch` / `runCodexFinalize` / `runCodexClose`。v2 在同一写事务检查租约并保存 LaunchIntent；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path/device/inode，dispatch 时在一个事务内原子 claim `dispatching` 与 Session `Dispatching`，重核版本及物理身份后才调用 launcher。由于当前 app-server 的 `turn/start` 响应 ID 与持久化 readback ID 可能漂移，LaunchReceipt v2 分别绑定两者；controller 在输入中生成 256-bit correlation，并把 exact text SHA-256 与唯一持久化 ID 一起核回，fresh thread 还必须证明精确 `0→1`。只满足集合基数而输入不匹配、初始非空、首次多 turn、后续或 finalize 前后的额外 turn 都是旁路。claim 后读回不明不重发，转 `ReconciliationRequired`。完整命令与状态顺序见 [GoalSession v2 操作协议](../codex-goal-session-v2.md)。
 
-同一稳定 Goal 内遇到 context refresh、增加/加强 Condition 或 Authority 内边界调整时，controller 应应用 typed Design Revision、局部失效 Evidence，并创建新 Attempt；不再回到 v1 的完整 Preview/Confirm。等价 verifier 替换属于同一目标生命周期，但在独立 parity/mutation proof API 落地前保持 fail closed。只有 Authority、风险/预算或 Goal 语义变化才重新授权或建立 successor。
+同一稳定 Goal 内遇到 context refresh、增加/加强 Condition 或 Authority 内边界调整时，controller 应应用 typed Design Revision、局部失效 Evidence，并创建新 Attempt；不重复整包 Preview/Confirm。等价 verifier 替换属于同一目标生命周期，但在独立 parity/mutation proof API 落地前保持 fail closed。只有 Authority、风险/预算或 Goal 语义变化才重新授权或建立 successor。
 
 ## Launch 前置条件
 
-只有 canonical contract 文件通过 byte-identical 检查、Validate 通过、包含 authoritative canonical JSON 的完整 Preview 已展示、用户明确确认当前 confirmed hash、Preflight 全绿，并且 `baseline_digest` 已保存到 baseline 文件之外的可信编排状态后，才允许控制器经 `thread/goal/set` 创建 goal。主会话必须先建立下文所示的 controller-owned `runBinding`，再提交同一 binding 的 closed-world `preflightEvidence={ok,reasons,binding}`；它不能来自执行会话输出。缺项、失败或 cross-binding 都停止 launch。用户说“直接跑”不替代 hash 确认。
+只有完整 Authorization Preview 已展示、用户明确确认当前 `authorization_hash`、V2 Session 为 Ready、root baseline 与当前 workspace 核验全绿，且 controller 已投影 immutable Attempt 后，才允许经 `thread/goal/set` 创建 goal。Controller 建立的 launcher `runBinding` 绑定私有 AttemptManifest hash、可信 baseline digest 与 run ID；它不是公开 V1 确认。缺项、失败或 cross-binding 都停止 launch。用户说“直接跑”不替代首次 Authorization 确认。
 
 ```json
 {
-  "contractHash": "<confirmed contract hash>",
+  "contractHash": "<private AttemptManifest hash>",
   "baselineDigest": "<trusted baseline digest>",
   "runId": "<controller-issued run id>"
 }
@@ -49,9 +49,9 @@ goal 由控制器创建，不是模型的 `create_goal`：objective 文本必须
 
 只有用户明确提供 token 上限且 contract 含 `budget.user_provided=true` 与 `budget.max_tokens` 时，才把该值映射为 `thread/goal/set` 的 `tokenBudget` 参数；没有明确用户来源时必须省略。GoalSession Authority 的 `maximum_budget:null` 同样表示未授予预算，不是无限预算；首次授予有限值要产生新 authorization hash，已有有限授权不能靠改回 null 删除。turn、时间或费用限制若不是原生参数，只作为监控条件，不冒充 tool 字段。
 
-无法在当前 Codex 环境物理限制的外部动作必须标为 `audit_only`。如果用户要求 physical 保证，应在只读凭证、proxy、sandbox 或可验证 deny mechanism 就绪前停止 launch。本 adapter 侧唯一可核的物理面是 `thread/start` 的 `--sandbox`：legacy v1 固定 `workspace-write`；GoalSession v2 从 Active Boundary 投影，actions 不含 `write` 时必须是 `read-only`，包含 `write` 才允许 `workspace-write`。launch 前置闸逐条比对 `enforcement="physical"` 的 constraint，`mechanism` 指向 sandbox 但与实际模式不符即红，`mechanism` 指不到 sandbox（egress proxy、只读凭证等）或干脆缺失同样红——那些机制运行在 controller 视野之外，无从验证，只能写成 `audit_only`。
+无法在当前 Codex 环境物理限制的外部动作必须标为 `audit_only`。如果用户要求 physical 保证，应在只读凭证、proxy、sandbox 或可验证 deny mechanism 就绪前停止 launch。本 adapter 侧唯一可核的物理面是 `thread/start` 的 `--sandbox`：GoalSession v2 从 Active Boundary 投影，actions 不含 `write` 时必须是 `read-only`，包含 `write` 才允许 `workspace-write`。launch 前置闸逐条比对 `enforcement="physical"` 的 constraint，`mechanism` 指向 sandbox 但与实际模式不符即红，`mechanism` 指不到 sandbox 或缺失同样红。
 
-legacy v1 的两条路径必须分开读：`launch` 靠**请求参数**（`thread/start` 显式传 `sandbox`）；底层 `runCodexResume` 只传 `{threadId}`，沙箱从持久化 thread 恢复，只能读回来核——见下文 resume 小节第 0 步。同一个 workspace-write 模式在协议两侧是两个词形：请求参数写 `workspace-write`，响应体写 `workspaceWrite`。GoalSession v2 的 `resume` 不走这条可变 continuation；它建立新的 immutable Attempt 和 thread/start，因此每次都重新投影 `read-only | workspace-write`。
+GoalSession v2 的 `resume` 建立新的 immutable Attempt 和 `thread/start`，每次都从 Active Boundary 重新投影 `read-only | workspace-write`。同一个模式在请求参数写 `workspace-write`，响应体写 `workspaceWrite`；controller 必须核回而不能按词形猜测。
 
 ## 姿态：app-server 是外部编排的唯一表面
 

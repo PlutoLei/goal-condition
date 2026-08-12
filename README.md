@@ -7,8 +7,8 @@
 | 步 | 做什么 | 由谁 |
 |---|---|---|
 | **边界** | 把任务砍成一张边界包：硬边界、判断标准、验收物、放层清单 | `boundary-design` |
-| **目标** | 把边界包编译成一份可校验的 run contract——canonical JSON，一个自含 objective，逐字节确认 hash | `goal-condition-template/` 的 compiler / validator |
-| **执行** | 以已确认的 contract 启动 Claude Code 或 Codex，跑完由**主会话独立终验**，执行会话不能自证完成 | runtime adapter + postflight |
+| **目标** | 按 runtime 编译：Claude 得到 canonical run contract；Codex 得到 GoalSession v2 的 Goal、Authority 与 Design | `goal-condition-template/` router / compiler |
+| **执行** | Claude 使用已确认 contract；Codex 只使用已授权 GoalSession v2。两者都由控制面独立终验，执行会话不能自证完成 | runtime adapter + controller |
 
 公开仓只保存脱敏的核心协议、adapter、脚本和测试；具体项目的事实、锚点与核验来源由私有 profile 在安装时注入。
 
@@ -22,7 +22,7 @@ boundary-design 的主要动作是**砍**：对每条候选约束问四个问题
 
 ## boundary-design 输出
 
-`boundary-design` 输出一张边界包，供人审阅或继续编译为 run contract：
+`boundary-design` 输出一张平台无关的边界包，供人审阅或继续编译为对应 runtime 的执行契约：
 
 ```text
 GOAL: <一句话，带语境>
@@ -44,20 +44,25 @@ GOAL: <一句话，带语境>
 
 ## goal-condition 的当前架构
 
-核心协议不是运行时专属的长提示词。它以 canonical JSON run contract 为唯一权威 artifact：一个 contract 只容纳一个自含 objective，完整记录 content-bound 稳定上下文、目标根、判断标准、验收标准、边界、允许变更、preflight、postflight 与有明确用户来源的资源上限。每个 `context_sources` entry 都绑定唯一 ID、绝对稳定路径和文件 bytes 的 SHA-256；未知字段、临时上下文、重复 ID、伪装为物理机制的文字约束和 shell 字符串执行入口都会 fail closed。
+核心协议不是运行时专属的长提示词，而是两条明确分开的控制路径：
+
+- Claude 使用 canonical JSON run contract 作为唯一权威 artifact，逐字节预览并确认 hash。
+- Codex 只使用 GoalSession v2：Goal 与 Maximum Authority 授权后，Design Revision 动态演化，每次执行投影为 immutable Attempt。
+
+Codex V2 内部仍生成一个通过共享 closed-world validator 的私有 `AttemptManifest`，但它只是 launcher ABI；`version: 1` 不是旧 runtime 的入口或 fallback 信号。
 
 | 阶段 | 责任 | 不可跳过的条件 |
 |---|---|---|
 | `boundary-design` | 产出平台无关的边界包 | 目标、判据、约束与验收物可审阅 |
-| compiler / validator | 编译并校验 canonical run contract | contract bytes 必须 byte-identical 且通过 closed-world 校验 |
-| preview / confirm | 展示完整 canonical JSON 与 SHA-256 | 用户明确确认当前 hash；任何字节变化都必须重新确认 |
-| preflight | 核对 context bytes，capture 启动前 Git、路径与结构化命令基线 | baseline 原子落盘，并将 `baseline_digest` 保存在 baseline 文件之外的可信编排状态 |
-| runtime adapter | 以已确认 contract 启动 Claude 或 Codex | 不补写目标、预算或权限承诺 |
-| postflight / close | 主会话独立复验产物与边界 | 使用原先保存的 digest 比较基线；任一差异都不得完成 |
+| router / compiler | 按 runtime 生成 Claude contract 或 Codex V2 Draft | Codex 不得回退旧 lifecycle；Claude contract 必须 closed-world |
+| preview / confirm | Claude 展示完整 canonical JSON；Codex 展示 Goal + Authority + Initial Design | 明确确认当前 contract hash 或 authorization hash |
+| preflight / prepare | 核对 content-bound Context、root baseline 与当前 workspace | baseline 与控制器状态在执行体可写面之外 |
+| runtime adapter | 启动 Claude contract 或 Codex immutable Attempt | 不补写目标、预算或权限承诺 |
+| postflight / verify / close | 控制面独立复验产物、边界与 runtime readback | 任一差异、旁路或未对账状态都不得完成 |
 
 `success_criteria.command` 仅是给人审阅的精确命令说明。机器执行只接受 `cwd` 加 `argv[]` 的结构化 command，并以 `shell:false` 启动；不会使用 `eval` 或隐式 shell 拼接。若 Condition 明确把 `/bin/sh -c` 写进 argv，它仍是被审计、hash-bound 且在 verifier sandbox 内执行的显式程序。
 
-### 完整 preview、hash 与基线握手
+### Claude 完整 preview、hash 与基线握手
 
 在任何启动前，先运行 validator 的 `--preview`。它会展示完整的 canonical artifact（包括嵌套的 preflight 与 postflight 参数）和绑定该 bytes 的 SHA-256。确认的是这个精确 hash，不是“语义大致相同”的 JSON。
 
@@ -71,20 +76,20 @@ node goal-condition-template/scripts/snapshot.mjs verify --contract <CONTRACT_FI
 
 ## 运行时 adapter
 
-Claude 与 Codex 共用同一 contract 和基线握手，但终态按各自接口单独解释。两个 adapter 都要求由启动任务的主会话独立完成 postflight；执行会话贴出的成功文本不是完成证据。
+Claude 与 Codex 共用底层 snapshot、launcher 安全能力，但不再共用一个公开 contract lifecycle。两个 runtime 都要求控制面独立完成终验；执行会话贴出的成功文本不是完成证据。
 
 | Runtime | 候选终态 | 主会话完成链 |
 |---|---|---|
 | Claude Code | 只含 `subtype=success`、`is_error=false`、`terminal_reason=completed`、空 `permission_denials` 的 exact result | 独立执行 postflight 与 baseline compare，提交 bound controller evidence 后才 Close |
-| Codex | 精确的 `status=ready_for_postflight` 且 `remaining_work=false` | `postflight` → `finalize_runtime`（`thread/goal/set`）→ `verify_runtime`（`thread/goal/get`）→ complete |
+| Codex | GoalSession v2 executor 只产生 Candidate | controller `verify` → Certified → `finalize` → `close` |
 
-两个 runtime 都必须先由主会话建立 controller-owned `runBinding`，并提交同一 binding 的 `preflightEvidence` 后才能 launch；两者的独立终验也都使用 bound `postflightEvidence`。Codex 另外要求 `finalizationReceipt` 与 `runtimeReadback`。候选 runtimeResult 不得伪造这些证据；任何缺项、乱序、cross-binding、blocked、权限错误或 remaining work 都 fail closed。
+Claude 使用 controller-owned `runBinding`、`preflightEvidence` 与 `postflightEvidence`。Codex V2 由独立 controller 绑定 Authorization、Design Revision、AttemptManifest、LaunchIntent、Evidence、turn receipt 与 runtime readback。候选不得伪造任一控制器证据；任何缺项、乱序、cross-binding、旁路、权限错误或 remaining work 都 fail closed。
 
 ### Codex GoalSession v2
 
-新 Codex task 在 default rollout 下使用 Codex-only GoalSession v2：用户只确认稳定 Goal 与 Maximum Authority，Boundary、Condition 与 content-bound Context 在授权内以 typed Design Revision 演化，每次 revision 产生新的 immutable Attempt。Grill 只用于设计评审，不进入 runtime。Context path 必须在 Active Boundary 内；无 `write` Authority 的 Attempt 使用 `read-only` sandbox，获授 `write` 才使用 `workspace-write`。
+Codex 只使用 GoalSession v2：用户只确认稳定 Goal 与 Maximum Authority，Boundary、Condition 与 content-bound Context 在授权内以 typed Design Revision 演化，每次 revision 产生新的 immutable Attempt。controller 不可用或 V2 gate 关闭时 fail closed，不回退到旧 Codex lifecycle。旧 contract 只能通过 `migrate-v1` 生成未确认 V2 Draft。Grill 只用于设计评审，不进入 runtime。Context path 必须在 Active Boundary 内；无 `write` Authority 的 Attempt 使用 `read-only` sandbox，获授 `write` 才使用 `workspace-write`。
 
-LaunchIntent MAC 绑定 controller release digest、Attempt 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。`opt-in→default` 的 canary receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary，不能复用旧版本绿证据。
+LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；`canary→enabled` 的 receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary，不能复用旧版本绿证据。
 
 ## 安装与私有 profile
 
@@ -128,7 +133,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `codex-controller/package.json`
 - `codex-controller/schema/goal-session-v2.schema.json`
 - `codex-controller/schema/revision-operation-v1.schema.json`
-- `codex-controller/src/adoption.mjs`
+- `codex-controller/src/migration.mjs`
 - `codex-controller/src/attempt.mjs`
 - `codex-controller/src/capabilities.mjs`
 - `codex-controller/src/cli.mjs`
@@ -142,7 +147,6 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `codex-controller/src/recovery.mjs`
 - `codex-controller/src/release.mjs`
 - `codex-controller/src/rollout.mjs`
-- `codex-controller/src/shadow.mjs`
 - `codex-controller/src/store.mjs`
 - `codex-controller/src/values.mjs`
 - `codex-controller/src/verification.mjs`
