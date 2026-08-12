@@ -4,13 +4,13 @@ import { join } from 'node:path';
 import { canonicalJson } from '../../scripts/lib/contract.mjs';
 import { digestCanonical, exactFields } from './values.mjs';
 
-export const ROLLOUT_MODES = Object.freeze(['shadow', 'opt-in', 'default', 'legacy-freeze']);
+export const ROLLOUT_MODES = Object.freeze(['disabled', 'canary', 'enabled']);
+const LEGACY_ROLLOUT_MODES = Object.freeze(['shadow', 'opt-in', 'default', 'legacy-freeze']);
 const HASH = /^[0-9a-f]{64}$/;
 const NEXT = Object.freeze({
-  shadow: new Set(['opt-in']),
-  'opt-in': new Set(['shadow', 'default']),
-  default: new Set(['opt-in', 'legacy-freeze']),
-  'legacy-freeze': new Set(['default']),
+  disabled: new Set(['canary']),
+  canary: new Set(['disabled', 'enabled']),
+  enabled: new Set(['disabled', 'canary']),
 });
 const STATE_FIELDS = Object.freeze([
   'schema_version', 'mode', 'changed_at', 'release_manifest_digest', 'canary_receipt',
@@ -87,7 +87,7 @@ export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
   if (!valid) {
     throw rolloutError(
       'ROLLOUT_CANARY_INVALID',
-      'default requires one controller-certified live canary that exercised a monotonic Design revision',
+      'enabled requires one controller-certified live canary that exercised a monotonic Design revision',
     );
   }
   return {
@@ -107,78 +107,150 @@ export function transitionRollout(current, next, { canaryReceipt = null } = {}) 
   if (!ROLLOUT_MODES.includes(current) || !ROLLOUT_MODES.includes(next) || !NEXT[current].has(next)) {
     throw rolloutError('ROLLOUT_TRANSITION_INVALID', `cannot move rollout from ${current} to ${next}`);
   }
-  if (['default', 'legacy-freeze'].includes(next) && !validCanaryReceipt(canaryReceipt)) {
-    throw rolloutError('ROLLOUT_CANARY_REQUIRED', 'default and legacy-freeze require a certified canary receipt');
+  if (next === 'enabled' && !validCanaryReceipt(canaryReceipt)) {
+    throw rolloutError('ROLLOUT_CANARY_REQUIRED', 'enabled requires a certified canary receipt');
   }
   return next;
 }
 
-export function readRolloutState(path) {
+function disabledState() {
+  return {
+    schema_version: 4,
+    mode: 'disabled',
+    changed_at: null,
+    release_manifest_digest: null,
+    canary_receipt: null,
+  };
+}
+
+function timestampValid(value) {
+  return value === null || (typeof value === 'string' && !Number.isNaN(new Date(value).getTime()));
+}
+
+function validV2State(value) {
   try {
-    const value = JSON.parse(readFileSync(path, 'utf8'));
     exactFields(value, STATE_FIELDS, 'rollout_state');
-    if (value.schema_version !== 3
-      || !ROLLOUT_MODES.includes(value.mode)
-      || (value.changed_at !== null && Number.isNaN(new Date(value.changed_at).getTime()))
-      || (['default', 'legacy-freeze'].includes(value.mode) && !validCanaryReceipt(value.canary_receipt))
-      || (['default', 'legacy-freeze'].includes(value.mode)
-        && value.release_manifest_digest !== value.canary_receipt?.controller_release_digest)
-      || (!['default', 'legacy-freeze'].includes(value.mode)
-        && (value.canary_receipt !== null || value.release_manifest_digest !== null))) {
-      throw new Error('invalid');
-    }
-    return value;
+  } catch {
+    return false;
+  }
+  if (value.schema_version !== 4
+    || !ROLLOUT_MODES.includes(value.mode)
+    || !timestampValid(value.changed_at)) return false;
+  if (value.mode === 'disabled') {
+    return value.release_manifest_digest === null && value.canary_receipt === null;
+  }
+  if (!HASH.test(value.release_manifest_digest ?? '')) return false;
+  if (value.mode === 'canary') return value.canary_receipt === null;
+  return validCanaryReceipt(value.canary_receipt)
+    && value.release_manifest_digest === value.canary_receipt.controller_release_digest;
+}
+
+function validLegacyState(value) {
+  try {
+    exactFields(value, STATE_FIELDS, 'legacy_rollout_state');
+  } catch {
+    return false;
+  }
+  return value.schema_version === 3
+    && LEGACY_ROLLOUT_MODES.includes(value.mode)
+    && timestampValid(value.changed_at)
+    && (['default', 'legacy-freeze'].includes(value.mode)
+      ? validCanaryReceipt(value.canary_receipt)
+        && value.release_manifest_digest === value.canary_receipt.controller_release_digest
+      : value.canary_receipt === null && value.release_manifest_digest === null);
+}
+
+function parseRolloutState(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
   } catch (error) {
-    if (error.code === 'ENOENT') {
-      return {
-        schema_version: 3,
-        mode: 'shadow',
-        changed_at: null,
-        release_manifest_digest: null,
-        canary_receipt: null,
-      };
-    }
+    if (error.code === 'ENOENT') return null;
     throw rolloutError('ROLLOUT_STATE_INVALID', 'rollout state is invalid');
   }
 }
 
-export function readRolloutMode(path) {
-  return readRolloutState(path).mode;
+function writeState(path, state) {
+  const temporary = `${path}.tmp`;
+  writeFileSync(temporary, canonicalJson(state), { mode: 0o600 });
+  renameSync(temporary, path);
+}
+
+export function readRolloutState(path) {
+  const value = parseRolloutState(path);
+  if (value === null) return disabledState();
+  if (!validV2State(value)) throw rolloutError('ROLLOUT_STATE_INVALID', 'rollout state is invalid');
+  return value;
+}
+
+export function ensureRolloutState(path, { releaseManifestDigest } = {}) {
+  const value = parseRolloutState(path);
+  if (value === null) return disabledState();
+  if (validV2State(value)) return value;
+  if (!validLegacyState(value)) throw rolloutError('ROLLOUT_STATE_INVALID', 'rollout state is invalid');
+  let next;
+  if (value.mode === 'shadow') {
+    next = { ...disabledState(), changed_at: value.changed_at };
+  } else if (value.mode === 'opt-in') {
+    if (!HASH.test(releaseManifestDigest ?? '')) {
+      throw rolloutError('ROLLOUT_RELEASE_REQUIRED', 'legacy canary migration requires the installed release digest');
+    }
+    next = {
+      schema_version: 4,
+      mode: 'canary',
+      changed_at: value.changed_at,
+      release_manifest_digest: releaseManifestDigest,
+      canary_receipt: null,
+    };
+  } else {
+    next = {
+      schema_version: 4,
+      mode: 'enabled',
+      changed_at: value.changed_at,
+      release_manifest_digest: value.release_manifest_digest,
+      canary_receipt: value.canary_receipt,
+    };
+  }
+  writeState(path, next);
+  return next;
+}
+
+export function readRolloutMode(path, options) {
+  return ensureRolloutState(path, options).mode;
 }
 
 export function writeRolloutMode({
-  path, current, next, changedAt, canaryReceipt = null, priorCanaryReceipt = null,
+  path, current, next, changedAt, canaryReceipt = null, releaseManifestDigest,
 }) {
-  const retainedReceipt = canaryReceipt
-    ?? (['default', 'legacy-freeze'].includes(current) ? priorCanaryReceipt : null);
-  const mode = transitionRollout(current, next, { canaryReceipt: retainedReceipt });
+  const mode = transitionRollout(current, next, { canaryReceipt });
   const timestamp = new Date(changedAt);
   if (Number.isNaN(timestamp.getTime())) throw rolloutError('ROLLOUT_TIME_INVALID', 'changedAt is invalid');
-  const nextReceipt = ['default', 'legacy-freeze'].includes(mode) ? retainedReceipt : null;
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, canonicalJson({
-    schema_version: 3,
+  if (mode !== 'disabled' && !HASH.test(releaseManifestDigest ?? '')) {
+    throw rolloutError('ROLLOUT_RELEASE_REQUIRED', 'live V2 rollout requires the installed release digest');
+  }
+  const nextReceipt = mode === 'enabled' ? canaryReceipt : null;
+  const state = {
+    schema_version: 4,
     mode,
     changed_at: timestamp.toISOString(),
-    release_manifest_digest: nextReceipt?.controller_release_digest ?? null,
+    release_manifest_digest: mode === 'disabled' ? null : releaseManifestDigest,
     canary_receipt: nextReceipt,
-  }), { mode: 0o600 });
-  renameSync(temporary, path);
+  };
+  if (!validV2State(state)) throw rolloutError('ROLLOUT_STATE_INVALID', 'next rollout state is invalid');
+  writeState(path, state);
   return mode;
 }
 
 export function assertLiveRollout(stateRoot, { releaseManifestDigest } = {}) {
-  const state = readRolloutState(join(stateRoot, 'rollout.json'));
+  const state = ensureRolloutState(join(stateRoot, 'rollout.json'), { releaseManifestDigest });
   const { mode } = state;
-  if (!['opt-in', 'default', 'legacy-freeze'].includes(mode)) {
+  if (mode === 'disabled') {
     throw rolloutError(
       'ROLLOUT_LIVE_BLOCKED',
-      'live GoalSession commands are disabled while the Codex controller is in shadow mode',
+      'live GoalSession commands are disabled by the V2 release gate',
     );
   }
-  if (['default', 'legacy-freeze'].includes(mode)
-    && (!HASH.test(releaseManifestDigest ?? '')
-      || state.release_manifest_digest !== releaseManifestDigest)) {
+  if (!HASH.test(releaseManifestDigest ?? '')
+    || state.release_manifest_digest !== releaseManifestDigest) {
     throw rolloutError(
       'ROLLOUT_RELEASE_MISMATCH',
       'the live rollout was certified by a different controller release',
