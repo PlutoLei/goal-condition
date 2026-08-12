@@ -21,7 +21,7 @@ import {
 } from './lib/adapters/claude.mjs';
 import {
   assertLaunchable as assertCodexLaunchable, assertResumedSession, assertSetReturnedStatus,
-  CODEX_SANDBOX_MODE, GoalRpcClient, normalizeTerminal as normalizeCodexTerminal,
+  bindControllerTurnText, CODEX_SANDBOX_MODE, GoalRpcClient, normalizeTerminal as normalizeCodexTerminal,
   noteworthyNotification, resumeRpcOps, TURN_BOUNDARY_METHODS, verifyFinalizeAttribution,
 } from './lib/adapters/codex.mjs';
 import { contractHash, readContract } from './lib/contract.mjs';
@@ -1475,8 +1475,10 @@ export async function runCodexLaunch({
       }
 
       const turnCorrelation = randomBytes(32).toString('hex');
-      const turnInputText = `${turnText ?? prompt}\n\nController Turn Correlation: ${turnCorrelation}`
-        + '\n\nKeep working the thread until the goal reaches status "complete", then stop.';
+      const turnInputText = bindControllerTurnText({
+        text: turnText ?? prompt,
+        correlation: turnCorrelation,
+      });
       const turnInputSha256 = sha256Text(turnInputText);
       const turnEnvelope = await client.turnStart({ threadId, text: turnInputText });
       const turnId = turnEnvelope?.result?.turn?.id ?? null;

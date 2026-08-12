@@ -6,11 +6,12 @@ import test from 'node:test';
 import { compileDraft, recordConfirmation } from '../src/compiler.mjs';
 import { transitionSession } from '../src/domain.mjs';
 import {
+  attemptRuntimePrompt,
   prepareControlledAttempt as prepareAttempt,
   launchControlledAttempt as launchAttempt,
 } from '../src/execution.mjs';
 import { openSessionStore } from '../src/store.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput } from './helpers.mjs';
 
 const roots = [];
 const RELEASE_DIGEST = '9'.repeat(64);
@@ -29,7 +30,7 @@ async function fixture() {
   roots.push(root);
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validDraft();
+  const draft = validCompilerInput();
   draft.authority.target_roots = [target];
   draft.initial_design.active_boundary.target_roots = [target];
   draft.initial_design.conditions[0].verifier.cwd = target;
@@ -52,6 +53,20 @@ async function fixture() {
 
 test.afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+test('runtime prompt distinguishes the executor terminal signal from controller certification', () => {
+  const prompt = attemptRuntimePrompt({
+    manifest: { objective: 'Verify the target.' },
+    contextPackage: { sha256: '1'.repeat(64), bytes: '{}' },
+    projectionProof: { sha256: '2'.repeat(64), bytes: '{}' },
+  });
+
+  assert.match(prompt.turn_text, /exactly one controller-started native turn/i);
+  assert.match(prompt.turn_text, /Do not call `create_goal`/);
+  assert.match(prompt.turn_text, /call `update_goal` with status `complete`/);
+  assert.match(prompt.turn_text, /Candidate signal, not Controller certification/);
+  assert.match(prompt.turn_text, /never leave the native goal `active` when ending this turn/i);
 });
 
 test('intent and exclusive root lease are durable before the live launcher is called', async () => {
@@ -96,6 +111,38 @@ test('intent and exclusive root lease are durable before the live launcher is ca
   assert.equal(launched.session.attempts[0].status, 'Candidate');
   assert.deepEqual(launched.receipt.authorized_turn_ids, ['turn-1']);
   assert.equal(launched.session.status, 'Evaluating');
+  store.close();
+});
+
+test('a creation receipt won inside the store returns the original run and its real status', async () => {
+  const { store, session } = await fixture();
+  const creationRequest = {
+    kind: 'run',
+    scopeId: session.session_id,
+    requestKey: '1234567890abcdef1234567890abcdef',
+    requestHash: '8'.repeat(64),
+  };
+  const common = {
+    store,
+    sessionId: session.session_id,
+    attemptId: 'attempt-concurrent-recovery',
+    workspaceDigest: 'b'.repeat(64),
+    expiresAt: '2099-08-11T01:00:00.000Z',
+    nonce: creationRequest.requestKey,
+    capabilityReport: { launchable: true },
+    creationRequest,
+  };
+  const first = prepareControlledAttempt({ ...common, runId: 'run-concurrent-first' });
+  assert.equal(first.recovered, false);
+  assert.equal(first.intent_status, 'pending');
+
+  store.updateLaunchIntentStatus({ runId: first.run_id, status: 'dispatching' });
+  const recovered = prepareControlledAttempt({ ...common, runId: 'run-concurrent-loser' });
+  assert.equal(recovered.run_id, first.run_id);
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.intent_status, 'dispatching');
+  assert.equal(recovered.projection, null);
+  assert.equal(recovered.runtime_prompt, null);
   store.close();
 });
 

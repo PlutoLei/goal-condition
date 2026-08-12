@@ -11,14 +11,14 @@ import {
   projectAttempt,
 } from '../src/projector.mjs';
 import { validateContract } from '../../scripts/lib/contract.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput } from './helpers.mjs';
 
 function digest(bytes) {
   return createHash('sha256').update(bytes, 'utf8').digest('hex');
 }
 
 function confirmedSession({ mutateDraft } = {}) {
-  const draft = validDraft();
+  const draft = validCompilerInput();
   mutateDraft?.(draft);
   const compiled = compileDraft(draft);
   assert.equal(compiled.gaps.length, 0);

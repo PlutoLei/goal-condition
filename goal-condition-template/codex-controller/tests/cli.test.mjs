@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { commandNames } from '../src/cli.mjs';
 import { stateDirFor } from '../../scripts/launch.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput } from './helpers.mjs';
 
 const cliPath = new URL('../src/cli.mjs', import.meta.url).pathname;
 const roots = [];
+
+function validCliInput(requestId = 'a'.repeat(32)) {
+  return { ...validCompilerInput(), request_id: requestId };
+}
 
 async function workspace() {
   const root = await mkdtemp(join(process.cwd(), '.gc-cli-test-'));
@@ -23,8 +27,8 @@ async function writeJson(root, name, value) {
   return path;
 }
 
-function run(args) {
-  const child = spawnSync(process.execPath, [cliPath, ...args], { encoding: 'utf8' });
+function run(args, { env = process.env } = {}) {
+  const child = spawnSync(process.execPath, [cliPath, ...args], { encoding: 'utf8', env });
   return {
     ...child,
     stdoutJson: child.stdout.trim() === '' ? null : JSON.parse(child.stdout),
@@ -76,11 +80,199 @@ test('controlled CLI executes through the installed release symlink', async () =
   assert.deepEqual(JSON.parse(child.stderr), { ok: false, code: 'CLI_COMMAND_UNKNOWN' });
 });
 
-test('init can capture a controller-owned root baseline and prepare a durable Attempt', async () => {
+test('stateful commands share the canonical environment store while an explicit root stays isolated', async () => {
   const { root, stateRoot } = await workspace();
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validDraft();
+  const draft = validCliInput();
+  draft.authority.target_roots = [target];
+  draft.authority.hard_prohibitions = [];
+  draft.initial_design.active_boundary.target_roots = [target];
+  draft.initial_design.conditions[0].verifier.cwd = target;
+  draft.initial_design.conditions[0].verifier.argv = [process.execPath, '--version'];
+  const env = { ...process.env, GOAL_CONDITION_CODEX_STATE_ROOT: stateRoot };
+  const draftPath = await writeJson(root, 'canonical-draft.json', draft);
+
+  const initialized = run([
+    'init', '--input', draftPath, '--capture-baseline', 'true',
+  ], { env });
+  assert.equal(initialized.status, 0, initialized.stderr);
+  assert.equal(initialized.stdoutJson.status, 'AwaitingConfirmation');
+  const sessionId = initialized.stdoutJson.session_id;
+
+  const previewed = run(['preview', '--session-id', sessionId], { env });
+  assert.equal(previewed.status, 0, previewed.stderr);
+  assert.equal(previewed.stdoutJson.authorization_hash, initialized.stdoutJson.authorization_hash);
+
+  const confirmation = await writeJson(root, 'canonical-confirmation.json', {
+    authorization_hash: initialized.stdoutJson.authorization_hash,
+    thread_id: 'thread-canonical',
+    message_ref: 'message-canonical-confirmed',
+    source: 'codex-task',
+  });
+  const confirmed = run([
+    'confirm', '--session-id', sessionId, '--input', confirmation,
+  ], { env });
+  assert.equal(confirmed.status, 0, confirmed.stderr);
+  assert.equal(confirmed.stdoutJson.status, 'Ready');
+
+  const get = await writeJson(root, 'canonical-mode-get.json', {
+    action: 'get', next: null, changed_at: null, canary_session_id: null,
+  });
+  assert.equal(run(['mode', '--input', get], { env }).stdoutJson.mode, 'disabled');
+
+  const explicitRoot = join(root, 'explicit-state');
+  const explicit = run([
+    'mode', '--state-root', explicitRoot, '--input', get,
+  ], { env });
+  assert.equal(explicit.status, 0, explicit.stderr);
+  assert.equal(explicit.stdoutJson.mode, 'disabled');
+  assert.equal(run([
+    'status', '--state-root', explicitRoot, '--session-id', sessionId,
+  ], { env }).stderrJson.code, 'SESSION_NOT_FOUND');
+});
+
+test('invalid canonical state-root environment values fail closed without a home fallback', async () => {
+  const { root } = await workspace();
+  const get = await writeJson(root, 'invalid-mode-get.json', {
+    action: 'get', next: null, changed_at: null, canary_session_id: null,
+  });
+  for (const invalid of ['', 'relative-state-root']) {
+    const result = run(['mode', '--input', get], {
+      env: { ...process.env, GOAL_CONDITION_CODEX_STATE_ROOT: invalid },
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderrJson.code, 'STATE_ROOT_INVALID');
+  }
+});
+
+test('canonical shared store issues distinct machine-global session and run ids across projects', async () => {
+  const { root, stateRoot } = await workspace();
+  const env = { ...process.env, GOAL_CONDITION_CODEX_STATE_ROOT: stateRoot };
+  const sessions = [];
+  for (const [index, project] of ['alpha', 'beta'].entries()) {
+    const target = join(root, project);
+    await mkdir(target);
+    const draft = validCliInput(String(index + 2).repeat(32));
+    draft.authority.target_roots = [target];
+    draft.authority.hard_prohibitions = [];
+    draft.initial_design.active_boundary.target_roots = [target];
+    draft.initial_design.conditions[0].verifier.cwd = target;
+    draft.initial_design.conditions[0].verifier.argv = [process.execPath, '--version'];
+    const initialized = run([
+      'init', '--input', await writeJson(root, `${project}-draft.json`, draft),
+      '--capture-baseline', 'true',
+    ], { env });
+    assert.equal(initialized.status, 0, initialized.stderr);
+    assert.match(initialized.stdoutJson.session_id, /^session-[0-9a-f]{32}$/);
+    const retried = run([
+      'init', '--input', await writeJson(root, `${project}-draft-retry.json`, draft),
+      '--capture-baseline', 'true',
+    ], { env });
+    assert.equal(retried.status, 0, retried.stderr);
+    assert.equal(retried.stdoutJson.session_id, initialized.stdoutJson.session_id);
+    sessions.push({ project, sessionId: initialized.stdoutJson.session_id, initialized, draft });
+  }
+  assert.notEqual(sessions[0].sessionId, sessions[1].sessionId);
+
+  const conflictingDraft = structuredClone(sessions[0].draft);
+  conflictingDraft.goal.statement = 'A changed request may not reuse the same request id.';
+  const conflictingInit = run([
+    'init', '--input', await writeJson(root, 'alpha-draft-conflict.json', conflictingDraft),
+    '--capture-baseline', 'true',
+  ], { env });
+  assert.notEqual(conflictingInit.status, 0);
+  assert.equal(conflictingInit.stderrJson.code, 'CREATION_REQUEST_CONFLICT');
+
+  for (const { project, sessionId, initialized } of sessions) {
+    const confirmation = await writeJson(root, `${project}-confirmation.json`, {
+      authorization_hash: initialized.stdoutJson.authorization_hash,
+      thread_id: `thread-${project}`,
+      message_ref: `message-${project}`,
+      source: 'codex-task',
+    });
+    assert.equal(run([
+      'confirm', '--session-id', sessionId, '--input', confirmation,
+    ], { env }).status, 0);
+  }
+  assert.equal(run(['mode', '--input', await writeJson(root, 'shared-mode.json', {
+    action: 'set', next: 'canary', changed_at: '2026-08-12T00:00:00.000Z', canary_session_id: null,
+  })], { env }).status, 0);
+
+  const runIds = [];
+  for (const { project, sessionId } of sessions) {
+    const prepared = run([
+      'prepare', '--session-id', sessionId,
+      '--input', await writeJson(root, `${project}-prepare.json`, {
+        attempt_id: `attempt-${project}`,
+        nonce: project === 'alpha'
+          ? '00112233445566778899aabbccddeeff'
+          : 'ffeeddccbbaa99887766554433221100',
+        expires_at: '2099-08-12T00:00:00.000Z',
+        hard_prohibition_capabilities: [],
+      }),
+    ], { env });
+    assert.equal(prepared.status, 0, prepared.stderr);
+    assert.match(prepared.stdoutJson.run_id, /^run-[0-9a-f]{32}$/);
+    const retried = run([
+      'prepare', '--session-id', sessionId,
+      '--input', await writeJson(root, `${project}-prepare-retry.json`, {
+        attempt_id: `attempt-${project}`,
+        nonce: project === 'alpha'
+          ? '00112233445566778899aabbccddeeff'
+          : 'ffeeddccbbaa99887766554433221100',
+        expires_at: '2099-08-12T00:00:00.000Z',
+        hard_prohibition_capabilities: [],
+      }),
+    ], { env });
+    assert.equal(retried.status, 0, retried.stderr);
+    assert.equal(retried.stdoutJson.run_id, prepared.stdoutJson.run_id);
+    runIds.push(prepared.stdoutJson.run_id);
+  }
+  assert.notEqual(runIds[0], runIds[1]);
+});
+
+test('migrate-v1 recovers its controller session id from a caller-known request id', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'legacy-target');
+  await mkdir(target);
+  const contract = JSON.parse(await readFile(
+    new URL('../../tests/fixtures/valid-contract.json', import.meta.url),
+    'utf8',
+  ));
+  contract.target_roots = [target];
+  contract.preflight[0].target = target;
+  contract.postflight[0].cwd = target;
+  contract.context_sources[0].path = join(target, 'context.md');
+  const migration = {
+    request_id: '6'.repeat(32),
+    contract,
+    original_baseline: { baseline_version: 1, entries: [] },
+  };
+  const inputPath = await writeJson(root, 'migration.json', migration);
+  const first = run(['migrate-v1', '--state-root', stateRoot, '--input', inputPath]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdoutJson.session_id, /^session-[0-9a-f]{32}$/);
+
+  const retry = run(['migrate-v1', '--state-root', stateRoot, '--input', inputPath]);
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.equal(retry.stdoutJson.session_id, first.stdoutJson.session_id);
+
+  migration.contract.objective = 'A changed migration request.';
+  const conflict = run([
+    'migrate-v1', '--state-root', stateRoot,
+    '--input', await writeJson(root, 'migration-conflict.json', migration),
+  ]);
+  assert.notEqual(conflict.status, 0);
+  assert.equal(conflict.stderrJson.code, 'CREATION_REQUEST_CONFLICT');
+});
+
+test('init captures a baseline and resume durably prepares before a separate launch', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'target');
+  await mkdir(target);
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.hard_prohibitions = [];
   draft.initial_design.active_boundary.target_roots = [target];
@@ -92,8 +284,9 @@ test('init can capture a controller-owned root baseline and prepare a durable At
   ]);
   assert.equal(initialized.status, 0, initialized.stderr);
   assert.equal(initialized.stdoutJson.root_baseline_digest.length, 64);
+  const sessionId = initialized.stdoutJson.session_id;
   const previewed = run([
-    'preview', '--state-root', stateRoot, '--session-id', draft.session_id,
+    'preview', '--state-root', stateRoot, '--session-id', sessionId,
   ]);
   assert.equal(previewed.status, 0, previewed.stderr);
   assert.match(previewed.stdoutJson.markdown, /# GoalSession Authorization/);
@@ -104,16 +297,15 @@ test('init can capture a controller-owned root baseline and prepare a durable At
     confirmed_at: '2026-08-11T00:00:00.000Z',
   });
   assert.equal(run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'mode.json', {
     action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
   const prepared = run([
-    'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
+    'prepare', '--state-root', stateRoot, '--session-id', sessionId,
     '--input', await writeJson(root, 'prepare.json', {
       attempt_id: 'attempt-cli-live',
-      run_id: 'run-cli-live',
       nonce: '00112233445566778899aabbccddeeff',
       expires_at: '2099-08-11T00:00:00.000Z',
       hard_prohibition_capabilities: [],
@@ -123,23 +315,105 @@ test('init can capture a controller-owned root baseline and prepare a durable At
   assert.equal(prepared.stdoutJson.live_execution, false);
   assert.equal(prepared.stdoutJson.attempt_hash.length, 64);
   const closed = run([
-    'close', '--state-root', stateRoot, '--session-id', draft.session_id,
-    '--run-id', 'run-cli-live', '--runtime-root', join(root, 'runtime'),
+    'close', '--state-root', stateRoot, '--session-id', sessionId,
+    '--run-id', prepared.stdoutJson.run_id, '--runtime-root', join(root, 'runtime'),
   ]);
   assert.equal(closed.status, 0, closed.stderr);
   assert.equal(closed.stdoutJson.root_lease_released, true);
   await writeFile(join(target, 'run-product.txt'), 'allowed controller product\n');
-  const preparedAgain = run([
-    'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
-    '--input', await writeJson(root, 'prepare-again.json', {
+  const resumeInput = await writeJson(root, 'resume.json', {
       attempt_id: 'attempt-cli-live-2',
-      run_id: 'run-cli-live-2',
       nonce: 'ffeeddccbbaa99887766554433221100',
       expires_at: '2099-08-11T00:00:00.000Z',
       hard_prohibition_capabilities: [],
-    }),
+  });
+  const preparedAgain = run([
+    'resume', '--state-root', stateRoot, '--session-id', sessionId,
+    '--input', resumeInput,
   ]);
   assert.equal(preparedAgain.status, 0, preparedAgain.stderr);
+  assert.equal(preparedAgain.stdoutJson.disposition, 'prepared');
+  assert.equal(preparedAgain.stdoutJson.live_execution, false);
+  assert.match(preparedAgain.stdoutJson.run_id, /^run-[0-9a-f]{32}$/);
+  const recovered = run([
+    'resume', '--state-root', stateRoot, '--session-id', sessionId,
+    '--input', resumeInput,
+  ]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(recovered.stdoutJson.run_id, preparedAgain.stdoutJson.run_id);
+});
+
+test('a lost prepare response remains recoverable after the Session revision changes', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'target');
+  await mkdir(target);
+  const draft = validCliInput('7'.repeat(32));
+  draft.authority.target_roots = [target];
+  draft.authority.hard_prohibitions = [];
+  draft.initial_design.active_boundary.target_roots = [target];
+  draft.initial_design.conditions[0].verifier.cwd = target;
+  draft.initial_design.conditions[0].verifier.argv = [process.execPath, '--version'];
+  const initialized = run([
+    'init', '--state-root', stateRoot,
+    '--input', await writeJson(root, 'recovery-draft.json', draft),
+    '--capture-baseline', 'true',
+  ]).stdoutJson;
+  assert.equal(run([
+    'confirm', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', await writeJson(root, 'recovery-confirmation.json', {
+      authorization_hash: initialized.authorization_hash,
+      thread_id: 'thread-recovery', message_ref: 'message-recovery', source: 'codex-task',
+    }),
+  ]).status, 0);
+  assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'recovery-mode.json', {
+    action: 'set', next: 'canary', changed_at: '2026-08-12T00:00:00.000Z', canary_session_id: null,
+  })]).status, 0);
+  const prepareInput = {
+    attempt_id: 'attempt-lost-response',
+    nonce: '77889900aabbccddeeff001122334455',
+    expires_at: '2099-08-12T00:00:00.000Z',
+    hard_prohibition_capabilities: [],
+  };
+  const preparePath = await writeJson(root, 'recovery-prepare.json', prepareInput);
+  const first = run([
+    'prepare', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', preparePath,
+  ]);
+  assert.equal(first.status, 0, first.stderr);
+
+  const condition = structuredClone(draft.initial_design.conditions[0]);
+  condition.id = 'condition-after-lost-response';
+  condition.verifier.id = 'verify-after-lost-response';
+  condition.projection.criterion_id = 'success-after-lost-response';
+  const revised = run([
+    'revise', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', await writeJson(root, 'recovery-revision.json', {
+      operation: {
+        version: 1,
+        type: 'ADD_CONDITION',
+        reason: 'simulate a controller revision after stdout was lost',
+        evidence_refs: [],
+        payload: { condition },
+      },
+    }),
+  ]);
+  assert.equal(revised.status, 0, revised.stderr);
+  const disabled = run([
+    'mode', '--state-root', stateRoot,
+    '--input', await writeJson(root, 'recovery-mode-disabled.json', {
+      action: 'set', next: 'disabled', changed_at: '2026-08-12T00:01:00.000Z', canary_session_id: null,
+    }),
+  ]);
+  assert.equal(disabled.status, 0, disabled.stderr);
+
+  const recovered = run([
+    'prepare', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', preparePath,
+  ]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(recovered.stdoutJson.run_id, first.stdoutJson.run_id);
+  assert.equal(recovered.stdoutJson.recovered, true);
+  assert.equal(recovered.stdoutJson.intent_status, 'pending');
 });
 
 test('read-only Authority rejects target mutations before prepare', async () => {
@@ -147,7 +421,7 @@ test('read-only Authority rejects target mutations before prepare', async () => 
   const target = join(root, 'target');
   await mkdir(target);
   await writeFile(join(target, 'baseline.txt'), 'trusted baseline\n');
-  const draft = validDraft();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.actions = ['read', 'execute'];
   draft.authority.hard_prohibitions = [];
@@ -159,12 +433,13 @@ test('read-only Authority rejects target mutations before prepare', async () => 
     'init', '--state-root', stateRoot, '--input', await writeJson(root, 'read-only-draft.json', draft),
     '--capture-baseline', 'true',
   ]).stdoutJson;
+  const sessionId = initialized.session_id;
   const confirmation = await writeJson(root, 'read-only-confirmation.json', {
     authorization_hash: initialized.authorization_hash,
     thread_id: 'thread-read-only', message_ref: 'message-confirmed', source: 'codex-task',
   });
   assert.equal(run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'read-only-mode.json', {
     action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
@@ -172,9 +447,9 @@ test('read-only Authority rejects target mutations before prepare', async () => 
 
   await writeFile(join(target, 'unauthorized.txt'), 'must be detected\n');
   const prepared = run([
-    'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
+    'prepare', '--state-root', stateRoot, '--session-id', sessionId,
     '--input', await writeJson(root, 'read-only-prepare.json', {
-      attempt_id: 'attempt-read-only', run_id: 'run-read-only',
+      attempt_id: 'attempt-read-only',
       nonce: '00112233445566778899aabbccddeeff', expires_at: '2099-08-11T00:00:00.000Z',
       hard_prohibition_capabilities: [],
     }),
@@ -222,7 +497,7 @@ test('close preserves the controller lease when a foreign live runtime lease pre
   const target = join(root, 'target');
   const runtimeRoot = join(root, 'runtime');
   await mkdir(target);
-  const draft = validDraft();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.hard_prohibitions = [];
   draft.initial_design.active_boundary.target_roots = [target];
@@ -232,27 +507,28 @@ test('close preserves the controller lease when a foreign live runtime lease pre
     'init', '--state-root', stateRoot, '--input', await writeJson(root, 'close-draft.json', draft),
     '--capture-baseline', 'true',
   ]).stdoutJson;
+  const sessionId = initialized.session_id;
   const confirmation = await writeJson(root, 'close-confirmation.json', {
     authorization_hash: initialized.authorization_hash,
     thread_id: 'thread-cli', message_ref: 'message-confirmed', source: 'codex-task',
   });
   assert.equal(run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'close-mode.json', {
     action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
   const prepared = run([
-    'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
+    'prepare', '--state-root', stateRoot, '--session-id', sessionId,
     '--input', await writeJson(root, 'close-prepare.json', {
-      attempt_id: 'attempt-close-failure', run_id: 'run-close-failure',
+      attempt_id: 'attempt-close-failure',
       nonce: '00112233445566778899aabbccddeeff', expires_at: '2099-08-11T00:00:00.000Z',
       hard_prohibition_capabilities: [],
     }),
   ]).stdoutJson;
   const runtimeState = stateDirFor({
     stateRoot: runtimeRoot,
-    controller: `goal-session-v2-${draft.session_id}-attempt-close-failure`,
+    controller: `goal-session-v2-${sessionId}-attempt-close-failure`,
     contractHash: prepared.contract_hash,
   });
   await mkdir(runtimeState, { recursive: true });
@@ -263,8 +539,8 @@ test('close preserves the controller lease when a foreign live runtime lease pre
   }));
 
   const closed = run([
-    'close', '--state-root', stateRoot, '--session-id', draft.session_id,
-    '--run-id', 'run-close-failure', '--runtime-root', runtimeRoot,
+    'close', '--state-root', stateRoot, '--session-id', sessionId,
+    '--run-id', prepared.run_id, '--runtime-root', runtimeRoot,
   ]);
   assert.equal(closed.status, 0, closed.stderr);
   assert.equal(closed.stdoutJson.ok, false);
@@ -272,7 +548,7 @@ test('close preserves the controller lease when a foreign live runtime lease pre
   assert.equal(closed.stdoutJson.root_lease_released, false);
   assert.equal(closed.stdoutJson.result.cleanupComplete, false);
   assert.equal(closed.stdoutJson.result.runtimeQuiesced, false);
-  const exported = run(['export', '--state-root', stateRoot, '--session-id', draft.session_id]);
+  const exported = run(['export', '--state-root', stateRoot, '--session-id', sessionId]);
   assert.equal(exported.stdoutJson.export.session.status, 'ReconciliationRequired');
 });
 
@@ -280,7 +556,7 @@ test('prepare rejects a caller-selected capability mapping for a different hard 
   const { root, stateRoot } = await workspace();
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validDraft();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.initial_design.active_boundary.target_roots = [target];
   draft.initial_design.conditions[0].verifier.cwd = target;
@@ -288,20 +564,21 @@ test('prepare rejects a caller-selected capability mapping for a different hard 
     'init', '--state-root', stateRoot, '--input', await writeJson(root, 'draft.json', draft),
     '--capture-baseline', 'true',
   ]).stdoutJson;
+  const sessionId = initialized.session_id;
   const confirmation = await writeJson(root, 'confirmation.json', {
     authorization_hash: initialized.authorization_hash,
     thread_id: 'thread-cli', message_ref: 'message-confirmed', source: 'codex-task',
   });
   assert.equal(run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'mode.json', {
     action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
   const prepared = run([
-    'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
+    'prepare', '--state-root', stateRoot, '--session-id', sessionId,
     '--input', await writeJson(root, 'prepare.json', {
-      attempt_id: 'attempt-mapping', run_id: 'run-mapping',
+      attempt_id: 'attempt-mapping',
       nonce: '00112233445566778899aabbccddeeff', expires_at: '2099-08-11T00:00:00.000Z',
       hard_prohibition_capabilities: [{ rule: 'network-deny', capability: 'workspace-write-boundary' }],
     }),
@@ -312,13 +589,14 @@ test('prepare rejects a caller-selected capability mapping for a different hard 
 
 test('init, confirm, revise, project, evaluate, status, and export stay controller-only', async () => {
   const { root, stateRoot } = await workspace();
-  const draft = validDraft();
+  const draft = validCliInput();
   draft.authority.secret_refs = ['secret-ref-prod-api'];
   const draftPath = await writeJson(root, 'draft.json', draft);
   const initialized = run(['init', '--state-root', stateRoot, '--input', draftPath]);
   assert.equal(initialized.status, 0, initialized.stderr);
   assert.equal(initialized.stdoutJson.status, 'AwaitingConfirmation');
   assert.equal(initialized.stdoutJson.live_execution, false);
+  const sessionId = initialized.stdoutJson.session_id;
 
   const confirmationPath = await writeJson(root, 'confirmation.json', {
     authorization_hash: initialized.stdoutJson.authorization_hash,
@@ -330,7 +608,7 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
   const confirmed = run([
     'confirm',
     '--state-root', stateRoot,
-    '--session-id', draft.session_id,
+    '--session-id', sessionId,
     '--input', confirmationPath,
   ]);
   assert.equal(confirmed.status, 0, confirmed.stderr);
@@ -352,7 +630,7 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
   const revised = run([
     'revise',
     '--state-root', stateRoot,
-    '--session-id', draft.session_id,
+    '--session-id', sessionId,
     '--input', revisionPath,
   ]);
   assert.equal(revised.status, 0, revised.stderr);
@@ -362,7 +640,7 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
   const projected = run([
     'project',
     '--state-root', stateRoot,
-    '--session-id', draft.session_id,
+    '--session-id', sessionId,
     '--attempt-id', 'attempt-cli-1',
   ]);
   assert.equal(projected.status, 0, projected.stderr);
@@ -378,19 +656,19 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
   const evaluated = run([
     'evaluate',
     '--state-root', stateRoot,
-    '--session-id', draft.session_id,
+    '--session-id', sessionId,
     '--input', evaluationPath,
   ]);
   assert.equal(evaluated.status, 0, evaluated.stderr);
   assert.equal(evaluated.stdoutJson.level, 'candidate');
 
-  const statusA = run(['status', '--state-root', stateRoot, '--session-id', draft.session_id]);
-  const statusB = run(['status', '--state-root', stateRoot, '--session-id', draft.session_id]);
+  const statusA = run(['status', '--state-root', stateRoot, '--session-id', sessionId]);
+  const statusB = run(['status', '--state-root', stateRoot, '--session-id', sessionId]);
   assert.deepEqual(statusA.stdoutJson, statusB.stdoutJson);
   assert.equal(JSON.stringify(statusA.stdoutJson).includes('secret-ref-prod-api'), false);
 
-  const exportA = run(['export', '--state-root', stateRoot, '--session-id', draft.session_id]);
-  const exportB = run(['export', '--state-root', stateRoot, '--session-id', draft.session_id]);
+  const exportA = run(['export', '--state-root', stateRoot, '--session-id', sessionId]);
+  const exportB = run(['export', '--state-root', stateRoot, '--session-id', sessionId]);
   assert.deepEqual(exportA.stdoutJson, exportB.stdoutJson);
   assert.equal(JSON.stringify(exportA.stdoutJson).includes('secret-ref-prod-api'), true);
   assert.equal(JSON.stringify(exportA.stdoutJson).includes('secret_value'), false);
@@ -398,12 +676,13 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
 
 test('EXPAND_AUTHORITY moves the session to AwaitingReauthorization', async () => {
   const { root, stateRoot } = await workspace();
-  const draft = validDraft();
+  const draft = validCliInput();
   const initialized = run([
     'init',
     '--state-root', stateRoot,
     '--input', await writeJson(root, 'draft.json', draft),
   ]).stdoutJson;
+  const sessionId = initialized.session_id;
   const confirmation = await writeJson(root, 'confirmation.json', {
     authorization_hash: initialized.authorization_hash,
     thread_id: 'thread-cli',
@@ -411,7 +690,7 @@ test('EXPAND_AUTHORITY moves the session to AwaitingReauthorization', async () =
     source: 'codex-task',
   });
   assert.equal(run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId, '--input', confirmation,
   ]).status, 0);
 
   const authority = structuredClone(draft.authority);
@@ -426,14 +705,14 @@ test('EXPAND_AUTHORITY moves the session to AwaitingReauthorization', async () =
     },
   });
   const result = run([
-    'revise', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', revision,
+    'revise', '--state-root', stateRoot, '--session-id', sessionId, '--input', revision,
   ]);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdoutJson.decision, 'reauthorize');
   assert.equal(result.stdoutJson.status, 'AwaitingReauthorization');
   assert.notEqual(result.stdoutJson.authorization_hash, initialized.authorization_hash);
   const oldConfirmation = run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId,
     '--input', confirmation,
   ]);
   assert.notEqual(oldConfirmation.status, 0);
@@ -443,7 +722,7 @@ test('EXPAND_AUTHORITY moves the session to AwaitingReauthorization', async () =
     thread_id: 'thread-cli', message_ref: 'message-confirmed-new', source: 'codex-task',
   });
   const confirmed = run([
-    'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', newConfirmation,
+    'confirm', '--state-root', stateRoot, '--session-id', sessionId, '--input', newConfirmation,
   ]);
   assert.equal(confirmed.status, 0, confirmed.stderr);
   assert.equal(confirmed.stdoutJson.status, 'Ready');
@@ -457,7 +736,7 @@ test('unknown flags and unknown JSON fields fail closed without echoing values',
   assert.equal(badFlag.stderr.includes('private-value'), false);
   assert.equal(badFlag.stderrJson.code, 'CLI_FLAG_UNKNOWN');
 
-  const input = { ...validDraft(), unknown_private_field: 'private-value' };
+  const input = { ...validCliInput(), unknown_private_field: 'private-value' };
   const badJson = run([
     'init', '--state-root', stateRoot, '--input', await writeJson(root, 'bad.json', input),
   ]);

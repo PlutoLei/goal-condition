@@ -21,6 +21,32 @@ export const NOTIFICATION_METHODS = Object.freeze([
 ]);
 export const TURN_BOUNDARY_METHODS = Object.freeze(['turn/started', 'turn/completed']);
 
+export const SINGLE_TURN_CANDIDATE_PROTOCOL = [
+  'This Attempt is exactly one controller-started native turn.',
+  'The Controller already created the native goal. Do not call `create_goal` or start another goal.',
+  'Before ending this turn, call `update_goal` with status `complete` if and only if the Attempt work is complete.',
+  '`complete` is a Candidate signal, not Controller certification; the Controller independently verifies and certifies it.',
+  "Never leave the native goal `active` when ending this turn, and never send a final response that causes an automatic continuation turn. If the work cannot be completed, do not invent completion; keep working until the Controller's bounded runtime stops the Attempt.",
+].join('\n');
+
+export function singleTurnCandidateText(text) {
+  if (typeof text !== 'string' || text.length === 0) {
+    throw new TypeError('single-turn candidate text requires a non-empty string');
+  }
+  if (text.endsWith(SINGLE_TURN_CANDIDATE_PROTOCOL)) return text;
+  return `${text}\n\n${SINGLE_TURN_CANDIDATE_PROTOCOL}`;
+}
+
+export function bindControllerTurnText({ text, correlation }) {
+  if (typeof correlation !== 'string' || !/^[0-9a-f]{64}$/.test(correlation)) {
+    throw new TypeError('controller turn correlation must be 256-bit lowercase hex');
+  }
+  const base = text.endsWith(SINGLE_TURN_CANDIDATE_PROTOCOL)
+    ? text.slice(0, -SINGLE_TURN_CANDIDATE_PROTOCOL.length).trimEnd()
+    : text;
+  return singleTurnCandidateText(`${base}\n\nController Turn Correlation: ${correlation}`);
+}
+
 // 通知落盘 / 进终局报告的收敛规则（纯函数，method 名与 payload 形状的唯一真值源）。
 // 起因（N-5）：`account/rateLimits/updated` 在上面的 NOTIFICATION_METHODS 里列着，实际却一个字
 // 都没落盘——onEnvelope 只写 request/response，通知只喂 _notifyCbs 而那里只统计两个 turn method。

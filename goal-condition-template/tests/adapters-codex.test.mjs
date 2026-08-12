@@ -10,6 +10,7 @@ import {
   GoalRpcClient, assertLaunchable, CODEX_SANDBOX_MODE, CODEX_SANDBOX_TYPE, CODEX_SANDBOX_PROFILE,
   parseCodexVersion,
   noteworthyNotification, NOTIFICATION_PAYLOAD_CAP, RPC_TIMEOUT_MS,
+  bindControllerTurnText, singleTurnCandidateText, SINGLE_TURN_CANDIDATE_PROTOCOL,
 } from '../scripts/lib/adapters/codex.mjs';
 import { runtimeTerminalState } from '../scripts/lib/workflow.mjs';
 import { LEASE_TTL_MS } from '../scripts/launch.mjs';
@@ -61,6 +62,16 @@ test('notification method set is the measured set, turn boundaries exact', () =>
   assert.equal(NOTIFICATION_METHODS.length, 12);
   assert.deepEqual(TURN_BOUNDARY_METHODS, ['turn/started', 'turn/completed']);
   assert.ok(NOTIFICATION_METHODS.includes('thread/goal/updated'));
+});
+
+test('controller turn binding places one exact single-turn protocol after the correlation', () => {
+  const correlation = 'a'.repeat(64);
+  const prepared = singleTurnCandidateText('HASH-BOUND ATTEMPT');
+  const bound = bindControllerTurnText({ text: prepared, correlation });
+
+  assert.equal(bound.match(/This Attempt is exactly one controller-started native turn\./g).length, 1);
+  assert.match(bound, new RegExp(`Controller Turn Correlation: ${correlation}`));
+  assert.ok(bound.endsWith(SINGLE_TURN_CANDIDATE_PROTOCOL));
 });
 
 test('assertSetReturnedStatus reads the actual returned status', () => {
