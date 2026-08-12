@@ -76,7 +76,7 @@ function sameCommand(left, right) {
 function budgetProjection(boundary) {
   if (boundary.budget === null) return undefined;
   if (!(Number.isFinite(boundary.budget) && boundary.budget > 0)) {
-    throw projectionError('BUDGET_NOT_PROJECTABLE', 'v1 can project only a positive explicit budget');
+    throw projectionError('BUDGET_NOT_PROJECTABLE', 'AttemptManifest can project only a positive explicit budget');
   }
   return { user_provided: true, max_cost_usd: boundary.budget };
 }
@@ -153,7 +153,7 @@ function buildManifest(session, design) {
     judgmentCriteria.push({
       id: uniqueControllerId('controller-goal-alignment', usedIds),
       rule: 'The attempt remains bound to the confirmed Goal and active design.',
-      why: 'The v1 judgment gate must not infer a different objective.',
+      why: 'The AttemptManifest judgment gate must not infer a different objective.',
     });
   }
   const authority = session.authority_revisions.at(-1).authority;
@@ -170,7 +170,7 @@ function buildManifest(session, design) {
     target,
     require: 'directory',
   }));
-  const manifest = {
+  const attemptManifest = {
     version: 1,
     runtime: 'codex',
     objective: session.goal.statement,
@@ -194,8 +194,20 @@ function buildManifest(session, design) {
     postflight,
   };
   const budget = budgetProjection(design.active_boundary);
-  if (budget !== undefined) manifest.budget = budget;
-  return { manifest, mappings };
+  if (budget !== undefined) attemptManifest.budget = budget;
+  return { attemptManifest, mappings };
+}
+
+export function assertAttemptManifest(attemptManifest) {
+  const diagnostics = validateContract(attemptManifest);
+  if (diagnostics.length > 0) {
+    throw projectionError(
+      'ATTEMPT_MANIFEST_INVALID',
+      'projected AttemptManifest failed closed-world validation',
+      diagnostics.map((diagnostic) => diagnostic.code),
+    );
+  }
+  return true;
 }
 
 export function projectBaselineManifest({ session, designRevision = session.design_revisions.at(-1) }) {
@@ -205,17 +217,10 @@ export function projectBaselineManifest({ session, designRevision = session.desi
   const authority = session.authority_revisions.at(-1).authority;
   const design = editableDesign(designRevision);
   assertDesignWithinAuthority({ goal: session.goal, authority, design });
-  const { manifest, mappings } = buildManifest(session, design);
+  const { attemptManifest, mappings } = buildManifest(session, design);
   assertProjectionCoverage({ conditions: design.conditions, mappings });
-  const diagnostics = validateContract(manifest);
-  if (diagnostics.length > 0) {
-    throw projectionError(
-      'V1_PROJECTION_INVALID',
-      'projected v1 manifest failed closed-world validation',
-      diagnostics.map((diagnostic) => diagnostic.code),
-    );
-  }
-  return manifest;
+  assertAttemptManifest(attemptManifest);
+  return attemptManifest;
 }
 
 export function assertProjectionCoverage({ conditions, mappings }) {
@@ -262,7 +267,7 @@ export function projectAttempt({ session, designRevision, attemptId }) {
   }
   const authority = session.authority_revisions.at(-1).authority;
   const design = editableDesign(designRevision);
-  const manifest = projectBaselineManifest({ session, designRevision });
+  const attemptManifest = projectBaselineManifest({ session, designRevision });
   const { mappings } = buildManifest(session, design);
 
   const sessionBinding = {
@@ -294,7 +299,7 @@ export function projectAttempt({ session, designRevision, attemptId }) {
   });
   const envelope = {
     session_binding: sessionBinding,
-    manifest,
+    manifest: attemptManifest,
     context_package_ref: {
       sha256: contextPackage.sha256,
       byte_length: contextPackage.byte_length,
@@ -306,15 +311,15 @@ export function projectAttempt({ session, designRevision, attemptId }) {
   };
   const attemptHash = hashAttempt({
     session_binding: sessionBinding,
-    manifest,
+    manifest: attemptManifest,
     context_package_ref: envelope.context_package_ref,
     projection_proof_ref: envelope.projection_proof_ref,
-    preflight: manifest.preflight,
-    postflight: manifest.postflight,
+    preflight: attemptManifest.preflight,
+    postflight: attemptManifest.postflight,
   });
   return {
     envelope,
-    manifest,
+    manifest: attemptManifest,
     contextPackage,
     projectionProof,
     attemptHash,

@@ -163,10 +163,10 @@ function baselineGitHeads(baseline) {
 }
 
 async function captureCurrent({ manifest, baseline }) {
-  // The root snapshot is immutable across typed Design revisions, while the projected v1 contract hash
+  // The root snapshot is immutable across typed Design revisions, while the projected AttemptManifest hash
   // intentionally changes per Attempt. Rebind only the snapshot's contract identity in a derived view;
   // entries remain the original controller-owned root baseline bytes.
-  // Shared v1 path snapshots compare a recursively captured path entry as one unit. GoalSession v2 grants
+  // Shared path snapshots compare a recursively captured path entry as one unit. GoalSession v2 grants
   // writes to the complete active target root, so add the root itself only to this derived comparison
   // manifest. This keeps the compatibility workaround Codex-only instead of changing v1/Claude semantics.
   const comparisonManifest = {
