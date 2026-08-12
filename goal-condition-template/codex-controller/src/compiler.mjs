@@ -1,8 +1,8 @@
 import { createGoalSession, transitionSession } from './domain.mjs';
+import { createControllerId } from './identity.mjs';
 import { exactFields } from './values.mjs';
 
 const DRAFT_FIELDS = Object.freeze([
-  'session_id',
   'goal',
   'non_goals',
   'root_baseline',
@@ -104,11 +104,15 @@ function observabilityGaps(draft) {
   )];
 }
 
-export function compileDraft(input) {
+export function compileDraft(input, { sessionId = createControllerId('session') } = {}) {
   exactFields(input, COMPILER_FIELDS, 'compiler_input');
-  const draft = Object.fromEntries(
-    DRAFT_FIELDS.filter((field) => input[field] !== undefined).map((field) => [field, structuredClone(input[field])]),
-  );
+  const draft = {
+    session_id: sessionId,
+    ...Object.fromEntries(
+      DRAFT_FIELDS.filter((field) => input[field] !== undefined)
+        .map((field) => [field, structuredClone(input[field])]),
+    ),
+  };
   if (input.discoverable !== undefined) {
     exactFields(input.discoverable, DRAFT_FIELDS, 'discoverable');
     for (const field of DRAFT_FIELDS) {

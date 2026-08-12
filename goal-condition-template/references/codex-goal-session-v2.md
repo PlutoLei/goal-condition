@@ -10,6 +10,8 @@ Controller state 与 runtime state 必须在所有 target root 和系统临时�
 
 普通命令可以省略 `--state-root`，controller 按以下优先级只解析一次：显式 `--state-root`、`GOAL_CONDITION_CODEX_STATE_ROOT`、绝对且 normalized 的 `$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。任一已出现的高优先级值无效时立即 fail closed，不向下回退。默认路径是跨项目共享的机器级 store；显式 override 创建独立 deployment namespace，其 rollout、release-bound canary receipt、session 与 lease 都独立，缺失 rollout 仍视为 `disabled`。下文命令展示普通零配置路径；只有运维另建 namespace 时才追加 `--state-root <controller-state>`。
 
+共享 store 中的 `session_id` 与 `run_id` 是机器级主键，只能由 controller 生成 128-bit 随机 ID。Draft、V1 migration、prepare 与 resume 输入不得自选它们：`init`/`migrate-v1` stdout 回传 `session_id`，后续命令使用该值；`prepare`/`resume` stdout 回传 `run_id`，launch/verify/finalize/close 使用该值。已有 store 中的旧 ID 仍可读取，但所有新建路径都使用 controller-issued identity。
+
 ## 1. Rollout 与能力
 
 先用 `mode get` 读取 `disabled | canary | enabled`；输入固定为 `{"action":"get","next":null,"changed_at":null,"canary_session_id":null}`。缺失状态等于 `disabled`。controller 在 `prepare/launch/resume/verify/finalize` 现场重读 gate：`disabled` 机械阻断 live，`canary` 只供显式 V2 canary，`enabled` 是正常路由；任何状态都不得回退到 Codex v1。`disabled→canary` 绑定当前 controller release digest；`canary→enabled` 还必须给出同一 store 中、同一 release 完成动态 Revision 与完整 native receipt/Evidence 的 Certified Session ID。release digest 不匹配时 fail closed。旧 schema-v3 state 只转换一次：`shadow→disabled`、`opt-in→canary`、`default|legacy-freeze→enabled`；新写入只使用 schema-v4 和新词汇。
@@ -57,7 +59,6 @@ prepare 输入：
 ```json
 {
   "attempt_id": "attempt-0001",
-  "run_id": "run-0001",
   "nonce": "<32+ lowercase hex>",
   "expires_at": "<future ISO-8601>",
   "hard_prohibition_capabilities": [
@@ -73,6 +74,8 @@ launch --session-id <session-id> \
 ```
 
 prepare 由 controller 读回 root baseline、核当前 workspace、投影 immutable `AttemptManifest`、保存 Context Package/Projection Proof，并在一个写事务内检查/写入 LaunchIntent + root lease。`AttemptManifest.version=1` 只是私有 launcher ABI 的格式版本，不参与 runtime 路由。LaunchIntent 同时 MAC 绑定当前 controller release digest 与每个 target root 的 canonical path、device、inode；launch 在 dispatch 前重核版本和物理身份，再于同一 SQLite 事务把 pending intent 改为 `dispatching`、Session 改为 `Dispatching`。Active Boundary 不含 `write` 时 `thread/start` 必须使用 `read-only` sandbox；只有明确获授 `write` 才能使用 `workspace-write`。随后使用短 Goal 作为原生 objective，把完整 hash-bound Context Package 放进 `turn/start`。claim 后崩溃的同 run 重试只做 readback/reconcile，绝不再发副作用。
+
+`prepare` 返回 controller-issued `run_id`；调用方不得预先提供。`resume` 同样为新 immutable Attempt 生成并返回新的 `run_id`。
 
 若 launch 返回 `reconciliation_required`，只运行 `reconcile` 或 `close`，不重发 launch。`CONTROL_PLANE_BYPASS` 不能自动洗成受控执行。
 
@@ -123,4 +126,4 @@ reconcile --session-id <session-id> \
 
 ## 6. V1 单向迁移
 
-旧 v1 contract 只有在用户明确迁移时运行 `migrate-v1`。迁移输入保存为 immutable provenance，输出是 `AwaitingConfirmation` 的 V2 Draft；必须重新展示并确认 Goal + Authority。缺原始 baseline 时标记 `migrated_at_current_state`，只认证迁移之后的修改；不得把历史确认、runtime state 或完成证据伪造成 V2 Receipt，也不得给迁移前状态补发 Certified Complete。迁移后只能进入新的 V2 Attempt，不存在 v1 resume。
+旧 v1 contract 只有在用户明确迁移时运行 `migrate-v1`。迁移输入不接受 caller-selected `session_id`；controller 生成并在 stdout 回传。迁移输入保存为 immutable provenance，输出是 `AwaitingConfirmation` 的 V2 Draft；必须重新展示并确认 Goal + Authority。缺原始 baseline 时标记 `migrated_at_current_state`，只认证迁移之后的修改；不得把历史确认、runtime state 或完成证据伪造成 V2 Receipt，也不得给迁移前状态补发 Certified Complete。迁移后只能进入新的 V2 Attempt，不存在 v1 resume。

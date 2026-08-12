@@ -141,6 +141,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `codex-controller/src/domain.mjs`
 - `codex-controller/src/evidence.mjs`
 - `codex-controller/src/execution.mjs`
+- `codex-controller/src/identity.mjs`
 - `codex-controller/src/index.mjs`
 - `codex-controller/src/policy.mjs`
 - `codex-controller/src/projector.mjs`

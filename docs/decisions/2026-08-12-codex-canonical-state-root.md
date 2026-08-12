@@ -23,6 +23,8 @@ A present but invalid higher-precedence value fails closed and never falls throu
 
 The default is a shared machine-local deployment namespace. An explicit override creates a separate namespace with its own rollout gate, release-bound canary receipt, sessions, and leases. It does not inherit `enabled` from the default store.
 
+Because the deployment namespace is machine-wide, identifiers with machine-wide storage keys are controller-owned. New `session_id` and `run_id` values use 128 bits of controller randomness and are returned by `init`/`migrate-v1` and `prepare`/`resume`. Callers propagate these values but cannot select them. Existing stored identifiers remain readable for compatibility.
+
 Claude and the shared run-contract schema are unchanged. A release containing this change requires a fresh dynamic-revision live canary before the canonical store can become `enabled`.
 
 ## Consequences
@@ -32,6 +34,7 @@ Claude and the shared run-contract schema are unchanged. A release containing th
 - Operators retain isolated namespaces for testing or incident recovery, but each must be promoted independently.
 - Malformed environment configuration is visible immediately instead of silently selecting another store.
 - The canonical store accumulates machine-level session history and must remain controller-owned.
+- Session and run creation becomes response-driven: later commands use the controller-issued identifiers from the preceding response.
 
 ## Rejected Alternatives
 

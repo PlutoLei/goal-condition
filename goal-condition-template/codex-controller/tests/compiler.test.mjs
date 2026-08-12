@@ -6,17 +6,26 @@ import {
   recordConfirmation,
   renderAuthorizationPreview,
 } from '../src/compiler.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput, validDraft } from './helpers.mjs';
+
+test('compiler owns the machine-global session identifier', () => {
+  const result = compileDraft(validCompilerInput());
+  assert.match(result.session.session_id, /^session-[0-9a-f]{32}$/);
+  assert.throws(
+    () => compileDraft(validDraft()),
+    (error) => error.code === 'UNKNOWN_FIELD',
+  );
+});
 
 test('complete structured input compiles without questions', () => {
-  const result = compileDraft(validDraft());
+  const result = compileDraft(validCompilerInput());
   assert.equal(result.gaps.length, 0);
   assert.equal(result.questions.length, 0);
   assert.equal(result.session.schema_version, 2);
 });
 
 test('discoverable missing information is filled instead of asked', () => {
-  const input = validDraft();
+  const input = validCompilerInput();
   delete input.non_goals;
   input.discoverable = { non_goals: ['Do not publish or deploy.'] };
   const result = compileDraft(input);
@@ -25,7 +34,7 @@ test('discoverable missing information is filled instead of asked', () => {
 });
 
 test('two materially different Goal candidates return one blocking CompilationGap', () => {
-  const input = validDraft();
+  const input = validCompilerInput();
   delete input.goal;
   input.goal_candidates = [
     {
@@ -51,7 +60,7 @@ test('two materially different Goal candidates return one blocking CompilationGa
 });
 
 test('preference-only ambiguity records a conservative assumption', () => {
-  const input = validDraft();
+  const input = validCompilerInput();
   input.preference_options = { verification_scope: ['targeted', 'full'] };
   const result = compileDraft(input);
   assert.equal(result.gaps.length, 0);
@@ -65,7 +74,7 @@ test('preference-only ambiguity records a conservative assumption', () => {
 });
 
 test('a design with no observable success Condition returns a blocking gap', () => {
-  const input = validDraft();
+  const input = validCompilerInput();
   input.initial_design.conditions[0].kind = 'invariant';
   const result = compileDraft(input);
   assert.equal(result.session, null);
@@ -74,7 +83,7 @@ test('a design with no observable success Condition returns a blocking gap', () 
 });
 
 test('preview shows authorization, initial design, policy summary, and only a short fingerprint', () => {
-  const draft = validDraft();
+  const draft = validCompilerInput();
   draft.initial_design.context_dependencies = [
     { id: 'context-readme', path: '/work/project/README.md', sha256: 'b'.repeat(64) },
   ];
@@ -102,7 +111,7 @@ test('preview shows authorization, initial design, policy summary, and only a sh
 });
 
 test('initial design is presented but not frozen into authorization', () => {
-  const first = compileDraft(validDraft());
+  const first = compileDraft(validCompilerInput());
   const receipt = recordConfirmation({
     session: first.session,
     observed: {
@@ -120,7 +129,7 @@ test('initial design is presented but not frozen into authorization', () => {
 });
 
 test('confirmation with a wrong authorization hash fails closed', () => {
-  const first = compileDraft(validDraft());
+  const first = compileDraft(validCompilerInput());
   assert.throws(
     () => recordConfirmation({
       session: first.session,

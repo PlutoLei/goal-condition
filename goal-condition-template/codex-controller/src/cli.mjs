@@ -42,6 +42,7 @@ import {
   prepareControlledAttempt,
 } from './execution.mjs';
 import { evaluateRevision } from './policy.mjs';
+import { createControllerId } from './identity.mjs';
 import { projectAttempt, projectBaselineManifest } from './projector.mjs';
 import { reconcileLaunch } from './recovery.mjs';
 import { currentControllerReleaseDigest } from './release.mjs';
@@ -201,7 +202,8 @@ async function captureCurrent({ manifest, baseline }) {
 
 async function init(flags) {
   const input = readJson(flags.input);
-  let compiled = compileDraft(input);
+  const sessionId = createControllerId('session');
+  let compiled = compileDraft(input, { sessionId });
   if (compiled.gaps.length > 0) throw cliError(compiled.gaps[0].code);
   let baseline = null;
   if (flags['capture-baseline'] !== undefined) {
@@ -210,7 +212,7 @@ async function init(flags) {
     baseline = await captureSnapshot(manifest, { phase: 'capture' });
     const nextInput = structuredClone(input);
     nextInput.root_baseline = { kind: 'v1-snapshot', digest: snapshotDigest(baseline) };
-    compiled = compileDraft(nextInput);
+    compiled = compileDraft(nextInput, { sessionId });
     if (compiled.gaps.length > 0) throw cliError(compiled.gaps[0].code);
   }
   const session = await withStore(
@@ -414,11 +416,11 @@ async function capabilities(flags) {
 
 async function migrateV1(flags) {
   const input = readJson(flags.input);
-  exactFields(input, ['contract', 'session_id', 'original_baseline'], 'v1_migration_input');
+  exactFields(input, ['contract', 'original_baseline'], 'v1_migration_input');
   const baseline = input.original_baseline ?? await captureSnapshot(input.contract, { phase: 'capture' });
   const migrated = migrateV1Contract({
     contract: input.contract,
-    sessionId: input.session_id,
+    sessionId: createControllerId('session'),
     currentStateDigest: snapshotDigest(baseline),
     originalBaseline: input.original_baseline,
   });
@@ -455,7 +457,7 @@ function hardProhibitionClaims(session, claims) {
 
 async function prepareCore({ store, sessionId, input }) {
   exactFields(input, [
-    'attempt_id', 'run_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
+    'attempt_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
   ], 'prepare_input');
   const session = store.read(sessionId);
   const targetRoots = session.design_revisions.at(-1).active_boundary.target_roots;
@@ -485,7 +487,7 @@ async function prepareCore({ store, sessionId, input }) {
     sessionId,
     attemptId: input.attempt_id,
     workspaceDigest: snapshotDigest(current),
-    runId: input.run_id,
+    runId: createControllerId('run'),
     expiresAt: input.expires_at,
     nonce: input.nonce,
     capabilityReport,
@@ -639,11 +641,10 @@ async function resume(flags) {
   return withStore(flags['state-root'], async (store) => {
     const input = readJson(flags.input);
     exactFields(input, [
-      'attempt_id', 'run_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities', 'deadline_ms',
+      'attempt_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities', 'deadline_ms',
     ], 'resume_input');
     const prepared = await prepareCore({ store, sessionId: flags['session-id'], input: {
       attempt_id: input.attempt_id,
-      run_id: input.run_id,
       nonce: input.nonce,
       expires_at: input.expires_at,
       hard_prohibition_capabilities: input.hard_prohibition_capabilities,
@@ -661,6 +662,7 @@ async function resume(flags) {
       continuation_kind: 'new-immutable-attempt',
       session_id: flags['session-id'],
       attempt_id: prepared.attempt_id,
+      run_id: prepared.run_id,
       disposition: result.disposition,
       receipt: result.receipt ?? null,
       live_execution: result.receipt !== undefined,

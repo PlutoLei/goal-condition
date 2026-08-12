@@ -10,7 +10,7 @@ import {
   launchControlledAttempt as launchAttempt,
 } from '../src/execution.mjs';
 import { openSessionStore } from '../src/store.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput } from './helpers.mjs';
 
 const roots = [];
 const RELEASE_DIGEST = '9'.repeat(64);
@@ -29,7 +29,7 @@ async function fixture() {
   roots.push(root);
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validDraft();
+  const draft = validCompilerInput();
   draft.authority.target_roots = [target];
   draft.initial_design.active_boundary.target_roots = [target];
   draft.initial_design.conditions[0].verifier.cwd = target;

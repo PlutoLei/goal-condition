@@ -32,6 +32,8 @@ V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live�
 
 普通命令省略 `--state-root`，共享机器级 controller store：显式 flag > `GOAL_CONDITION_CODEX_STATE_ROOT` > `$XDG_STATE_HOME/goal-condition/codex-v2` > `<home>/.local/state/goal-condition/codex-v2`。无效的高优先级输入 fail closed，不向低优先级回退；显式 override 是独立 deployment namespace，必须独立 rollout。
 
+机器级 store 的 `session_id` 与 `run_id` 只能由 controller 生成 128-bit 随机 ID：`init`/`migrate-v1` 回传 session ID，`prepare`/`resume` 回传 run ID，后续命令消费回传值。新建输入不得自选这两个全局主键。
+
 旧 Codex v1 contract 只能显式运行 `migrate-v1`。迁移保存输入与 provenance，创建未确认的 V2 Draft，并重新展示 Goal + Authority；旧确认、旧 runtime state 与旧完成证据都不继承，迁移后只能创建新的 V2 Attempt。
 
 一次确认稳定的 Goal、Non-goals、Maximum Authority、机械 Hard Prohibition capability 与最大风险/预算；初始 Boundary 与 Conditions 会展示但不冻结进授权哈希。Authority 内的单调收紧、只追加 Condition、controller 读取 bytes 后的 Context refresh 形成 typed Design Revision，并在新的不可变 Attempt 继续，不重复确认整包。扩大 Authority 会追加 AuthorityRevision、生成新 authorization hash 并重新确认；弱化 Condition 或改变 Goal 必须 successor。verifier 等价替换与 controller correction 在独立 proof API 落地前 fail closed。

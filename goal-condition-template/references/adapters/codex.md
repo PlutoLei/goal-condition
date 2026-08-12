@@ -31,6 +31,8 @@ GoalSession v2 controller 通过 `capabilities`、`migrate-v1`、`init`、`previ
 
 普通命令不传 `--state-root`：controller 依次选择显式 flag、`GOAL_CONDITION_CODEX_STATE_ROOT`、`$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。无效的已选输入 fail closed；显式 override 创建独立 deployment namespace，必须独立 rollout，不能继承默认 store 的 release gate 或 canary receipt。解析后仍由物理路径、祖先 symlink、临时目录与 target-root isolation 门禁决定是否可用。
 
+deployment namespace 扩大到机器级后，identity ownership 同步上收：`session_id` 与 `run_id` 由 controller 生成 128-bit 随机值并通过 `init`/`migrate-v1`、`prepare`/`resume` 回传。调用方只能传播回传值，不能提交机器级主键；`attempt_id` 仍只需在所属 Session 内稳定唯一。旧持久化 ID 保持可读，不反向伪造成 controller-issued receipt。
+
 controller 不复制 app-server 执行器：live 副作用仍只经本 adapter 的 `runCodexLaunch` / `runCodexFinalize` / `runCodexClose`。v2 在同一写事务检查租约并保存 LaunchIntent；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path/device/inode，dispatch 时在一个事务内原子 claim `dispatching` 与 Session `Dispatching`，重核版本及物理身份后才调用 launcher。由于当前 app-server 的 `turn/start` 响应 ID 与持久化 readback ID 可能漂移，LaunchReceipt v2 分别绑定两者；controller 在输入中生成 256-bit correlation，并把 exact text SHA-256 与唯一持久化 ID 一起核回，fresh thread 还必须证明精确 `0→1`。只满足集合基数而输入不匹配、初始非空、首次多 turn、后续或 finalize 前后的额外 turn 都是旁路。claim 后读回不明不重发，转 `ReconciliationRequired`。完整命令与状态顺序见 [GoalSession v2 操作协议](../codex-goal-session-v2.md)。
 
 同一稳定 Goal 内遇到 context refresh、增加/加强 Condition 或 Authority 内边界调整时，controller 应应用 typed Design Revision、局部失效 Evidence，并创建新 Attempt；不重复整包 Preview/Confirm。等价 verifier 替换属于同一目标生命周期，但在独立 parity/mutation proof API 落地前保持 fail closed。只有 Authority、风险/预算或 Goal 语义变化才重新授权或建立 successor。

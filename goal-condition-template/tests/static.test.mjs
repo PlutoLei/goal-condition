@@ -199,6 +199,8 @@ test('Codex production guidance defines the canonical controller store and isola
     '.local/state/goal-condition/codex-v2',
     '独立 deployment namespace',
     '独立 rollout',
+    'controller 生成',
+    '128-bit',
   ]) {
     assert.ok(production.includes(term), `canonical controller-store guidance is missing ${term}`);
   }

@@ -5,6 +5,7 @@ export * from './compiler.mjs';
 export * from './domain.mjs';
 export * from './evidence.mjs';
 export * from './execution.mjs';
+export * from './identity.mjs';
 export * from './migration.mjs';
 export * from './policy.mjs';
 export * from './projector.mjs';

@@ -16,6 +16,7 @@
 - Alternative state roots remain separate deployment namespaces whose missing rollout state is `disabled`.
 - Existing temporary-path, physical ancestor, permission, target-root isolation, release digest, canary, and lease gates remain authoritative.
 - The new release must run a fresh dynamic-revision promotion canary before `enabled`.
+- Machine-global `session_id` and `run_id` values are controller-generated 128-bit random IDs returned by the preceding command; callers do not select them.
 
 ---
 

@@ -28,6 +28,7 @@ export const REQUIRED_CORE_FILES = Object.freeze([
   'codex-controller/src/domain.mjs',
   'codex-controller/src/evidence.mjs',
   'codex-controller/src/execution.mjs',
+  'codex-controller/src/identity.mjs',
   'codex-controller/src/index.mjs',
   'codex-controller/src/migration.mjs',
   'codex-controller/src/policy.mjs',

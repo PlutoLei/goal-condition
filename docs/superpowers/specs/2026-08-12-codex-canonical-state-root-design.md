@@ -31,6 +31,8 @@ All commands that currently require `--state-root` will accept it as an optional
 
 The normal path is one shared controller store across projects. That gives rollout mode, release-bound canary receipt, event/blob integrity, and target-root lease arbitration one machine-local namespace. An operator who deliberately selects another state root is creating another deployment namespace; its missing rollout state remains `disabled` and must be promoted independently.
 
+Machine-wide deployment also makes session and run identities machine-wide. The controller therefore generates new `session_id` and `run_id` values from 128 bits of randomness and returns them to the caller; new Draft, migration, prepare, and resume inputs cannot select these database keys. Existing persisted IDs remain readable.
+
 ## Security Boundary
 
 The canonical root is controller-owned state, not an executor workspace. Existing checks must still reject launch whenever that root sits inside any executor target root, resolves through a symlink alias, or lies in a temporary directory.
@@ -68,6 +70,7 @@ Tests must prove:
 6. existing symlink, temporary-path, permissions, target-root isolation, release-binding, and rollout tests stay green;
 7. the installed Skill documents the zero-config normal path and V2-only routing;
 8. the full root and Codex controller suites pass.
+9. two unrelated projects using the canonical store receive distinct controller-issued session and run IDs without caller coordination.
 
 Live acceptance for the new release must run the existing promotion shape in the canonical store:
 

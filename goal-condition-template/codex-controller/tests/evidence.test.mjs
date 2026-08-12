@@ -10,10 +10,10 @@ import {
   recordEvidence,
 } from '../src/evidence.mjs';
 import { digestCanonical } from '../src/values.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput } from './helpers.mjs';
 
 function sessionWithAllConditions() {
-  const draft = validDraft();
+  const draft = validCompilerInput();
   draft.initial_design.context_dependencies = [
     { id: 'context-main', path: '/work/project/context.md', sha256: 'b'.repeat(64) },
   ];
