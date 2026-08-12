@@ -87,4 +87,3 @@ Final readback must show no leases, no target mutation, no bypasses, two Design 
 ## Rollback
 
 Rollback changes the canonical store from `enabled` to `canary` or `disabled`; it never selects Codex V1. Reinstalling an older release does not inherit this release's canary because the manifest digest no longer matches.
-

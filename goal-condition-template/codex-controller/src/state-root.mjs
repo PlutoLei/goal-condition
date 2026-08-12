@@ -33,4 +33,3 @@ export function resolveControllerStateRoot({
   }
   return join(requireAbsolute(home), '.local', 'state', 'goal-condition', 'codex-v2');
 }
-
