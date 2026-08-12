@@ -10,6 +10,7 @@ export * from './policy.mjs';
 export * from './projector.mjs';
 export * from './recovery.mjs';
 export * from './rollout.mjs';
+export * from './state-root.mjs';
 export * from './store.mjs';
 export * from './values.mjs';
 export * from './verification.mjs';
