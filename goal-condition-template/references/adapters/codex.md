@@ -71,7 +71,7 @@ controller 被 SIGKILL 时孤儿 daemon 的归宿：app-server 走 stdio，父�
 
 `thread/start` 必须显式传 `ephemeral:false`——goal 必须挂在非 ephemeral 的 thread 上，实测 ephemeral thread 上发起 goal RPC 会被拒绝（`-32600`）。thread 就绪后由控制器调用 `thread/goal/set` 创建 goal；goal set 本身不驱动执行，必须紧接着显式调用 `turn/start {threadId, input:[{type:'text', text}]}` 才能推入真实 turn。
 
-运行期间订阅 `turn/started` 与 `turn/completed` 计 turn 边界：只要 goal 尚未达成，服务端会在一个 turn 完成后约 13ms 内自动链起下一个 turn——这是近瞬时链式，不是等 idle 窗口，adapter 不需要自实现 idle 检测。控制器额外轮询 `thread/goal/get`，配一个 wall-clock deadline（adapter 常量）；超时即终局报告。
+运行期间订阅 `turn/started` 与 `turn/completed` 计 turn 边界。服务端在 goal 仍为 `active` 时会在一个 turn 完成后约 13ms 内自动链起下一个 turn；GoalSession v2 不把这条原生续轮当成授权执行。每个 Attempt 的协议是严格一个 controller-started turn：controller 在 exact input 中禁止 `create_goal`，要求执行体只在工作确实完成时于首轮内调用 `update_goal(status="complete")`，并明确该写入只形成 Candidate、不能自认证。执行体若以 `active` 结束并触发第二轮，LaunchReceipt 的 `0→1` 栅栏将其判为 `CONTROL_PLANE_BYPASS`。控制器同时轮询 `thread/goal/get` 并施加 wall-clock deadline；无法安全形成 Candidate 时走终局报告或对账路径，而不是扩大 authorized turn 集合。
 
 两个 turn 计数落在 `turn-counts.json`，它们是**控制器观察到的通知数**，不是服务端的权威 turn 记账：控制器拿到判定的那一拍就停止观察，此刻还在飞的 turn 只记进 `started`。goal 的 `complete` 由模型在 turn 内自标，控制器看得见它**严格早于**那个 turn 结束，所以成功路径上 `completed = started - 1` 是必然而不是漏记。这句口径写在文件自身的 `semantics` 字段里——它是操作员判断「跑了几轮」的唯一依据，字面上的「差一」不解释就会被读成「最后一轮没跑完」。
 
@@ -249,7 +249,7 @@ goalRpc 是这四条通道背后的唯一执行豁口，只有主会话调用；
 
 ## blocked 终局
 
-`blocked` 不是暂停，也不是“还没做完”。只有同一阻断条件至少连续三个 goal turn 重复、无法继续取得有意义进展且确实需要用户输入或外部状态变化时，执行体才应通过 `update_goal` 把状态自标为 `blocked`——这是模型侧 tool 的合法使用场景，阈值写死在提示词里，不是控制器施加的规则。控制器观察到 `blocked` 状态后立即转入终局报告路径：按 diagnostic 报告阻断证据与下一步，不进入验收、不触发 finalize。恢复后的阻断审计重新计数；未达到阈值时保持运行、报告具体阻断证据。
+`blocked` 不是暂停，也不是“还没做完”。运行时工具只允许在同一阻断条件至少连续三个 goal turn 重复、无法继续取得有意义进展且确实需要用户输入或外部状态变化时自标 `blocked`。GoalSession v2 的单 Attempt 因果边界只有一个授权 turn，因此执行体不能为了提前结束而伪造三轮或在首轮滥用 `blocked`；首轮无法完成时不自报 complete，由 controller 的 wall-clock/turn/token 护栏形成终局报告。若原生 runtime 以合法 `blocked` 状态返回，控制器仍立即走终局报告路径，不进入验收、不触发 finalize。
 
 **`blocked` 只在工具面健康时才是一条可靠的终局路径。** 它的上报通道与被阻断的执行通道共用同一条实现：0.147 的工具调用全部经 Code Mode 路由，宿主一缺，`apply_patch`、`exec_command` 与 `update_goal` 一起失效。第二次真实冒烟实测到这个形态——执行体正确识别出自己连撞三堵墙、正确尝试自标 `blocked`、连续失败四次，并在最终答复里如实说明；它做对了每一件能做的事，但那条路本身是断的。goal 因此一直停在 `active`，控制器永远等不到这个终局信号。**唯一的阻断上报通道与被阻断的执行通道共用实现**，这是设计层面的单点，codex 侧改不了。
 

@@ -1140,6 +1140,9 @@ test('runCodexLaunch keeps the native objective short and readback attributes th
   const sentText = calls.find(([name]) => name === 'turnStart')[1].text;
   assert.match(sentText, /^LONG HASH-BOUND CONTEXT PACKAGE/);
   assert.match(sentText, /Controller Turn Correlation: [0-9a-f]{64}/);
+  assert.match(sentText, /This Attempt is exactly one controller-started native turn\./);
+  assert.match(sentText, /Before ending this turn, call `update_goal` with status `complete`/);
+  assert.doesNotMatch(sentText, /Keep working the thread until the goal reaches status "complete"/);
   assert.equal(
     launched.turnInputSha256,
     createHash('sha256').update(sentText, 'utf8').digest('hex'),

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { canonicalJson, contractHash } from '../../scripts/lib/contract.mjs';
+import { singleTurnCandidateText } from '../../scripts/lib/adapters/codex.mjs';
 import {
   createLaunchIntent,
   createLaunchReceipt,
@@ -31,13 +32,13 @@ function intentWithoutStatus(value) {
 export function attemptRuntimePrompt(projection) {
   return {
     objective: projection.manifest.objective,
-    turn_text: [
+    turn_text: singleTurnCandidateText([
       'Execute this immutable GoalSession Attempt. The Controller, not this executor, certifies completion.',
       `Context Package SHA-256: ${projection.contextPackage.sha256}`,
       projection.contextPackage.bytes,
       `Projection Proof SHA-256: ${projection.projectionProof.sha256}`,
       projection.projectionProof.bytes,
-    ].join('\n\n'),
+    ].join('\n\n')),
   };
 }
 
