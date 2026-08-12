@@ -184,6 +184,28 @@ test('Codex production guidance exposes only GoalSession v2 and one-way migratio
   }
 });
 
+test('Codex production guidance defines the canonical controller store and isolated overrides', () => {
+  const skill = read(skillPath);
+  const protocol = read(join(referencesRoot, 'codex-goal-session-v2.md'));
+  const adapter = read(join(referencesRoot, 'adapters/codex.md'));
+  const production = `${skill}\n${protocol}\n${adapter}`;
+  assert.ok(
+    REQUIRED_CORE_FILES.includes('codex-controller/src/state-root.mjs'),
+    'release inventory is missing the canonical state-root resolver',
+  );
+  for (const term of [
+    'GOAL_CONDITION_CODEX_STATE_ROOT',
+    'XDG_STATE_HOME',
+    '.local/state/goal-condition/codex-v2',
+    '独立 deployment namespace',
+    '独立 rollout',
+  ]) {
+    assert.ok(production.includes(term), `canonical controller-store guidance is missing ${term}`);
+  }
+  assert.match(protocol, /普通命令.*省略 `--state-root`/);
+  assert.match(production, /无效.*fail closed/);
+});
+
 // R-4：状态机对可续类与终局类红 postflight 返回的**都是** `reject`，真正的分流在
 // classifyPostflightRed，而那是编排器要自己调的一步。SKILL.md 此前只说「其余状态按 diagnostic 报告
 // 实际差异和下一步」——照这句字面实现的编排器拿到 reject 就去报告，resume 永远不会被发起。整条续跑

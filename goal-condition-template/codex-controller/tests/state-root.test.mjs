@@ -30,7 +30,7 @@ test('an explicit state root wins over every environment default', () => {
       GOAL_CONDITION_CODEX_STATE_ROOT: '/controller/environment',
       XDG_STATE_HOME: '/controller/xdg',
     },
-    home: '/Users/test',
+    home: '/controller/home',
   }), '/controller/explicit');
 });
 
@@ -40,22 +40,22 @@ test('the GoalSession-specific environment root wins over XDG and home', () => {
       GOAL_CONDITION_CODEX_STATE_ROOT: '/controller/environment',
       XDG_STATE_HOME: '/controller/xdg',
     },
-    home: '/Users/test',
+    home: '/controller/home',
   }), '/controller/environment');
 });
 
 test('an absolute XDG state home derives the GoalSession V2 store', () => {
   assert.equal(resolveStateRoot({
     environment: { XDG_STATE_HOME: '/controller/xdg' },
-    home: '/Users/test',
+    home: '/controller/home',
   }), '/controller/xdg/goal-condition/codex-v2');
 });
 
 test('the home fallback is deterministic when no override is present', () => {
   assert.equal(resolveStateRoot({
     environment: {},
-    home: '/Users/test',
-  }), '/Users/test/.local/state/goal-condition/codex-v2');
+    home: '/controller/home',
+  }), '/controller/home/.local/state/goal-condition/codex-v2');
 });
 
 test('a malformed higher-precedence value fails closed instead of falling through', () => {
@@ -64,20 +64,19 @@ test('a malformed higher-precedence value fails closed instead of falling throug
       GOAL_CONDITION_CODEX_STATE_ROOT: '',
       XDG_STATE_HOME: '/controller/xdg',
     },
-    home: '/Users/test',
+    home: '/controller/home',
   });
   assertInvalid({
     environment: { XDG_STATE_HOME: 'relative-xdg' },
-    home: '/Users/test',
+    home: '/controller/home',
   }, 'relative-xdg');
   assertInvalid({
     explicit: '/controller/../alias',
     environment: { GOAL_CONDITION_CODEX_STATE_ROOT: '/controller/environment' },
-    home: '/Users/test',
+    home: '/controller/home',
   }, '/controller/../alias');
 });
 
 test('an invalid home cannot create an implicit relative controller store', () => {
   assertInvalid({ environment: {}, home: 'relative-home' }, 'relative-home');
 });
-

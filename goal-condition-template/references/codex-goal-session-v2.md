@@ -8,6 +8,8 @@ node codex-controller/src/cli.mjs <command> ...
 
 Controller state 与 runtime state 必须在所有 target root 和系统临时目录之外；state/target root 及已有祖先必须使用 canonical physical path，不接受 symlink alias。每条命令 stdout 只输出一个 JSON；stderr 只输出安全错误码。Node.js 必须至少为 24.15。
 
+普通命令可以省略 `--state-root`，controller 按以下优先级只解析一次：显式 `--state-root`、`GOAL_CONDITION_CODEX_STATE_ROOT`、绝对且 normalized 的 `$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。任一已出现的高优先级值无效时立即 fail closed，不向下回退。默认路径是跨项目共享的机器级 store；显式 override 创建独立 deployment namespace，其 rollout、release-bound canary receipt、session 与 lease 都独立，缺失 rollout 仍视为 `disabled`。下文命令展示普通零配置路径；只有运维另建 namespace 时才追加 `--state-root <controller-state>`。
+
 ## 1. Rollout 与能力
 
 先用 `mode get` 读取 `disabled | canary | enabled`；输入固定为 `{"action":"get","next":null,"changed_at":null,"canary_session_id":null}`。缺失状态等于 `disabled`。controller 在 `prepare/launch/resume/verify/finalize` 现场重读 gate：`disabled` 机械阻断 live，`canary` 只供显式 V2 canary，`enabled` 是正常路由；任何状态都不得回退到 Codex v1。`disabled→canary` 绑定当前 controller release digest；`canary→enabled` 还必须给出同一 store 中、同一 release 完成动态 Revision 与完整 native receipt/Evidence 的 Certified Session ID。release digest 不匹配时 fail closed。旧 schema-v3 state 只转换一次：`shadow→disabled`、`opt-in→canary`、`default|legacy-freeze→enabled`；新写入只使用 schema-v4 和新词汇。
@@ -29,9 +31,9 @@ Controller state 与 runtime state 必须在所有 target root 和系统临时�
 完整输入直接编译，不运行 Grill。draft 的 `root_baseline.digest` 可先放合法占位 SHA-256；`init --capture-baseline true` 会在确认前由 controller 捕获真实 baseline、重新编译并把 snapshot 写入 CAS。
 
 ```text
-init --state-root <controller-state> --input <draft.json> --capture-baseline true
-preview --state-root <controller-state> --session-id <session-id>
-confirm --state-root <controller-state> --session-id <session-id> --input <confirmation.json>
+init --input <draft.json> --capture-baseline true
+preview --session-id <session-id>
+confirm --session-id <session-id> --input <confirmation.json>
 ```
 
 必须把 `preview.markdown` 完整展示给用户，并请其确认当前 `authorization_hash`。初始 Context dependency 会逐项显示 stable path 与 content SHA-256，且路径必须位于 Initial Active Boundary 内；不得把未展示的 target 外宿主路径注入执行器。confirmation 输入：
@@ -65,8 +67,8 @@ prepare 输入：
 ```
 
 ```text
-prepare --state-root <controller-state> --session-id <session-id> --input <prepare.json>
-launch --state-root <controller-state> --session-id <session-id> \
+prepare --session-id <session-id> --input <prepare.json>
+launch --session-id <session-id> \
   --run-id <run-id> --runtime-root <runtime-state> --deadline-ms <positive-ms>
 ```
 
@@ -79,7 +81,7 @@ prepare 由 controller 读回 root baseline、核当前 workspace、投影 immut
 候选出现后运行：
 
 ```text
-verify --state-root <controller-state> --session-id <session-id> --attempt-id <attempt-id> \
+verify --session-id <session-id> --attempt-id <attempt-id> \
   --run-id <run-id> --runtime-root <runtime-state>
 ```
 
@@ -88,10 +90,10 @@ verify --state-root <controller-state> --session-id <session-id> --attempt-id <a
 verify 红，或 Candidate 阶段的新 reviewer 发现 Authority 内缺口时，把 controller 事实编译为封闭 typed operation，调用 `revise`；revision 输入只有 `operation`，不接受调用方提供的 `controller_facts` 布尔值。`auto_apply` 后先 `close` 被取代 Attempt，释放它的 target-root lease，再用新的 `attempt_id/run_id/nonce` 调 `resume`；GoalSession 层的 resume 是新 immutable Attempt，不复用旧 candidate：
 
 ```text
-revise --state-root <controller-state> --session-id <session-id> --input <revision.json>
-close --state-root <controller-state> --session-id <session-id> \
+revise --session-id <session-id> --input <revision.json>
+close --session-id <session-id> \
   --run-id <prior-run-id> --runtime-root <runtime-state>
-resume --state-root <controller-state> --session-id <session-id> \
+resume --session-id <session-id> \
   --runtime-root <runtime-state> --input <next-attempt.json>
 ```
 
@@ -102,9 +104,9 @@ resume --state-root <controller-state> --session-id <session-id> \
 只有 verify 返回 `completion.level="certified"` 才允许：
 
 ```text
-finalize --state-root <controller-state> --session-id <session-id> \
+finalize --session-id <session-id> \
   --run-id <run-id> --runtime-root <runtime-state>
-close --state-root <controller-state> --session-id <session-id> \
+close --session-id <session-id> \
   --run-id <run-id> --runtime-root <runtime-state>
 ```
 
@@ -113,7 +115,7 @@ finalize 在任何 terminal mutation 前、goal-set/get 后各执行一次 `thre
 恢复只运行：
 
 ```text
-reconcile --state-root <controller-state> --session-id <session-id> \
+reconcile --session-id <session-id> \
   --run-id <run-id> --runtime-root <runtime-state>
 ```
 

@@ -42,14 +42,14 @@ assert.equal(typeof resolveControllerStateRoot, 'function');
 assert.equal(resolveControllerStateRoot({
   explicit: '/controller/explicit',
   environment: { GOAL_CONDITION_CODEX_STATE_ROOT: '/controller/env' },
-  home: '/Users/test',
+  home: '/controller/home',
 }), '/controller/explicit');
 assert.equal(resolveControllerStateRoot({
   environment: { XDG_STATE_HOME: '/controller/xdg' },
-  home: '/Users/test',
+  home: '/controller/home',
 }), '/controller/xdg/goal-condition/codex-v2');
 assert.throws(
-  () => resolveControllerStateRoot({ environment: { XDG_STATE_HOME: 'relative' }, home: '/Users/test' }),
+  () => resolveControllerStateRoot({ environment: { XDG_STATE_HOME: 'relative' }, home: '/controller/home' }),
   (error) => error.code === 'STATE_ROOT_INVALID',
 );
 ```

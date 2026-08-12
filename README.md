@@ -147,6 +147,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `codex-controller/src/recovery.mjs`
 - `codex-controller/src/release.mjs`
 - `codex-controller/src/rollout.mjs`
+- `codex-controller/src/state-root.mjs`
 - `codex-controller/src/store.mjs`
 - `codex-controller/src/values.mjs`
 - `codex-controller/src/verification.mjs`

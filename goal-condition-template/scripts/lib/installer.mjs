@@ -35,6 +35,7 @@ export const REQUIRED_CORE_FILES = Object.freeze([
   'codex-controller/src/recovery.mjs',
   'codex-controller/src/release.mjs',
   'codex-controller/src/rollout.mjs',
+  'codex-controller/src/state-root.mjs',
   'codex-controller/src/store.mjs',
   'codex-controller/src/values.mjs',
   'codex-controller/src/verification.mjs',
