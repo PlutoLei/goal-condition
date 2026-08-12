@@ -55,6 +55,7 @@ export const REQUIRED_CORE_FILES = Object.freeze([
   'scripts/launch.mjs',
   'scripts/lib/adapters/claude.mjs',
   'scripts/lib/adapters/codex.mjs',
+  'scripts/lib/claude-permissions.mjs',
 ]);
 const REQUIRED_CORE_SET = new Set(REQUIRED_CORE_FILES);
 const SHA256 = /^[0-9a-f]{64}$/;

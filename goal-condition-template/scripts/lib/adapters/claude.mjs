@@ -2,6 +2,10 @@
 
 import { join } from 'node:path';
 
+import {
+  assertPermissionSpecifier, permissionRule, permissionSpecifierProblem,
+} from '../claude-permissions.mjs';
+
 // 版本闸是**下限**不是精确 allowlist。它想挡的是 result envelope 形状漂移，可那是个代理指标——
 // 真正要防的东西下面的 21-key 全集校验已经**直接**在管：envelope 没变的新版本被精确 allowlist 拦下
 // 是纯误杀，envelope 真变了的新版本直检照样红且诊断更精确。代理指标严于直接指标，代价却是 claude
@@ -46,15 +50,22 @@ export function normalizeTerminal(raw) {
   }
   // 锚按 subtype 二选一：error_max_turns 走 17-key error 锚，其余（含未知 error subtype）一律
   // 按 21-key 成功锚判。两个锚都是全集相等校验，互斥不重叠。
-  const budgetExhausted = raw.subtype === 'error_max_turns';
-  const anchor = budgetExhausted ? CLAUDE_ERROR_MAX_TURNS_KEYS : CLAUDE_RESULT_KEYS;
-  const anchorSet = budgetExhausted ? ERROR_MAX_TURNS_KEYS : EXPECTED_KEYS;
-  const table = budgetExhausted ? 'CLAUDE_ERROR_MAX_TURNS_KEYS' : 'CLAUDE_RESULT_KEYS';
+  const usesMaxTurnsAnchor = raw.subtype === 'error_max_turns';
+  const budgetExhausted = usesMaxTurnsAnchor
+    && raw.type === 'result'
+    && raw.is_error === true
+    && raw.terminal_reason === 'max_turns';
+  const anchor = usesMaxTurnsAnchor ? CLAUDE_ERROR_MAX_TURNS_KEYS : CLAUDE_RESULT_KEYS;
+  const anchorSet = usesMaxTurnsAnchor ? ERROR_MAX_TURNS_KEYS : EXPECTED_KEYS;
+  const table = usesMaxTurnsAnchor ? 'CLAUDE_ERROR_MAX_TURNS_KEYS' : 'CLAUDE_RESULT_KEYS';
   const missing = anchor.filter((key) => !Object.hasOwn(raw, key));
   const unknown = Object.keys(raw).filter((key) => !anchorSet.has(key));
   const reasons = [];
   if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${driftHint(table)}`);
   if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${driftHint(table)}`);
+  if (usesMaxTurnsAnchor && !budgetExhausted) {
+    reasons.push('Claude error_max_turns result does not match the measured discriminator tuple');
+  }
   if (reasons.length) return { ok: false, reasons };
   // budgetExhausted 是给控制器报告体的路由信号（「预算耗尽、可续跑」），不进 candidate——
   // candidate 恒为 4 字段：workflow.mjs 的 claudeTerminalState 做闭世界形状检查，多一个字段
@@ -148,11 +159,20 @@ export function buildSettings({
   const inferredBashPrefixes = (contract.postflight ?? [])
     .map((entry) => entry?.argv?.[0])
     .filter((value) => typeof value === 'string' && value.length > 0);
+  for (const value of [
+    ...inferredBashPrefixes,
+    ...(execution.bash_prefixes ?? []),
+    ...(execution.webfetch_domains ?? []),
+    ...(execution.skills ?? []),
+    hookScriptPath,
+    stateDir,
+    ...targetRoots,
+  ]) assertPermissionSpecifier(value);
   const allow = [
     ...unique([...inferredBashPrefixes, ...(execution.bash_prefixes ?? [])])
-      .map((prefix) => `Bash(${prefix}:*)`),
-    ...(execution.webfetch_domains ?? []).map((domain) => `WebFetch(domain:${domain})`),
-    ...(execution.skills ?? []).map((skill) => `Skill(${skill})`),
+      .map((prefix) => permissionRule('Bash', `${prefix}:*`)),
+    ...(execution.webfetch_domains ?? []).map((domain) => permissionRule('WebFetch', `domain:${domain}`)),
+    ...(execution.skills ?? []).map((skill) => permissionRule('Skill', skill)),
   ];
   const canonicalTargets = unique(targetRoots);
   const additionalDirectories = unique([
@@ -160,8 +180,8 @@ export function buildSettings({
     ...additionalReadRoots,
   ]);
   const projectSettingsDeny = canonicalTargets.flatMap((root) => [
-    `Edit(/${join(root, '.claude', 'settings.json')})`,
-    `Edit(/${join(root, '.claude', 'settings.local.json')})`,
+    permissionRule('Edit', `/${join(root, '.claude', 'settings.json')}`),
+    permissionRule('Edit', `/${join(root, '.claude', 'settings.local.json')}`),
   ]);
   return {
     hooks: { Stop: [{ hooks: [{ type: 'command', command: `node ${shellSingleQuote(hookScriptPath)}` }] }] },
@@ -170,7 +190,11 @@ export function buildSettings({
     // deny 路径必须是 realpath 规范形（/var/folders vs /private/var/folders 的字面失配会让 deny 落空）。
     permissions: {
       allow,
-      deny: [`Edit(/${hookScriptPath})`, `Edit(/${stateDir}/**)`, ...projectSettingsDeny],
+      deny: [
+        permissionRule('Edit', `/${hookScriptPath}`),
+        permissionRule('Edit', `/${stateDir}/**`),
+        ...projectSettingsDeny,
+      ],
       additionalDirectories,
     },
   };
@@ -273,6 +297,18 @@ export function assertLaunchable(contract, probes) {
   const hook = probes?.hookScript;
   const permissions = probes?.settings?.permissions ?? {};
   const deny = permissions.deny ?? [];
+  const permissionInputs = [
+    ...(contract?.postflight ?? []).map((entry) => entry?.argv?.[0]),
+    ...(contract?.execution_permissions?.bash_prefixes ?? []),
+    ...(contract?.execution_permissions?.webfetch_domains ?? []),
+    ...(contract?.execution_permissions?.skills ?? []),
+    probes?.stateDir,
+    hook?.path,
+    ...(probes?.targetRoots ?? []),
+  ];
+  if (permissionInputs.some((value) => permissionSpecifierProblem(value) !== null)) {
+    reasons.push('a value entering the Claude permission specifier DSL is not representable');
+  }
   if (!hook?.exists) reasons.push('hook script is not on disk in controller state');
   if (hook?.sha256 !== probes?.expectedHookSha256) reasons.push('hook script bytes do not match the generated script');
   if (hook?.mode !== '0500') reasons.push('hook script mode must be 0500');

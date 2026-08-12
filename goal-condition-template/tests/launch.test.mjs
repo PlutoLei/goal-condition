@@ -461,7 +461,7 @@ test('runClaudeAttempt(kind=launch) on a green probe set produces a candidate an
   assert.ok(stub.calls[0].args.includes('-p'));
   assert.ok(stub.calls[0].args.includes('OBJECTIVE TEXT'));
   assert.ok(stub.calls[0].args.includes('--settings'));
-  assert.equal(stub.calls[0].options.cwd, workDir);
+  assert.equal(stub.calls[0].options.cwd, realpathSync(workDir));
   assert.equal(stub.calls[0].options.maxBuffer, 32 * 1024 * 1024);
 
   // 会话身份由控制器预派：argv 里的 --session-id 是 UUID，返回体与指针都必须是同一个值。
@@ -475,7 +475,7 @@ test('runClaudeAttempt(kind=launch) on a green probe set produces a candidate an
   assert.deepEqual(candidateOnDisk, result.candidate);
   const threadOnDisk = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
   assert.equal(threadOnDisk.sessionId, issued);
-  assert.equal(threadOnDisk.cwd, workDir);
+  assert.equal(threadOnDisk.cwd, realpathSync(workDir));
   assert.equal(threadOnDisk.promptSha256, createHash('sha256').update('OBJECTIVE TEXT', 'utf8').digest('hex'));
   assert.ok(threadOnDisk.transcriptPath.endsWith(`/${issued}.jsonl`));
   const rawOnDisk = JSON.parse(await readFile(join(stateDir, 'attempts', '1-result.json'), 'utf8'));
@@ -608,7 +608,7 @@ test('runClaudeAttempt writes the session pointer before spawning the executor',
 
   assert.equal(result.outcome, 'candidate');
   assert.equal(pointerAtSpawn.sessionId, sessionFromArgs(calls[0].args));
-  assert.equal(pointerAtSpawn.cwd, workDir);
+  assert.equal(pointerAtSpawn.cwd, realpathSync(workDir));
   assert.equal(typeof pointerAtSpawn.promptSha256, 'string');
   assert.equal(typeof pointerAtSpawn.transcriptPath, 'string');
 });
@@ -634,7 +634,7 @@ test('runClaudeAttempt refuses a second launch instead of replacing the claimed 
   assert.equal(launched.sessionId, JSON.parse(pointerBefore).sessionId);
 });
 
-test('runClaudeAttempt replaces a dangling thread pointer without following it outside controller state', async (t) => {
+test('runClaudeAttempt fails closed on a dangling thread pointer without following or replacing it', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
   const victimDir = await mkdtemp(join(tmpdir(), 'gc-thread-pointer-victim-'));
   t.after(() => rm(victimDir, { recursive: true, force: true }));
@@ -643,14 +643,91 @@ test('runClaudeAttempt replaces a dangling thread pointer without following it o
   await symlink(victim, pointerPath);
   assert.equal(existsSync(pointerPath), false, 'the setup must be a dangling symlink');
 
+  const stub = stubEchoing(claudeResultFixture);
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch',
-    execFileImpl: stubEchoing(claudeResultFixture).impl,
+    execFileImpl: stub.impl,
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.equal(result.attemptNumber, null);
+  assert.ok(result.reasons.some((reason) => reason.includes('invalid')));
+  assert.equal(stub.calls.length, 0);
+  assert.equal(existsSync(victim), false);
+  assert.equal((await lstat(pointerPath)).isSymbolicLink(), true);
+});
+
+test('runClaudeAttempt fails closed on malformed launch and resume pointers without spawning', async (t) => {
+  for (const [kind, contents] of [
+    ['launch', '{broken json'],
+    ['launch', JSON.stringify({ sessionId: '' })],
+    ['resume', JSON.stringify({ sessionId: 'not-a-uuid' })],
+  ]) {
+    const { stateDir, contract, binding } = await setupClaudeState(t);
+    await writeFile(join(stateDir, 'thread.json'), contents);
+    const stub = stubEchoing(claudeResultFixture);
+    const result = await runClaudeAttempt({
+      contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', diagnosticText: 'continue', kind,
+      execFileImpl: stub.impl,
+    });
+    assert.equal(result.outcome, 'terminal_report', kind);
+    assert.equal(result.attemptNumber, null, kind);
+    assert.ok(result.reasons.some((reason) => reason.includes('invalid')), kind);
+    assert.equal(stub.calls.length, 0, kind);
+  }
+});
+
+test('runClaudeAttempt uses the canonical cwd even if the lexical target symlink is retargeted before dispatch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-canonical-cwd-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const targetA = join(root, 'target-a');
+  const targetB = join(root, 'target-b');
+  const linked = join(root, 'linked-target');
+  await mkdir(targetA);
+  await mkdir(targetB);
+  await symlink(targetA, linked);
+  const contract = makeContract({ target_roots: [linked] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+    beforeDispatch: async () => {
+      await rm(linked);
+      await symlink(targetB, linked);
+    },
   });
 
   assert.equal(result.outcome, 'candidate');
-  assert.equal(existsSync(victim), false);
-  assert.equal((await lstat(pointerPath)).isFile(), true);
+  const canonicalA = realpathSync(targetA);
+  assert.equal(stub.calls[0].options.cwd, canonicalA);
+  const settings = JSON.parse(await readFile(join(setup.stateDir, 'settings.json'), 'utf8'));
+  assert.ok(settings.permissions.deny.includes(`Edit(/${join(canonicalA, '.claude', 'settings.json')})`));
+  assert.ok(!settings.permissions.deny.includes(`Edit(/${join(targetB, '.claude', 'settings.json')})`));
+});
+
+test('runClaudeAttempt rechecks canonical target identity immediately before dispatch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-target-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  const moved = join(root, 'target-old');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+    beforeDispatch: async () => {
+      const { rename } = await import('node:fs/promises');
+      await rename(target, moved);
+      await mkdir(target);
+    },
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('identity changed')));
+  assert.equal(stub.calls.length, 0);
 });
 
 test('an error_max_turns hard stop keeps the pointer and resumes without surgery', async (t) => {
@@ -734,11 +811,15 @@ async function plantReadbackState({ pointer, transcriptLines }) {
   return { stateDir, transcriptPath };
 }
 
+const READBACK_UUID_1 = '11111111-1111-4111-8111-111111111111';
+const READBACK_UUID_2 = '22222222-2222-4222-8222-222222222222';
+const READBACK_UUID_3 = '33333333-3333-4333-8333-333333333333';
+
 test('runClaudeReadback reports liveness and prompt attribution without leaking transcript bytes or coordinates', async () => {
   const prompt = 'SECRET OBJECTIVE do not leak';
   const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
   const { stateDir } = await plantReadbackState({
-    pointer: { sessionId: 'sid-1', cwd: '/work/root', promptSha256 },
+    pointer: { sessionId: READBACK_UUID_1, cwd: '/work/root', promptSha256 },
     transcriptLines: [
       { type: 'queue-operation' },
       { type: 'user', message: { content: prompt } },                       // string 形态（S-C 实测）
@@ -755,15 +836,26 @@ test('runClaudeReadback reports liveness and prompt attribution without leaking 
   // 零字节出境：报告体里不允许出现 transcript 的任何内容。
   const serialized = JSON.stringify(report);
   assert.ok(!serialized.includes('SECRET'));
-  assert.ok(!serialized.includes('sid-1'));
+  assert.ok(!serialized.includes(READBACK_UUID_1));
   assert.ok(!serialized.includes(stateDir));
   assert.equal(Object.hasOwn(report, 'sessionId'), false);
   assert.equal(Object.hasOwn(report, 'transcriptPath'), false);
 });
 
+test('runClaudeReadback maps an arbitrary transcript type to a fixed privacy-safe enum', async () => {
+  const { stateDir } = await plantReadbackState({
+    pointer: { sessionId: READBACK_UUID_1, cwd: '/work/root', promptSha256: 'a'.repeat(64) },
+    transcriptLines: [{ type: 'SECRET TYPE BYTES must not escape' }],
+  });
+  const report = await runClaudeReadback({ stateDir });
+  assert.equal(report.available, true);
+  assert.equal(report.lastEntryType, 'unknown');
+  assert.ok(!JSON.stringify(report).includes('SECRET'));
+});
+
 test('runClaudeReadback handles array-form user content and flags a mismatched prompt', async () => {
   const { stateDir } = await plantReadbackState({
-    pointer: { sessionId: 'sid-2', cwd: '/w', promptSha256: 'a'.repeat(64) },
+    pointer: { sessionId: READBACK_UUID_2, cwd: '/w', promptSha256: 'a'.repeat(64) },
     transcriptLines: [{ type: 'user', message: { content: [{ type: 'text', text: 'something else' }] } }],
   });
   const report = await runClaudeReadback({ stateDir });
@@ -785,7 +877,7 @@ test('runClaudeReadback fails open on every unavailable shape', async () => {
   assert.equal((await runClaudeReadback({ stateDir: old.stateDir })).available, false);
   // 指针形态齐全但 transcript 不在（slug 规则漂移或会话未起）。
   const gone = await plantReadbackState({
-    pointer: { sessionId: 'sid-3', cwd: '/w', promptSha256: 'a'.repeat(64), transcriptPath: join(empty, 'nope.jsonl') },
+    pointer: { sessionId: READBACK_UUID_3, cwd: '/w', promptSha256: 'a'.repeat(64), transcriptPath: join(empty, 'nope.jsonl') },
   });
   const goneReport = await runClaudeReadback({ stateDir: gone.stateDir });
   assert.equal(goneReport.available, false);

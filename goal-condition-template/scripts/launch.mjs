@@ -4,9 +4,10 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import {
   appendFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync,
+  constants,
 } from 'node:fs';
 import {
-  appendFile, chmod, lstat, mkdir, readdir, readFile, rm, writeFile,
+  appendFile, chmod, lstat, mkdir, open, readdir, readFile, rm, stat, writeFile,
 } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
@@ -67,6 +68,51 @@ function canonicalPath(pathname) {
   } catch {
     return pathname;
   }
+}
+
+const CLAUDE_POINTER_KEYS = Object.freeze(['cwd', 'promptSha256', 'sessionId', 'transcriptPath']);
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Controller claims are read through a descriptor with O_NOFOLLOW and must be private regular files.
+// This avoids the lstat-then-read race and makes a symlink/hardlink an invalid claim, never an invitation
+// to replace or follow it.
+async function readControllerJsonNoFollow(pathname) {
+  if (typeof constants.O_NOFOLLOW !== 'number') {
+    return { ok: false, missing: false };
+  }
+  let handle;
+  try {
+    handle = await open(pathname, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    return { ok: false, missing: error?.code === 'ENOENT' };
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.nlink !== 1) return { ok: false, missing: false };
+    try {
+      return { ok: true, missing: false, value: JSON.parse(await handle.readFile('utf8')) };
+    } catch {
+      return { ok: false, missing: false };
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
+function isClaudePointer(value) {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
+  if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(CLAUDE_POINTER_KEYS)) return false;
+  if (!UUID_V4.test(value.sessionId)) return false;
+  if (typeof value.cwd !== 'string' || !isAbsolute(value.cwd)) return false;
+  if (!HEX64.test(value.promptSha256)) return false;
+  if (typeof value.transcriptPath !== 'string' || !isAbsolute(value.transcriptPath)) return false;
+  return true;
+}
+
+async function observeTargetIdentity(pathname) {
+  const st = await stat(pathname);
+  if (!st.isDirectory()) throw new Error('target root is not a directory');
+  return { dev: st.dev, ino: st.ino };
 }
 
 export function stateDirFor({ stateRoot, controller = 'default', contractHash }) {
@@ -411,6 +457,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // not ok→终局报告）。候选与终局都不做 postflight——那是主会话的独立职责。
 export async function runClaudeAttempt({
   contract, stateDir, prompt, kind, diagnosticText, binding, execFileImpl = execFile,
+  beforeDispatch = async () => {},
 }) {
   // attempt 号只在所有前置闸全绿、真要 spawn 执行器时才占（第二次冒烟 N-2）：占位不可撤销，
   // 而前置闸拒绝的原因经常在 contract 之外（binding 笔误、claude 版本掉出 allowlist、hook 文件
@@ -449,9 +496,26 @@ export async function runClaudeAttempt({
   const expectedHookSha256 = createHash('sha256').update(script, 'utf8').digest('hex');
   const targetRoots = (contract.target_roots ?? []).map(canonicalPath);
   const additionalReadRoots = (contract.execution_permissions?.additional_read_roots ?? []).map(canonicalPath);
-  const settings = buildSettings({
-    contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
-  });
+  let targetRootIdentities;
+  try {
+    targetRootIdentities = await Promise.all(targetRoots.map(observeTargetIdentity));
+  } catch {
+    return finish({
+      outcome: 'terminal_report',
+      reasons: ['a canonical target root is not a readable directory, so its launch identity cannot be bound'],
+    });
+  }
+  let settings;
+  try {
+    settings = buildSettings({
+      contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
+    });
+  } catch {
+    return finish({
+      outcome: 'terminal_report',
+      reasons: ['Claude permission settings contain an invalid permission specifier and cannot be compiled'],
+    });
+  }
   const settingsPath = join(realStateDir, 'settings.json');
   // hook 脚本走的是「读磁盘 bytes → 与现场重算的 sha256 比对」，settings.json 此前没有同等待遇：
   // 判定的是上一行这个内存对象，交给 claude 的却是磁盘上的 settingsPath（re-review I1b 实测：把
@@ -486,25 +550,23 @@ export async function runClaudeAttempt({
     return finish({ outcome: 'terminal_report', reasons: verdict.reasons });
   }
 
-  const cwd = contract.target_roots[0];
-  const threadPath = join(stateDir, 'thread.json');
+  const cwd = targetRoots[0];
+  const threadPath = join(realStateDir, 'thread.json');
 
   let spec;
   let sessionId;
   if (kind === 'launch') {
     // 一次逻辑 run 只能 claim 一个 Claude 会话。已有可读指针时再次 launch 会把 resume 坐标
     // 换成新会话，与「1 launch + ≤2 resume」和 claim 后只 readback/reconcile 的恢复模型都冲突。
-    // 损坏/不可读的残留不被当成有效 claim；下面的 writeReplacing 会以不跟随链接的方式换掉它。
-    try {
-      const prior = JSON.parse(await readFile(threadPath, 'utf8'));
-      if (typeof prior?.sessionId === 'string' && prior.sessionId.length > 0) {
-        return finish({
-          outcome: 'terminal_report',
-          reasons: ['this run already claimed a claude session; use resume or readback instead of launching again'],
-        });
-      }
-    } catch {
-      // 没有可读的有效 claim；首发可以继续，安全替换在占号之后执行。
+    // 损坏/不可读/链接形态都意味着 claim 状态不可证明，必须显式恢复，不能覆写后另起会话。
+    const prior = await readControllerJsonNoFollow(threadPath);
+    if (!prior.missing) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: [prior.ok && isClaudePointer(prior.value)
+          ? 'this run already claimed a claude session; use resume or readback instead of launching again'
+          : 'thread.json exists but is invalid; recover it explicitly instead of launching a second session'],
+      });
     }
     // claim-before-dispatch（借 codex GoalSession v2 的 LaunchIntent 语义）：会话身份由控制器
     // 预派，resume 指针在 spawn 之前落盘（见占号后那一步）。2026-08-10 真实 run 的 resume 死锁
@@ -514,14 +576,20 @@ export async function runClaudeAttempt({
       prompt, settingsPath, cwd, budget: contract.budget, sessionId,
     });
   } else if (kind === 'resume') {
-    try {
-      ({ sessionId } = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8')));
-    } catch {
+    const prior = await readControllerJsonNoFollow(threadPath);
+    if (prior.missing) {
       return finish({
         outcome: 'terminal_report',
         reasons: ['no thread.json in state dir: cannot resume without a prior session id'],
       });
     }
+    if (!prior.ok || !isClaudePointer(prior.value)) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['thread.json exists but is invalid; recover the controller-issued pointer before resume'],
+      });
+    }
+    ({ sessionId } = prior.value);
     spec = resumeSpec({
       sessionId, settingsPath, diagnosticText, cwd, budget: contract.budget,
     });
@@ -537,12 +605,41 @@ export async function runClaudeAttempt({
     // resume 都有指针可用。promptSha256/transcriptPath 只供 readback 归因与观测（fail-open 通道），
     // resume 只消费 sessionId。spawn 未成功而指针已在的形态是 fail-closed 的：resume 会对不存在
     // 的会话报错、落终局报告，不会伪装成候选。
-    await writeReplacing(threadPath, JSON.stringify({
-      sessionId,
-      cwd,
-      promptSha256: createHash('sha256').update(prompt, 'utf8').digest('hex'),
-      transcriptPath: claudeTranscriptPath({ cwd, sessionId }),
-    }, null, 2), 0o600);
+    try {
+      await writeFile(threadPath, JSON.stringify({
+        sessionId,
+        cwd,
+        promptSha256: createHash('sha256').update(prompt, 'utf8').digest('hex'),
+        transcriptPath: claudeTranscriptPath({ cwd, sessionId }),
+      }, null, 2), { flag: 'wx', mode: 0o600 });
+    } catch {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['thread.json was claimed concurrently or is invalid; refusing to dispatch a second session'],
+      });
+    }
+  }
+
+  // The permission rules and cwd are bound to the same canonical roots. Recheck device/inode after
+  // every async claim step and immediately before spawn so replacing a canonical directory cannot
+  // redirect execution into a repository whose project settings were never denied.
+  await beforeDispatch({ cwd, targetRoots: [...targetRoots] });
+  try {
+    for (let index = 0; index < targetRoots.length; index += 1) {
+      const current = await observeTargetIdentity(targetRoots[index]);
+      const bound = targetRootIdentities[index];
+      if (current.dev !== bound.dev || current.ino !== bound.ino) {
+        return finish({
+          outcome: 'terminal_report',
+          reasons: ['canonical target root identity changed before dispatch; refusing to spawn Claude'],
+        });
+      }
+    }
+  } catch {
+    return finish({
+      outcome: 'terminal_report',
+      reasons: ['canonical target root identity changed before dispatch; refusing to spawn Claude'],
+    });
   }
 
   let raw;
@@ -605,16 +702,18 @@ export async function runClaudeAttempt({
 // 它的结论也不进任何 controller 证据通道——这是给「干完了还是卡住了」的独立观测面，处置
 // （kill / resume / 继续等）留给人工决策。
 export async function runClaudeReadback({ stateDir }) {
-  let pointer;
-  try {
-    pointer = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
-  } catch {
+  const pointerRead = await readControllerJsonNoFollow(join(stateDir, 'thread.json'));
+  if (pointerRead.missing) {
     return { available: false, reasons: ['no readable thread.json in the state dir'] };
   }
+  if (!pointerRead.ok) {
+    return { available: false, reasons: ['thread.json exists but is invalid or unsafe to read'] };
+  }
+  const pointer = pointerRead.value;
   if (typeof pointer?.threadId === 'string') {
     return { available: false, reasons: ['this state dir belongs to a codex run: readback here is claude-only'] };
   }
-  if (typeof pointer?.sessionId !== 'string' || typeof pointer?.transcriptPath !== 'string') {
+  if (!isClaudePointer(pointer)) {
     return {
       available: false,
       reasons: ['thread.json predates the pointer shape with transcriptPath: launch under the current adapter to enable readback'],
@@ -645,7 +744,11 @@ export async function runClaudeReadback({ stateDir }) {
     } catch {
       continue;
     }
-    if (typeof entry?.type === 'string') lastEntryType = entry.type;
+    if (typeof entry?.type === 'string') {
+      lastEntryType = new Set([
+        'assistant', 'user', 'system', 'result', 'queue-operation', 'progress', 'summary',
+      ]).has(entry.type) ? entry.type : 'unknown';
+    }
     if (firstUserSha256 === null && entry?.type === 'user') {
       const content = entry?.message?.content;
       const textPart = typeof content === 'string' ? content

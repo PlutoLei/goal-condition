@@ -78,6 +78,19 @@ test('a measured error_max_turns envelope is a budget-exhausted candidate, not a
   assert.equal(verdict.ok, false);
 });
 
+test('error_max_turns routing requires the complete measured discriminator tuple', () => {
+  for (const [field, value] of [
+    ['type', 'assistant'],
+    ['is_error', false],
+    ['terminal_reason', 'completed'],
+  ]) {
+    const normalized = normalizeTerminal({ ...errorMaxTurnsResult, [field]: value });
+    assert.equal(normalized.ok, false, `${field} must be value-anchored`);
+    assert.ok(normalized.reasons.some((reason) => reason.includes('discriminator')));
+    assert.equal(normalized.budgetExhausted, undefined);
+  }
+});
+
 test('the success path reports budgetExhausted=false explicitly', () => {
   assert.equal(normalizeTerminal(realResult).budgetExhausted, false);
 });
@@ -227,6 +240,21 @@ test('buildSettings shell-escapes hostile paths with POSIX single quotes', () =>
   assert.equal(hostile.hooks.Stop[0].hooks[0].command, "node '/tmp/a$b`c'\\''d/stop-hook.mjs'");
 });
 
+test('buildSettings rejects every unrepresentable value interpolated into permission rules', () => {
+  const cases = [
+    { hookScriptPath: '/state/bad)/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'] },
+    { hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/bad)', targetRoots: ['/work/root'] },
+    { hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/bad) Bash(evil'] },
+    {
+      contract: { ...hookContract, execution_permissions: { bash_prefixes: ['safe) Bash(evil'] } },
+      hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+    },
+  ];
+  for (const input of cases) {
+    assert.throws(() => buildSettings(input), /permission specifier/i);
+  }
+});
+
 const goodProbes = Object.freeze({
   contractHash: 'a'.repeat(64), confirmedHash: 'a'.repeat(64), baselineDigestStored: true,
   claudeVersion: '2.1.223',
@@ -305,6 +333,27 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
     assert.equal(verdict.ok, false);
     assert.ok(verdict.reasons.length > 0);
   }
+});
+
+test('assertLaunchable independently rejects a direct-call permission DSL bypass', () => {
+  const hostileContract = {
+    ...hookContract,
+    execution_permissions: { bash_prefixes: ['safe) Bash(evil'] },
+  };
+  const hostileSettings = structuredClone(goodProbes.settings);
+  hostileSettings.permissions.allow = [
+    'Bash(npm:*)', 'Bash(test:*)', 'Bash(safe) Bash(evil:*)',
+  ];
+  const verdict = assertLaunchable(hostileContract, { ...goodProbes, settings: hostileSettings });
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.reasons.some((reason) => reason.includes('permission specifier')));
+
+  const hostilePath = assertLaunchable(hookContract, {
+    ...goodProbes,
+    stateDir: '/state/bad)',
+  });
+  assert.equal(hostilePath.ok, false);
+  assert.ok(hostilePath.reasons.some((reason) => reason.includes('permission specifier')));
 });
 
 // 版本闸是下限不是精确 allowlist：精确 allowlist 每次 claude 升版都会挡下合法 launch（2026-08-09

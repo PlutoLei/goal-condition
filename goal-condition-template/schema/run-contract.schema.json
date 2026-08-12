@@ -34,6 +34,12 @@
     "preflight": {"type": "array", "items": {"$ref": "#/$defs/preflightEntry"}, "minItems": 1},
     "postflight": {"type": "array", "items": {"$ref": "#/$defs/commandEntry"}, "minItems": 1}
   },
+  "allOf": [
+    {
+      "if": {"required": ["execution_permissions"]},
+      "then": {"properties": {"runtime": {"const": "claude"}}}
+    }
+  ],
   "$defs": {
     "nonEmptyString": {"type": "string", "minLength": 1},
     "pathList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},

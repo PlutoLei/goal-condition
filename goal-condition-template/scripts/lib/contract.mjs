@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { isAbsolute, normalize } from 'node:path';
 import { TextDecoder } from 'node:util';
 
+import { permissionSpecifierProblem } from './claude-permissions.mjs';
+
 // This is a deliberately narrow, deterministic validator for this repository's
 // run contract. It is not a general JSON Schema Draft validator.
 export const CONTRACT_FIELD_TABLES = Object.freeze({
@@ -295,8 +297,7 @@ function validateExecutionPermissions(diagnostics, value, runtime) {
       // Claude 权限规则是 Tool(specifier) 字符串 DSL，官方没有转义语法。允许右括号或换行进入
       // specifier 会越过编译器生成的边界；前后空白也会改变 prefix 匹配语义。因此不可无损表示的
       // 值在 contract 层直接拒绝，不能到 buildSettings 再猜。
-      if (typeof entry === 'string'
-        && (entry !== entry.trim() || /[()\r\n]/.test(entry))) {
+      if (typeof entry === 'string' && permissionSpecifierProblem(entry) !== null) {
         diagnostics.push(diagnostic(
           'PERMISSION_SPECIFIER_UNREPRESENTABLE', entryPath, entry,
           'trimmed permission specifier without parentheses or line breaks',
@@ -449,6 +450,17 @@ export function validateContract(value) {
   const entryIds = new Set();
   validateContextSources(diagnostics, value.context_sources, entryIds);
   validatePathArray(diagnostics, value.target_roots, 'target_roots', { temporaryCode: 'TEMP_PATH', minItems: 1 });
+  if (value.runtime === 'claude' && Array.isArray(value.target_roots)) {
+    value.target_roots.forEach((entry, index) => {
+      if (typeof entry === 'string' && permissionSpecifierProblem(entry) !== null) {
+        diagnostics.push(diagnostic(
+          'PERMISSION_SPECIFIER_UNREPRESENTABLE', `target_roots[${index}]`, entry,
+          'target path representable inside one Claude Edit permission rule',
+          'use a target path without permission-rule delimiters',
+        ));
+      }
+    });
+  }
   validateCriteria(diagnostics, value.judgment_criteria, 'judgment_criteria', 'judgmentCriterion', entryIds);
   validateCriteria(diagnostics, value.success_criteria, 'success_criteria', 'successCriterion', entryIds);
   validateConstraints(diagnostics, value.constraints, entryIds);
@@ -460,8 +472,7 @@ export function validateContract(value) {
   if (value.runtime === 'claude' && Array.isArray(value.postflight)) {
     value.postflight.forEach((entry, index) => {
       const executable = entry?.argv?.[0];
-      if (typeof executable === 'string'
-        && (executable !== executable.trim() || /[()\r\n]/.test(executable))) {
+      if (typeof executable === 'string' && permissionSpecifierProblem(executable) !== null) {
         diagnostics.push(diagnostic(
           'PERMISSION_SPECIFIER_UNREPRESENTABLE', `postflight[${index}].argv[0]`, executable,
           'executable name representable as one Claude Bash permission prefix',

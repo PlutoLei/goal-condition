@@ -78,8 +78,16 @@ test('execution_permissions is a closed-world Claude-only authorization surface'
   const codex = validateContract({ ...valid, runtime: 'codex', execution_permissions });
   assert.ok(codex.some((x) => x.code === 'CLAUDE_EXECUTION_PERMISSIONS_ONLY'));
 
+  const hostileTarget = structuredClone(valid);
+  hostileTarget.runtime = 'claude';
+  hostileTarget.target_roots[0] = '/opt/work) Bash(evil';
+  assert.ok(validateContract(hostileTarget)
+    .some((x) => x.code === 'PERMISSION_SPECIFIER_UNREPRESENTABLE' && x.path === 'target_roots[0]'));
+
   assert.ok(Object.hasOwn(schema.properties, 'execution_permissions'));
   assert.equal(schema.$defs.executionPermissions.additionalProperties, false);
+  assert.ok(schema.allOf.some((entry) => entry.if?.required?.includes('execution_permissions')
+    && entry.then?.properties?.runtime?.const === 'claude'));
 });
 
 // ③（re-review round 1）：max_turns 是轮数，小数没有可执行语义。实测 max_turns=0.5 会让 CLI 的

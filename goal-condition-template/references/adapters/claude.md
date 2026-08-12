@@ -33,9 +33,9 @@
 
 把已确认 contract 的 `objective` 与必要的 criteria、constraints、allowed mutations、成功证据编译成一个自含 prompt。内容先写入权限受控的普通文件，再由启动器读取文件 bytes，以单一 argv 参数交给 `claude -p`；禁止把 prompt 拼进 shell 字符串，也禁止通过 shell quoting 传递特殊字符。达标判定不依赖这段 prompt 里的自然语言承诺——它由下方的 Stop hook 以确定性命令兜底。
 
-**会话身份由控制器预派（claim-before-dispatch）**：launch 的 argv 恒带 `--session-id <uuid>`，UUID 由启动器现场生成；resume 指针 `thread.json`（`{sessionId, cwd, promptSha256, transcriptPath}`）在占号之后、spawn 之前落盘。于是 max-turns 硬停、进程崩溃、stdout 不可解析等一切终局形态下指针都在，「预算耗尽走 resume 续跑」不再依赖成功形态的 envelope（2026-08-10 真实 run 的 resume 死锁根因）。CLI 对重复 UUID 明确拒绝（实测），预派不会静默串台。终局侧有配对的身份核验：envelope 回显的 `session_id` 必须等于控制器持有值，对不上即终局报告，不吞进候选；执行体的回显永远不反向覆写指针。`--session-id` 的可用性由 prepare 采集 `claude --help` 直接探测（`probes.claudeSessionIdFlag`），launch 前置闸对探测不到的一律拒绝——这是直接检查，不是版本代理；旧 state 目录缺探测值同样红，重跑 prepare 即可、不烧配额。
+**会话身份由控制器预派（claim-before-dispatch）**：launch 的 argv 恒带 `--session-id <uuid>`，UUID 由启动器现场生成；resume 指针 `thread.json`（`{sessionId, cwd, promptSha256, transcriptPath}`）在占号之后、spawn 之前用 `O_EXCL` 落盘。指针读走 descriptor + `O_NOFOLLOW`，且只接受单链接 regular file 与精确四字段形状；已有、损坏、不可读或 symlink/hardlink 指针都 fail closed，必须显式恢复，绝不覆写后另起会话。于是 max-turns 硬停、进程崩溃、stdout 不可解析等一切终局形态下指针都在，「预算耗尽走 resume 续跑」不再依赖成功形态的 envelope（2026-08-10 真实 run 的 resume 死锁根因）。CLI 对重复 UUID 明确拒绝（实测），预派不会静默串台。终局侧有配对的身份核验：envelope 回显的 `session_id` 必须等于控制器持有值，对不上即终局报告，不吞进候选；执行体的回显永远不反向覆写指针。`--session-id` 的可用性由 prepare 采集 `claude --help` 直接探测（`probes.claudeSessionIdFlag`），launch 前置闸对探测不到的一律拒绝——这是直接检查，不是版本代理；旧 state 目录缺探测值同样红，重跑 prepare 即可、不烧配额。
 
-任务级自动授权由已确认 contract 的可选 `execution_permissions` 编译进独立 `--settings`：postflight 的 executable 首词与显式 `bash_prefixes` 生成 `Bash(<prefix>:*)`，另生成 WebFetch domain、Skill 与额外目录；未知字段、Codex runtime 误用和无法安全放进权限 DSL 的字符串都在 Validate 阶段红。deny 固定保护 hook、整个 state 目录，以及每个 realpath target root 下的 `.claude/settings.json` / `.claude/settings.local.json`（F-B1），防止执行体通过改项目权限文件给后续会话扩权。launch 前置闸独立核对 allow、additionalDirectories 和每条 deny，避免生成器稳定地产错仍被放行。
+任务级自动授权由已确认 contract 的可选 `execution_permissions` 编译进独立 `--settings`：postflight 的 executable 首词与显式 `bash_prefixes` 生成 `Bash(<prefix>:*)`，另生成 WebFetch domain、Skill 与额外目录；未知字段、Codex runtime 误用和无法安全放进权限 DSL 的字符串都在 Validate 阶段红。统一的 DSL 表示性校验也覆盖 realpath 后的 target root、state root 与 hook path；编译器拒绝不可表示值，launch 前置闸再独立检查一次，直接绕过 Validate 也不能放行。deny 固定保护 hook、整个 state 目录，以及每个 realpath target root 下的 `.claude/settings.json` / `.claude/settings.local.json`（F-B1），防止执行体通过改项目权限文件给后续会话扩权。Claude 的实际 cwd 使用同一 canonical 首 root；控制器绑定全部 target root 的 device/inode，并在 spawn 前复核，避免 symlink 重定向或目录替换把执行送进未受对应 deny 保护的仓库。
 
 本实现不使用 `--disallowedTools` 作为第二套权限真值源；并存 CLI deny 与 contract-compiled settings 会制造两份可漂移的授权表。若未来引入，只能由同一份已确认字段投影生成，并纳入同一前置闸。
 
@@ -45,6 +45,8 @@
 
 - **`--permission-mode acceptEdits`**：`launchSpec`/`resumeSpec` 固定带这个 flag。除生成的 deny 外，工作目录与 additionalDirectories 内的编辑不会逐次询问；`permissions.allow` 还会免询问批准声明的 Bash/WebFetch/Skill。无人值守需要这层授权，但它不是验收或通用隔离，不能靠“模型会先问一句”成立约束。
 - **`--max-turns`**：固定带上。无显式预算时取 `DEFAULT_MAX_TURNS=50`；用户确认的 `budget.max_turns` 原样进入 argv，可提高到 `MAX_TURNS_CEILING=200`，超过 200 在占号与 spawn 前红，不静默改写成 200。它与 Stop hook 的 `MAX_HOOK_BLOCKS` 是两层不同的闸：前者硬停单次 attempt，后者决定 hook 还愿不愿意把未达标的会话续下去。
+
+max-turns 的特殊恢复路由不只看 17-key 全集，还要求实测 discriminator 同时成立：`type=result`、`subtype=error_max_turns`、`is_error=true`、`terminal_reason=max_turns`。key 对但取值不对仍按协议漂移落红，不会错误压低 hook 期望或标成可续。
 
 ### Stop hook 契约
 
@@ -82,7 +84,7 @@
 不得只看 `subtype`。Adapter 向公共状态机提交的结果必须先通过实测 key 集全等校验，未知 key 或缺失 key 一律 fail closed，不静默丢弃。锚有**两个**，按 `subtype` 二选一、互斥不重叠：
 
 - `subtype` 不是 `error_max_turns` → 21-key 成功锚（`CLAUDE_RESULT_KEYS`，2.1.223 实测，2.1.228 复核未漂）；
-- `subtype === "error_max_turns"` → 17-key error 锚（`CLAUDE_ERROR_MAX_TURNS_KEYS`，2.1.226 真实 run 与 2.1.228 spike 逐 key 一致：比成功锚少 `api_error_status`/`result`/`time_to_request_ms`/`ttft_ms`/`ttft_stream_ms`、多 `errors`，`terminal_reason` 取值 `max_turns`）。
+- `subtype === "error_max_turns"` → 17-key error 锚（`CLAUDE_ERROR_MAX_TURNS_KEYS`，2.1.226 真实 run 与 2.1.228 spike 逐 key 一致：比成功锚少 `api_error_status`/`result`/`time_to_request_ms`/`ttft_ms`/`ttft_stream_ms`、多 `errors`）；全集相等后仍须满足上面的四值 discriminator，才产生 `budgetExhausted`。
 
 第二锚过闸的结果是**未达标候选而不是协议漂移**——「没干完」和「envelope 变形」是两类事，单锚时代它们同落 malformed，把最需要续跑的形态（预算耗尽）封死在 resume 之外。launch 返回体以 `budgetExhausted: true` 标注这类候选（报告体字段，**不进** `candidate`——candidate 恒 4 字段，`workflow.mjs` 的 claudeTerminalState 做闭世界形状检查），控制器据此走「未达标可续」分流。其他 error subtype（如 `error_during_execution`）没有实测锚，一律按成功锚落红：只为实测过的形态建锚。
 
@@ -162,7 +164,7 @@ attempt 用尽或超出时间预算同样终局，按 diagnostic 报告差异与
 
 ## readback 观测通道
 
-`node scripts/launch.mjs readback --state DIR` 是 claude 线的只读观测：读 `thread.json` 指针，对 `transcriptPath`（`~/.claude/projects/<slug(cwd)>/<sessionId>.jsonl`，slug 规则实测为「绝对路径中非 `[A-Za-z0-9-]` 一律替换成 `-`」）做活性观测——文件 mtime、行数、最后条目类型，外加 prompt 归因（transcript 首条 user 输入的 SHA-256 对 `thread.json.promptSha256`，实测逐字回显）。它回答的是「执行体还在干活吗」：mtime 停滞且无 envelope 是 stall 信号，transcript 还在长是在干，envelope 落了是已报终局——这是控制器分辨「干完了 / 卡住了」的独立观测面，不再依赖执行体自报。
+`node scripts/launch.mjs readback --state DIR` 是 claude 线的只读观测：通过上述 no-follow 指针读取，对 `transcriptPath`（`~/.claude/projects/<slug(cwd)>/<sessionId>.jsonl`，slug 规则实测为「绝对路径中非 `[A-Za-z0-9-]` 一律替换成 `-`」）做活性观测——文件 mtime、行数、固定枚举后的最后条目类型，外加 prompt 归因（transcript 首条 user 输入的 SHA-256 对 `thread.json.promptSha256`，实测逐字回显）。未知 `type` 只返回常量 `unknown`，不允许 transcript 自带字符串穿过隐私边界。它回答的是「执行体还在干活吗」：mtime 停滞且无 envelope 是 stall 信号，transcript 还在长是在干，envelope 落了是已报终局——这是控制器分辨「干完了 / 卡住了」的独立观测面，不再依赖执行体自报。
 
 边界四条：**fail-open**——slug 是 CLI 内部实现、无稳定性承诺，规则漂移或会话未起的表现是 `available:false`，观测不可用不等于 run 出事，兜底永远是 wall-clock deadline；**恒 exit 0**——把观测缺席标成非零会诱导编排器把它当 run 故障；**零字节出境**——输出只有计数、类型与哈希比对结论（`promptAttribution: match|mismatch|unavailable`），transcript 内容一个字节不回显；**不进证据通道**——readback 结论只供人工处置决策（kill / resume / 继续等），归因 mismatch 是「值得人工核查」的报告信号，readback 无权据此终止任何东西，transcript 字节更不得进入 diagnostic 馈回通道（闭世界规则不变）。
 
