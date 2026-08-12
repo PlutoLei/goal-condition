@@ -8,7 +8,7 @@ import {
 import {
   appendFile, chmod, lstat, mkdir, readdir, readFile, rm, writeFile,
 } from 'node:fs/promises';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import {
   basename, isAbsolute, join,
@@ -259,7 +259,8 @@ function renderDiagnosticText(reds) {
   ].join('\n');
 }
 
-// 控制器 postflight 用「运行次数 ≥ attempt 轮数」验证 hook 未静默缺席。
+// 控制器按候选返回体的 hookExpected 累计「本应出现 Stop 事件」的轮次，再与运行次数对账；
+// max-turns 硬停不触发 Stop hook，不能把那一轮误报成 hook 缺席。
 export async function hookRunCount(stateDir) {
   let text;
   try {
@@ -275,11 +276,21 @@ export async function hookRunCount(stateDir) {
 async function defaultCollect({ hookScriptPath }) {
   const { stdout } = await execFile('claude', ['--version']);
   const match = stdout.match(/(\d+\.\d+\.\d+)/);
+  // --session-id 能力探测直接问 --help，不做版本推断（代理指标不得严于/替代直接检查）：flag
+  // 何时引入无从由版本下限证明，而它现在是否存在可以直接观测。探测失败按「不存在」落盘——
+  // launch 前置闸据此落红，fail closed，不把「问不出来」当「有」。
+  let helpStdout = '';
+  try {
+    ({ stdout: helpStdout } = await execFile('claude', ['--help']));
+  } catch {
+    helpStdout = '';
+  }
   const bytes = await readFile(hookScriptPath);
   const st = await lstat(hookScriptPath);
   return {
     claudeVersionRaw: stdout,
     claudeVersion: match ? match[1] : null,
+    claudeSessionIdFlag: /--session-id\b/.test(helpStdout),
     hookMode: (st.mode & 0o7777).toString(8).padStart(4, '0'),
     hookSha256: createHash('sha256').update(bytes).digest('hex'),
   };
@@ -338,6 +349,8 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
     claudeVersionCommand: ['claude', '--version'],
     claudeVersionRaw: collected.claudeVersionRaw,
     claudeVersion: collected.claudeVersion,
+    claudeHelpCommand: ['claude', '--help'],
+    claudeSessionIdFlag: collected.claudeSessionIdFlag === true,
     settings,
     hookScript: {
       path: hookScriptPath, exists: true, mode: collected.hookMode, sha256: collected.hookSha256,
@@ -351,6 +364,15 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
 
   // 6.
   return { settingsPath, hookScriptPath, probes };
+}
+
+// claude -p 的会话 transcript 落在 ~/.claude/projects/<slug(cwd)>/<sessionId>.jsonl；slug 规则
+// （绝对路径中非 [A-Za-z0-9-] 的字符一律替换成 '-'）是 CLI 内部实现、无稳定性承诺——spike S-C
+// 在 2.1.228 实测确认。因此这条路径只作观测通道（readback，fail-open）：规则漂移的表现是
+// 「文件不存在 → available:false」，绝不进入判定或证据链。
+export function claudeTranscriptPath({ cwd, sessionId }) {
+  const slug = String(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+  return join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
 }
 
 // 现场重新 lstat/hash hook 文件——probes.json 记的是 prepare 时刻的观测，attempt 之间可能被
@@ -392,9 +414,9 @@ export async function runClaudeAttempt({
   // 这份 contract 在这个 state 目录上永久锁死。它也与 claude.md 的计数口径冲突——那里定义的是
   // 「一次逻辑 run = 1 首发 + 最多 2 次续跑」，约束的是真实跑过的轮次。
   let attemptNumber = null;
-  // 每个返回体都带上 attemptNumber 与本刻的 hook 运行次数：spec §5 与 claude.md:44 要求控制器
-  // postflight 校验「hook 运行次数 ≥ attempt 轮数」，把 hook 静默缺席（resume 未继承 --settings、
-  // hook 被绕过删除）变成可验证的红。对账所需的两个数此前一个都不在返回体里，主会话无从核对。
+  // 每个返回体都带上 attemptNumber 与本刻的 hook 运行次数；候选另带 hookExpected，控制器只把
+  // hookExpected=true 的轮次计入期望值。这样既能把 hook 静默缺席（resume 未继承 --settings、
+  // hook 被绕过删除）变成可验证的红，也不会把不触发 Stop 的 max-turns 硬停误算成缺席。
   // 前置闸拒绝时 attemptNumber 为 null——显式的「没有轮次可对账」，与「字段缺失」区分开。
   const finish = async (result) => ({
     ...result, attemptNumber, hookRuns: await hookRunCount(stateDir),
@@ -432,6 +454,10 @@ export async function runClaudeAttempt({
   const hookScript = await observeHookScript(hookScriptPath);
   const probes = {
     claudeVersion: storedProbes.claudeVersion,
+    // 与 claudeVersion 同一待遇：一次外部进程观测，无法在纯判定路径上重放，只能从 prepare 落盘
+    // 的 probes.json 里读。显式 === true 归一：旧 state 目录（探测引入前 prepare 的）缺这个字段
+    // 时判 false → 前置闸红 → 重跑 prepare 即可，不烧配额。
+    claudeSessionIdFlag: storedProbes.claudeSessionIdFlag === true,
     contractHash: contractHash(contract),
     // confirmedHash 现在来自主会话的 runBinding 本体（不再是 stateDir 末段——那条检查已经
     // 上移成独立的三方交叉判定），与此刻现场重算的 contractHash 对比，抓的是「prepare 之后
@@ -452,12 +478,33 @@ export async function runClaudeAttempt({
   }
 
   const cwd = contract.target_roots[0];
+  const threadPath = join(stateDir, 'thread.json');
 
   let spec;
+  let sessionId;
   if (kind === 'launch') {
-    spec = launchSpec({ prompt, settingsPath, cwd, budget: contract.budget });
+    // 一次逻辑 run 只能 claim 一个 Claude 会话。已有可读指针时再次 launch 会把 resume 坐标
+    // 换成新会话，与「1 launch + ≤2 resume」和 claim 后只 readback/reconcile 的恢复模型都冲突。
+    // 损坏/不可读的残留不被当成有效 claim；下面的 writeReplacing 会以不跟随链接的方式换掉它。
+    try {
+      const prior = JSON.parse(await readFile(threadPath, 'utf8'));
+      if (typeof prior?.sessionId === 'string' && prior.sessionId.length > 0) {
+        return finish({
+          outcome: 'terminal_report',
+          reasons: ['this run already claimed a claude session; use resume or readback instead of launching again'],
+        });
+      }
+    } catch {
+      // 没有可读的有效 claim；首发可以继续，安全替换在占号之后执行。
+    }
+    // claim-before-dispatch（借 codex GoalSession v2 的 LaunchIntent 语义）：会话身份由控制器
+    // 预派，resume 指针在 spawn 之前落盘（见占号后那一步）。2026-08-10 真实 run 的 resume 死锁
+    // 根因就是指针落在终局校验之后——error 形态 envelope 过不了单锚，指针永不落盘。
+    sessionId = randomUUID();
+    spec = launchSpec({
+      prompt, settingsPath, cwd, budget: contract.budget, sessionId,
+    });
   } else if (kind === 'resume') {
-    let sessionId;
     try {
       ({ sessionId } = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8')));
     } catch {
@@ -475,6 +522,19 @@ export async function runClaudeAttempt({
 
   // 前置闸全绿、argv 已组好，下一行就是真正的 spawn——占号的时刻在这里，不在函数开头。
   attemptNumber = await nextAttempt(stateDir);
+
+  if (kind === 'launch') {
+    // 指针先落盘再 spawn：无论终局形态如何（成功、error_max_turns、进程崩溃、stdout 不可解析），
+    // resume 都有指针可用。promptSha256/transcriptPath 只供 readback 归因与观测（fail-open 通道），
+    // resume 只消费 sessionId。spawn 未成功而指针已在的形态是 fail-closed 的：resume 会对不存在
+    // 的会话报错、落终局报告，不会伪装成候选。
+    await writeReplacing(threadPath, JSON.stringify({
+      sessionId,
+      cwd,
+      promptSha256: createHash('sha256').update(prompt, 'utf8').digest('hex'),
+      transcriptPath: claudeTranscriptPath({ cwd, sessionId }),
+    }, null, 2), 0o600);
+  }
 
   let raw;
   try {
@@ -505,10 +565,99 @@ export async function runClaudeAttempt({
     return finish({ outcome: 'terminal_report', reasons: normalized.reasons });
   }
 
-  await writeFile(join(stateDir, 'candidate.json'), JSON.stringify(normalized.candidate, null, 2));
-  await writeFile(join(stateDir, 'thread.json'), JSON.stringify({ sessionId: raw.session_id }, null, 2));
+  // 身份交叉核验：envelope 回显的 session_id 必须等于控制器持有的那一个（launch=预派值，
+  // resume=thread.json 指针）。对不上说明候选归属存疑——fail closed 落终局，不吞进候选；
+  // thread.json 保持控制器写入的值不动，执行体侧的回显永远不反向覆写指针。
+  if (raw.session_id !== sessionId) {
+    return finish({
+      outcome: 'terminal_report',
+      reasons: ['claude reported a session_id different from the controller-issued one: the candidate cannot be attributed to this run'],
+    });
+  }
 
-  return finish({ outcome: 'candidate', candidate: normalized.candidate, sessionId: raw.session_id });
+  await writeFile(join(stateDir, 'candidate.json'), JSON.stringify(normalized.candidate, null, 2));
+
+  // budgetExhausted 是报告体字段不进 candidate（candidate 恒 4 字段，见 normalizeTerminal）：
+  // 控制器据它把「预算耗尽」路由到未达标可续分流，而不是把 reject 的形状红当成协议漂移。
+  return finish({
+    outcome: 'candidate',
+    candidate: normalized.candidate,
+    sessionId,
+    budgetExhausted: normalized.budgetExhausted,
+    // max-turns 硬停不会触发 Stop 事件；它不应被旧的 attemptNumber 口径误算成 hook 缺席。
+    // 控制器累计对账 hookRuns 时只计 hookExpected=true 的候选 attempt。
+    hookExpected: !normalized.budgetExhausted,
+  });
+}
+
+// claude 线只读观测通道（transcript readback）：不 spawn、不写盘、不把 transcript 字节放进
+// 输出——只给计数、条目类型与哈希比对结论（隐私纪律：任务内容不回显）。任何内部失败都归
+// {available:false}：观测不可用不等于 run 出事，兜底永远是 wall-clock deadline，不是这里。
+// 它的结论也不进任何 controller 证据通道——这是给「干完了还是卡住了」的独立观测面，处置
+// （kill / resume / 继续等）留给人工决策。
+export async function runClaudeReadback({ stateDir }) {
+  let pointer;
+  try {
+    pointer = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
+  } catch {
+    return { available: false, reasons: ['no readable thread.json in the state dir'] };
+  }
+  if (typeof pointer?.threadId === 'string') {
+    return { available: false, reasons: ['this state dir belongs to a codex run: readback here is claude-only'] };
+  }
+  if (typeof pointer?.sessionId !== 'string' || typeof pointer?.transcriptPath !== 'string') {
+    return {
+      available: false,
+      reasons: ['thread.json predates the pointer shape with transcriptPath: launch under the current adapter to enable readback'],
+    };
+  }
+  let st;
+  try {
+    st = await lstat(pointer.transcriptPath);
+  } catch {
+    return {
+      available: false,
+      reasons: ['transcript not found at the recorded path: the session may not have started yet, or the CLI transcript layout drifted'],
+    };
+  }
+  let text;
+  try {
+    text = await readFile(pointer.transcriptPath, 'utf8');
+  } catch {
+    return { available: false, reasons: ['transcript is not readable by the controller'] };
+  }
+  const lines = text.split('\n').filter((line) => line.trim().length > 0);
+  let lastEntryType = null;
+  let firstUserSha256 = null;
+  for (const line of lines) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof entry?.type === 'string') lastEntryType = entry.type;
+    if (firstUserSha256 === null && entry?.type === 'user') {
+      const content = entry?.message?.content;
+      const textPart = typeof content === 'string' ? content
+        : (Array.isArray(content) && content[0]?.type === 'text' ? content[0].text : null);
+      if (typeof textPart === 'string') {
+        firstUserSha256 = createHash('sha256').update(textPart, 'utf8').digest('hex');
+      }
+    }
+  }
+  // 归因是报告信号不是闸：mismatch 说明「transcript 首条 user 输入不是控制器发出的 prompt」，
+  // 值得人工核查，但 readback 无权据此终止任何东西。
+  const promptAttribution = typeof pointer.promptSha256 !== 'string' || firstUserSha256 === null
+    ? 'unavailable'
+    : (firstUserSha256 === pointer.promptSha256 ? 'match' : 'mismatch');
+  return {
+    available: true,
+    mtimeMs: st.mtimeMs,
+    lineCount: lines.length,
+    lastEntryType,
+    promptAttribution,
+  };
 }
 
 async function defaultCodexCollect() {
@@ -1768,6 +1917,7 @@ const COMMANDS = {
   },
   finalize: { allowed: ['--state', '--binding-file'], required: ['--state', '--binding-file'] },
   close: { allowed: ['--state'], required: ['--state'] },
+  readback: { allowed: ['--state'], required: ['--state'] },
 };
 
 function usage() {
@@ -1778,6 +1928,10 @@ function usage() {
     '  node scripts/launch.mjs resume --contract FILE --state DIR --diagnostics-file FILE --binding-file FILE [--raise-token-budget N]',
     '  node scripts/launch.mjs finalize --state DIR --binding-file FILE',
     '  node scripts/launch.mjs close --state DIR',
+    '  node scripts/launch.mjs readback --state DIR',
+    '',
+    'readback 是 claude 线的只读观测（transcript 活性、prompt 归因），恒 exit 0：available:false',
+    '表示观测不可用，不代表 run 出事；它的结论不进任何证据通道，处置留给人工。',
     '',
     '--raise-token-budget 只在 codex 续跑时可用，且只有显式写出来才会抬预算：预算仅用户明给，',
     '这个 flag 就是那份用户确认的载体，缺省绝不自动抬。',
@@ -1926,6 +2080,12 @@ async function runCli() {
     }
     if (parsed.command === 'close') {
       await runCloseCommand(parsed.values);
+      return;
+    }
+    if (parsed.command === 'readback') {
+      // 观测工具恒 exit 0：available:false 是「看不到」不是「出事了」，把它标成非零会诱导编排器
+      // 把观测缺席当成 run 故障处理。
+      process.stdout.write(`${JSON.stringify(await runClaudeReadback({ stateDir: parsed.values['--state'] }))}\n`);
       return;
     }
     await runAttemptCommand(parsed.command, parsed.values);

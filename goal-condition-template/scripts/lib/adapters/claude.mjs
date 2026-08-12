@@ -18,24 +18,48 @@ export const CLAUDE_RESULT_KEYS = Object.freeze([
 
 const EXPECTED_KEYS = new Set(CLAUDE_RESULT_KEYS);
 
+// max-turns 硬停的 error 形态 envelope 完整 key 集：2.1.226 真实 run 与 2.1.228 spike S-B 逐 key
+// 一致（比成功锚少 api_error_status/result/time_to_request_ms/ttft_ms/ttft_stream_ms、多 errors，
+// terminal_reason 取值 max_turns）。只为实测过的 error_max_turns 建锚；其他 error subtype 没有
+// 实测锚，一律按成功锚落红（fail closed）——「没干完」和「协议漂移」是两类事，2026-08-10 真实
+// run 曾因单锚把前者判成后者而封死续跑。
+export const CLAUDE_ERROR_MAX_TURNS_KEYS = Object.freeze([
+  'duration_api_ms', 'duration_ms', 'errors', 'fast_mode_disabled_reason', 'fast_mode_state',
+  'is_error', 'modelUsage', 'num_turns', 'permission_denials', 'session_id', 'stop_reason',
+  'subtype', 'terminal_reason', 'total_cost_usd', 'type', 'usage', 'uuid',
+]);
+
+const ERROR_MAX_TURNS_KEYS = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
+
 // 版本闸放宽成下限之后，「新版本改了 result envelope」全靠这道直检兜底，所以诊断必须直接指路：
 // 只说「多了 N 个未知 key」的操作员不知道下一步该干什么。隐私纪律不变——只给计数，不回显 key 名。
-const DRIFT_HINT = 'this may be a claude upgrade drifting the result envelope: '
-  + "re-check the new version's result envelope, then update CLAUDE_RESULT_KEYS";
+function driftHint(table) {
+  return 'this may be a claude upgrade drifting the result envelope: '
+    + `re-check the new version's result envelope, then update ${table}`;
+}
 
 export function normalizeTerminal(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, reasons: ['Claude result must be an object'] };
   }
-  const actual = Object.keys(raw);
-  const missing = CLAUDE_RESULT_KEYS.filter((key) => !Object.hasOwn(raw, key));
-  const unknown = actual.filter((key) => !EXPECTED_KEYS.has(key));
+  // 锚按 subtype 二选一：error_max_turns 走 17-key error 锚，其余（含未知 error subtype）一律
+  // 按 21-key 成功锚判。两个锚都是全集相等校验，互斥不重叠。
+  const budgetExhausted = raw.subtype === 'error_max_turns';
+  const anchor = budgetExhausted ? CLAUDE_ERROR_MAX_TURNS_KEYS : CLAUDE_RESULT_KEYS;
+  const anchorSet = budgetExhausted ? ERROR_MAX_TURNS_KEYS : EXPECTED_KEYS;
+  const table = budgetExhausted ? 'CLAUDE_ERROR_MAX_TURNS_KEYS' : 'CLAUDE_RESULT_KEYS';
+  const missing = anchor.filter((key) => !Object.hasOwn(raw, key));
+  const unknown = Object.keys(raw).filter((key) => !anchorSet.has(key));
   const reasons = [];
-  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${DRIFT_HINT}`);
-  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${DRIFT_HINT}`);
+  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${driftHint(table)}`);
+  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${driftHint(table)}`);
   if (reasons.length) return { ok: false, reasons };
+  // budgetExhausted 是给控制器报告体的路由信号（「预算耗尽、可续跑」），不进 candidate——
+  // candidate 恒为 4 字段：workflow.mjs 的 claudeTerminalState 做闭世界形状检查，多一个字段
+  // 就把「未达标候选」变成 reject 里的形状错误，两种红不是一回事。
   return {
     ok: true,
+    budgetExhausted,
     candidate: {
       subtype: raw.subtype,
       is_error: raw.is_error,
@@ -130,11 +154,15 @@ export function effectiveMaxTurns(budget) {
     : CLI_MAX_TURNS;
 }
 
-export function launchSpec({ prompt, settingsPath, cwd, budget }) {
+export function launchSpec({ prompt, settingsPath, cwd, budget, sessionId }) {
   // prompt 由调用方从权限受控文件 bytes 读出、单 argv 传入（现行规则）；本函数纯数据不执行。
+  // sessionId 由控制器预派（claim-before-dispatch）：resume 指针在 spawn 之前就落盘，max-turns
+  // 硬停、进程崩溃、stdout 不可解析等一切终局形态下都不丢指针。CLI 对重复 UUID 明确拒绝
+  // （spike S-A 实测），预派不会静默串台。
   return {
-    argv: ['claude', '-p', prompt, '--output-format', 'json', '--settings', settingsPath,
-      '--permission-mode', 'acceptEdits', '--max-turns', String(effectiveMaxTurns(budget))],
+    argv: ['claude', '-p', prompt, '--output-format', 'json', '--session-id', sessionId,
+      '--settings', settingsPath, '--permission-mode', 'acceptEdits',
+      '--max-turns', String(effectiveMaxTurns(budget))],
     settingsPath, cwd, env_names: [],
   };
 }
@@ -192,6 +220,14 @@ export function assertLaunchable(contract, probes) {
   if (probes?.baselineDigestStored !== true) reasons.push('baseline digest is not stored in trusted orchestration state');
   const versionReason = versionFloorReason(probes?.claudeVersion);
   if (versionReason !== null) reasons.push(versionReason);
+  // --session-id 是恢复模型的前提（指针先于 spawn 存在）。这不是版本代理：prepare 采集
+  // `claude --help` 直接探测 flag 存在性，直接检查优先于版本推断——flag 何时引入无从由版本
+  // 下限证明，而它是否存在可以直接问。旧 state 目录（本探测引入之前 prepare 的）没有这个值，
+  // 同样落红：重跑 prepare 即可，前置闸拒绝不烧 attempt 配额。
+  if (probes?.claudeSessionIdFlag !== true) {
+    reasons.push('claude --help does not advertise --session-id (or probes.json predates the '
+      + 'capability probe): re-run prepare against a claude that supports controller-issued session ids');
+  }
   if (settingsContainKey(probes?.settings, ['disableAllHooks', 'allowManagedHooksOnly'])) {
     reasons.push('settings must not disable or restrict hooks');
   }

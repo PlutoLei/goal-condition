@@ -33,6 +33,8 @@
 
 把已确认 contract 的 `objective` 与必要的 criteria、constraints、allowed mutations、成功证据编译成一个自含 prompt。内容先写入权限受控的普通文件，再由启动器读取文件 bytes，以单一 argv 参数交给 `claude -p`；禁止把 prompt 拼进 shell 字符串，也禁止通过 shell quoting 传递特殊字符。达标判定不依赖这段 prompt 里的自然语言承诺——它由下方的 Stop hook 以确定性命令兜底。
 
+**会话身份由控制器预派（claim-before-dispatch）**：launch 的 argv 恒带 `--session-id <uuid>`，UUID 由启动器现场生成；resume 指针 `thread.json`（`{sessionId, cwd, promptSha256, transcriptPath}`）在占号之后、spawn 之前落盘。于是 max-turns 硬停、进程崩溃、stdout 不可解析等一切终局形态下指针都在，「预算耗尽走 resume 续跑」不再依赖成功形态的 envelope（2026-08-10 真实 run 的 resume 死锁根因）。CLI 对重复 UUID 明确拒绝（实测），预派不会静默串台。终局侧有配对的身份核验：envelope 回显的 `session_id` 必须等于控制器持有值，对不上即终局报告，不吞进候选；执行体的回显永远不反向覆写指针。`--session-id` 的可用性由 prepare 采集 `claude --help` 直接探测（`probes.claudeSessionIdFlag`），launch 前置闸对探测不到的一律拒绝——这是直接检查，不是版本代理；旧 state 目录缺探测值同样红，重跑 prepare 即可、不烧配额。
+
 任务级权限收紧通过明确的 `--disallowedTools` 或独立 `--settings` 文件传入。必须先验证 deny/settings 确实覆盖 contract 声称为 `physical` 的动作；仅有文字禁令、auto 分类或未经 fault injection 的 scoped rule 不构成物理拦截，应降为 `audit_only` 或停止 launch。这条验证已机械化，且结论是硬的：本 adapter 生成的 deny 恒为「hook 脚本路径 + 整个 state 目录」两条，护的都是控制器自己的机件，**不存在面向用户约束的物理拦截面**。launch 前置闸因此逐条拒绝 `enforcement="physical"` 的 constraint，`mechanism` 怎么写都红；改写 `mechanism` 不是出路——那两条 deny 含 contract hash 与 prepare 期才确定的 state 路径，把它抄进 contract 会改掉 hash。claude runtime 下的约束一律写 `audit_only`；确需物理保证，就先把 proxy、只读凭证或 sandbox 备好，或改用有物理面的 runtime。
 
 ### 启动姿态里的两个权限事实
@@ -46,7 +48,7 @@
 - **达标判定**：hook 逐条执行 postflight command，多条红收集不抛出——某条非零退出即记为红；这同时钉死独立 postflight 的红判据（command entry 不带 `expected` 字段，红=非零退出）。全绿即候选达标，继续 block 表示尚未达标。
 - **block 协议**：hook 向 stdout 写 JSON decision `{"decision":"block","reason":"..."}` 并以 exit 0 退出——不是 exit code 2；放行时不写 decision，同样 exit 0。`reason` 措辞必须与 objective 兼容，只能是「未达标，请补 X」式陈述，不得与任务目标语义冲突——冲突会让模型遵从 objective 罢工、静默 block 到预算耗尽，形成死循环。
 - **预算放行**：block 次数达到上限（`MAX_HOOK_BLOCKS`，默认 8，contract 的 `budget.max_turns` 更严时取较小值）或运行时长超过 `budget.max_minutes` 折算的墙钟预算，hook 一律放行停机，候选态如实标「未达标」，不得无限 block。
-- **运行留痕**：hook 每次执行向 state 目录追加一条记录（时间戳、红项清单、decision）。控制器 postflight 校验「hook 运行次数 ≥ attempt 轮数」，把 hook 静默缺席（resume 未继承 `--settings`、hook 被绕过删除）变成可验证的红。对账所需的两个数从 launch 返回体取：每个 attempt 结果（候选与终局报告都有）带 `attemptNumber` 与 `hookRuns`（该刻的留痕行数），主会话不必自己读 state 目录里的文件。`attemptNumber` 为 `null` 是一个明确取值，表示这次调用被 launch 前置闸挡在起飞之前、没有占用任何轮次——此时不存在可对账的 attempt，那一轮不进入「hook 运行次数 ≥ attempt 轮数」的比较。字段本身恒在，`null` 与「缺字段」不是一回事。
+- **运行留痕**：hook 每次执行向 state 目录追加一条记录（时间戳、红项清单、decision）。控制器校验「累计 `hookRuns` ≥ 累计 `hookExpected=true` 的候选轮次」，把 hook 静默缺席（resume 未继承 `--settings`、hook 被绕过删除）变成可验证的红，同时排除不会触发 Stop 事件的 max-turns 硬停。对账字段从 launch 返回体取：每个结果都带 `attemptNumber` 与 `hookRuns`（该刻的留痕行数），候选结果另带 `hookExpected`；主会话不必自己读 state 文件。`attemptNumber=null` 表示调用被前置闸挡在 spawn 之前、没有占用轮次；`hookExpected=false` 表示本轮确实 spawn 过，但终局机制不产生 Stop 事件。二者都不是字段缺失。
 - **定位声明**：hook 是续轮驱动器，不是验收。它的判定结论不进入任何 controller 证据通道；hook 全绿仍可能被控制器独立 postflight 推翻，例如越权 mutation 只有 baseline compare 能看见。
 - **副作用告诫**：hook 命令集应限定为无写副作用的子集；如确有产物写入，必须把产物路径纳入 contract 的 `allowed_mutations` 并在 Preview 里显式列出，否则可能落进 target root、被误判为不可续的边界违规。
 
@@ -73,7 +75,14 @@
 
 ## Runtime 终态
 
-不得只看 `subtype`。Adapter 向公共状态机提交的结果必须先通过实测版本的 21-key 完整 key 集校验（`claude -p --output-format json` 的 result envelope），未知 key 或缺失 key 一律 fail closed，不静默丢弃；通过后投影出以下 4 个字段参与判定：
+不得只看 `subtype`。Adapter 向公共状态机提交的结果必须先通过实测 key 集全等校验，未知 key 或缺失 key 一律 fail closed，不静默丢弃。锚有**两个**，按 `subtype` 二选一、互斥不重叠：
+
+- `subtype` 不是 `error_max_turns` → 21-key 成功锚（`CLAUDE_RESULT_KEYS`，2.1.223 实测，2.1.228 复核未漂）；
+- `subtype === "error_max_turns"` → 17-key error 锚（`CLAUDE_ERROR_MAX_TURNS_KEYS`，2.1.226 真实 run 与 2.1.228 spike 逐 key 一致：比成功锚少 `api_error_status`/`result`/`time_to_request_ms`/`ttft_ms`/`ttft_stream_ms`、多 `errors`，`terminal_reason` 取值 `max_turns`）。
+
+第二锚过闸的结果是**未达标候选而不是协议漂移**——「没干完」和「envelope 变形」是两类事，单锚时代它们同落 malformed，把最需要续跑的形态（预算耗尽）封死在 resume 之外。launch 返回体以 `budgetExhausted: true` 标注这类候选（报告体字段，**不进** `candidate`——candidate 恒 4 字段，`workflow.mjs` 的 claudeTerminalState 做闭世界形状检查），控制器据此走「未达标可续」分流。其他 error subtype（如 `error_during_execution`）没有实测锚，一律按成功锚落红：只为实测过的形态建锚。
+
+通过后投影出以下 4 个字段参与判定：
 
 | 字段 | 成功条件 |
 |---|---|
@@ -130,7 +139,9 @@ allowlist 原本顺带覆盖、而直检覆盖不到的有三处。它们**不�
 
 ## resume 外环
 
-单次首发未达标（hook 因预算放行、或候选终态判定未过）时，主会话可发起 `--resume <session_id>` 续跑；续跑请求必须带上与首发完全相同的 `--settings` 文件——不带则 Stop hook 静默失效，续轮判定形同虚设。外环有上限：一次逻辑 run = 1 首发 + 最多 2 次续跑，attempt 序号写入 controller state、单调递增。
+单次首发未达标（hook 因预算放行、候选终态判定未过、或 `budgetExhausted` 标注的 max-turns 硬停）时，主会话可发起 `--resume <session_id>` 续跑；`session_id` 从 `thread.json` 指针取——它在首发 spawn 之前就已落盘，任何终局形态都不缺。续跑请求必须带上与首发完全相同的 `--settings` 文件——不带则 Stop hook 静默失效，续轮判定形同虚设。外环有上限：一次逻辑 run = 1 首发 + 最多 2 次续跑，attempt 序号写入 controller state、单调递增。
+
+**续轮职责是分层的（不是冗余）**：Stop hook 管**会话内**续轮——模型提前自认完成而 postflight 未绿时 block 打回，廉价、不烧 attempt 配额（2026-08-12 真实任务首次实测接管）；控制器 resume 管**跨 attempt** 补活——max-turns 硬停不触发 Stop 事件（实测 hookRuns=0），hook 在这个形态下结构性缺席，补活主责在控制器。因此 max-turns 候选返回 `hookExpected=false`，普通候选返回 `true`；累计对账只统计后者，预算模型不再假设 hook 是唯一的续跑驱动。
 
 计数口径就是这句话的字面意思：**只有真的要 spawn 执行器时才占号**。被 launch 前置闸挡下的调用（binding 对不上、`claude` 版本低于下限或读不出来、hook 文件被改、`baselineDigest` 没存、resume 找不到 thread.json）一格都不占，改正之后配额仍是满的。这不是宽松，而是让计数器只统计它声称统计的东西：占号不可撤销，`prepare` 与 `close` 都不清 `attempts/`，而上述拒绝原因全在 contract 之外——改正它们不改 contract hash，也就不换 state 目录。配额真的用尽时，诊断 `ATTEMPT_LIMIT_EXCEEDED` 会给出出路：换一个 `--controller` 名重跑 `prepare`（写出带全新配额的 state 目录），或在确认没有 run 在跑之后手工删掉那个 `attempts/` 目录。
 
@@ -144,6 +155,12 @@ allowlist 原本顺带覆盖、而直检覆盖不到的有三处。它们**不�
 「馈回」的内容有边界，与 codex 侧同一条规定：**diagnostic 只能由 contract 声明的事实与控制器自己的判定构成——postflight 条目 id、该条目在 contract 里的 argv 与 cwd、退出码、红项分类结论；执行体产出的任何字节都不得进入这条通道。** 这里的 diagnostic 是 `claude -p` 的 prompt 位，也就是下一轮的用户回合，容易踩的形态是把红项命令的 stdout 贴进去——而 postflight 命令的 stdout 完全可能是执行体自己上一轮写出来的文件内容（`cat`/`diff`/`jq` 类 verifier 都会），那等于让它自己的产出以指令的身份回到它面前。`--diagnostics-file` 因此收的是一份闭世界的红项清单（`{"reds":[{"entry","code","exit"}]}`，`entry` 必须是本 contract 的 postflight 条目 id，`argv`/`cwd` 从 contract 取而不从文件读），文本由 launcher 渲染；不合形状即进程级失败（exit 1）。
 
 attempt 用尽或超出时间预算同样终局，按 diagnostic 报告差异与下一步。
+
+## readback 观测通道
+
+`node scripts/launch.mjs readback --state DIR` 是 claude 线的只读观测：读 `thread.json` 指针，对 `transcriptPath`（`~/.claude/projects/<slug(cwd)>/<sessionId>.jsonl`，slug 规则实测为「绝对路径中非 `[A-Za-z0-9-]` 一律替换成 `-`」）做活性观测——文件 mtime、行数、最后条目类型，外加 prompt 归因（transcript 首条 user 输入的 SHA-256 对 `thread.json.promptSha256`，实测逐字回显）。它回答的是「执行体还在干活吗」：mtime 停滞且无 envelope 是 stall 信号，transcript 还在长是在干，envelope 落了是已报终局——这是控制器分辨「干完了 / 卡住了」的独立观测面，不再依赖执行体自报。
+
+边界四条：**fail-open**——slug 是 CLI 内部实现、无稳定性承诺，规则漂移或会话未起的表现是 `available:false`，观测不可用不等于 run 出事，兜底永远是 wall-clock deadline；**恒 exit 0**——把观测缺席标成非零会诱导编排器把它当 run 故障；**零字节出境**——输出只有计数、类型与哈希比对结论（`promptAttribution: match|mismatch|unavailable`），transcript 内容一个字节不回显；**不进证据通道**——readback 结论只供人工处置决策（kill / resume / 继续等），归因 mismatch 是「值得人工核查」的报告信号，readback 无权据此终止任何东西，transcript 字节更不得进入 diagnostic 馈回通道（闭世界规则不变）。
 
 ## Postflight 与 Close
 

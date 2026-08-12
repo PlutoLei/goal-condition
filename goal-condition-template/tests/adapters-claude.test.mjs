@@ -1,11 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { CLAUDE_RESULT_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, CLI_MAX_TURNS } from '../scripts/lib/adapters/claude.mjs';
+import { CLAUDE_RESULT_KEYS, CLAUDE_ERROR_MAX_TURNS_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, CLI_MAX_TURNS } from '../scripts/lib/adapters/claude.mjs';
 import { runtimeTerminalState } from '../scripts/lib/workflow.mjs';
 
 const fixtureUrl = new URL('./fixtures/claude-result-21key.json', import.meta.url);
 const realResult = JSON.parse(await readFile(fixtureUrl, 'utf8'));
+
+// spike S-B（2.1.228）的实测产物：--max-turns 1 触发硬停，CLI 出 error 形态 envelope。与
+// 2026-08-10/08-12 两次真实 run 在 2.1.226/2.1.228 的观测逐 key 一致。形状从实测文件读，不手抄。
+const errorFixtureUrl = new URL('./fixtures/claude-result-17key-error-max-turns.json', import.meta.url);
+const errorMaxTurnsResult = JSON.parse(await readFile(errorFixtureUrl, 'utf8'));
 
 // spike S5 runB 的实测产物：模型改不动 hook 就换 Bash 直接重定向（`printf 'exit 0' > stop-hook.sh`），
 // 被 settings.permissions.deny 挡下，留下这条 permission_denials 记录。形状从实测文件读，不手抄。
@@ -38,6 +43,71 @@ test('normalizeTerminal fails closed on unknown, missing, or non-object input', 
     assert.ok(normalized.reasons.length > 0);
     assert.ok(!('candidate' in normalized));
   }
+});
+
+// ---------------------------------------------------------------------------
+// error_max_turns 第二锚（D5）：「没干完」和「协议漂移」是两类事。2026-08-10 真实 run 里
+// max-turns 硬停的 17-key envelope 被单锚判成 malformed，thread.json 不落盘，resume 死锁。
+// ---------------------------------------------------------------------------
+
+test('CLAUDE_ERROR_MAX_TURNS_KEYS pins the measured error envelope exactly', () => {
+  assert.equal(CLAUDE_ERROR_MAX_TURNS_KEYS.length, 17);
+  assert.deepEqual([...Object.keys(errorMaxTurnsResult)].sort(), [...CLAUDE_ERROR_MAX_TURNS_KEYS].sort());
+  // 与成功锚的差集也是实测事实（少 5 多 1），锚表改动必须两边一起过目。
+  const success = new Set(CLAUDE_RESULT_KEYS);
+  const error = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
+  assert.deepEqual(
+    CLAUDE_RESULT_KEYS.filter((key) => !error.has(key)).sort(),
+    ['api_error_status', 'result', 'time_to_request_ms', 'ttft_ms', 'ttft_stream_ms'],
+  );
+  assert.deepEqual(CLAUDE_ERROR_MAX_TURNS_KEYS.filter((key) => !success.has(key)), ['errors']);
+});
+
+test('a measured error_max_turns envelope is a budget-exhausted candidate, not a terminal report', () => {
+  const normalized = normalizeTerminal(errorMaxTurnsResult);
+  assert.equal(normalized.ok, true);
+  assert.equal(normalized.budgetExhausted, true);
+  // candidate 恒 4 字段：budgetExhausted 是报告体信号，不得混进 candidate——workflow.mjs 的
+  // claudeTerminalState 做闭世界形状检查，多一个字段就把「未达标」变成形状错误。
+  assert.deepEqual(Object.keys(normalized.candidate).sort(),
+    ['is_error', 'permission_denials', 'subtype', 'terminal_reason']);
+  assert.equal(normalized.candidate.subtype, 'error_max_turns');
+  assert.equal(normalized.candidate.terminal_reason, 'max_turns');
+  // 它是候选但不是达标候选：公共状态机照常拒绝 Close，这正是「如实标注未达标」。
+  const verdict = runtimeTerminalState('claude', normalized.candidate);
+  assert.equal(verdict.ok, false);
+});
+
+test('the success path reports budgetExhausted=false explicitly', () => {
+  assert.equal(normalizeTerminal(realResult).budgetExhausted, false);
+});
+
+test('the error anchor is exhaustive: every key removed or added fails closed', () => {
+  for (const key of CLAUDE_ERROR_MAX_TURNS_KEYS) {
+    const mutated = { ...errorMaxTurnsResult };
+    delete mutated[key];
+    // 删 subtype 本身会把判定送回成功锚——两种走向都必须红。
+    const normalized = normalizeTerminal(mutated);
+    assert.equal(normalized.ok, false, `deleting ${key} must fail closed`);
+  }
+  const extra = normalizeTerminal({ ...errorMaxTurnsResult, surprise_key: 1 });
+  assert.equal(extra.ok, false);
+  // 隐私纪律与成功锚同款：只给计数，不回显 key 名。
+  assert.ok(extra.reasons.every((reason) => !reason.includes('surprise_key')));
+});
+
+test('cross-shape confusion fails closed in both directions and hints the right table', () => {
+  // 成功形态谎报 error_max_turns：按 error 锚判，多 5 缺 1，红。
+  const successBody = normalizeTerminal({ ...realResult, subtype: 'error_max_turns' });
+  assert.equal(successBody.ok, false);
+  assert.ok(successBody.reasons.some((reason) => reason.includes('CLAUDE_ERROR_MAX_TURNS_KEYS')));
+  // error 形态谎报 success：按成功锚判，缺 5 多 1，红。
+  const errorBody = normalizeTerminal({ ...errorMaxTurnsResult, subtype: 'success' });
+  assert.equal(errorBody.ok, false);
+  assert.ok(errorBody.reasons.some((reason) => reason.includes('CLAUDE_RESULT_KEYS')));
+  // 没建锚的 error subtype（形状同为 17-key）不放行：只为实测过的形态建锚，其余 fail closed。
+  const unanchored = normalizeTerminal({ ...errorMaxTurnsResult, subtype: 'error_during_execution' });
+  assert.equal(unanchored.ok, false);
 });
 
 // fault injection 类别③（hook 篡改探针）的 pipeline 末端：探针层（assertLaunchable 的 sha256/mode/
@@ -133,6 +203,7 @@ test('buildSettings shell-escapes hostile paths with POSIX single quotes', () =>
 const goodProbes = Object.freeze({
   contractHash: 'a'.repeat(64), confirmedHash: 'a'.repeat(64), baselineDigestStored: true,
   claudeVersion: '2.1.223',
+  claudeSessionIdFlag: true,
   settings: buildSettings({ hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir' }),
   hookScript: { path: '/state/dir/stop-hook.mjs', exists: true, sha256: 'f'.repeat(64), mode: '0500' },
   expectedHookSha256: 'f'.repeat(64),
@@ -141,8 +212,11 @@ const goodProbes = Object.freeze({
 });
 
 test('launchSpec/resumeSpec are pure argv data with settings pinned', () => {
-  const spec = launchSpec({ prompt: 'OBJECTIVE TEXT', settingsPath: '/state/dir/settings.json', cwd: '/work/root' });
+  const spec = launchSpec({
+    prompt: 'OBJECTIVE TEXT', settingsPath: '/state/dir/settings.json', cwd: '/work/root', sessionId: 'sid-launch',
+  });
   assert.deepEqual(spec.argv, ['claude', '-p', 'OBJECTIVE TEXT', '--output-format', 'json',
+    '--session-id', 'sid-launch',
     '--settings', '/state/dir/settings.json', '--permission-mode', 'acceptEdits',
     '--max-turns', String(CLI_MAX_TURNS)]);
   const resume = resumeSpec({ sessionId: 'sid-1', settingsPath: '/state/dir/settings.json',
@@ -182,6 +256,8 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
     { ...goodProbes, confirmedHash: 'b'.repeat(64) },
     { ...goodProbes, baselineDigestStored: false },
     { ...goodProbes, claudeVersion: '2.1.222' },                      // 低于实测下限的旧版本
+    { ...goodProbes, claudeSessionIdFlag: false },                    // --help 探测不到 --session-id
+    (() => { const p = { ...goodProbes }; delete p.claudeSessionIdFlag; return p; })(),  // 旧 probes.json 缺探测值
     { ...goodProbes, settings: { ...goodProbes.settings, disableAllHooks: true } },
     { ...goodProbes, settings: { hooks: goodProbes.settings.hooks, permissions: { deny: [] } } },  // 缺 deny
     { ...goodProbes, hookScript: { ...goodProbes.hookScript, exists: false } },

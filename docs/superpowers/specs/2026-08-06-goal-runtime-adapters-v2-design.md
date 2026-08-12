@@ -239,7 +239,7 @@ goalRpc(op, params) → envelope          （codex 专属，controller 独占声
 - **hook 执行器是新增组件**（四源审核收口）：现行代码没有 postflight 执行器——`captureCommand` 是 preflight 快照执行器（execFile、非零退出即 `COMMAND_FAILED` 整体抛错、输出哈希的**不变性**语义），与 hook 无复用关系。hook 执行器语义为**达标判定**：逐条跑、逐条记 exit code、多条红**收集不抛**、产出红项清单。
 - **判定**：全绿 → 放行停机（候选=达标）；有红且未超预算 → block，红项 id + 安全摘要作为 reason 馈回续轮；超 turn/时间预算（hook 在 state 文件计数）→ 放行停机（候选=未达，如实标注）。**【v2 实测 S3】生效的 block 协议 = hook 输出 JSON decision `{"decision":"block","reason":…}`（exit 0），非 exit code 2。**
 - **【v2 实测 S3】hook reason 与 objective 冲突风险（重要）**：hook 的 reason 是「建议」不是「强制」——若它与 objective 语义冲突，模型会遵从 objective 罢工 → 静默 block 到 max_turns 死循环（实测 8 轮全 block）。故控制器生成的 hook reason 措辞必须与 objective 兼容（只说「未达标、请补 X」，不与任务目标矛盾）；且 max_turns 耗尽须走「候选=未达」终局，不能无限 block。
-- **运行留痕**：hook 每次执行写一条 state 记录（时间戳 + 结果摘要）；控制器 postflight 校验「hook 运行次数 ≥ attempt 轮数」——把 hook 静默缺席（如 resume 未继承 settings、hook 被旁路移除）变成可验证的红。
+- **运行留痕**：hook 每次执行写一条 state 记录（时间戳 + 结果摘要）；控制器校验「累计 hook 运行次数 ≥ 累计明确期待 Stop hook 的候选轮次」——把 hook 静默缺席（如 resume 未继承 settings、hook 被旁路移除）变成可验证的红，同时不把不会触发 Stop 的 max-turns 硬停误报为缺席。
 - **定位声明**：hook 是续轮驱动器不是验收，其结论不进任何 controller 证据通道——hook 全绿仍可能被控制器 postflight 推翻（如越权 mutation 仅 baseline compare 可见）。
 - **env**：hook 命令需要的 env 由脚本从控制器指定的 env 文件加载；这是生成脚本的内部行为，不在「contract argv 禁 shell 字符串」管辖内。
 
