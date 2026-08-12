@@ -511,7 +511,7 @@ function hardProhibitionClaims(session, claims) {
   });
 }
 
-async function prepareCore({ store, sessionId, input }) {
+async function prepareCore({ store, sessionId, input, beforeCreate = () => {} }) {
   exactFields(input, [
     'attempt_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
   ], 'prepare_input');
@@ -524,8 +524,9 @@ async function prepareCore({ store, sessionId, input }) {
   };
   const existing = store.readCreationReceipt(creationRequest);
   if (existing !== null) {
-    return restorePrepared({ store, sessionId, runId: existing.identifier });
+    return recoverPreparedIdentity({ store, sessionId, runId: existing.identifier });
   }
+  beforeCreate();
   const session = store.read(sessionId);
   const targetRoots = session.design_revisions.at(-1).active_boundary.target_roots;
   const writable = session.design_revisions.at(-1).active_boundary.actions.includes('write');
@@ -564,12 +565,12 @@ async function prepareCore({ store, sessionId, input }) {
 }
 
 async function prepare(flags) {
-  assertCurrentLiveRollout(flags['state-root']);
   return withStore(flags['state-root'], async (store) => {
     const prepared = await prepareCore({
       store,
       sessionId: flags['session-id'],
       input: readJson(flags.input),
+      beforeCreate: () => assertCurrentLiveRollout(flags['state-root']),
     });
     return {
       ok: true,
@@ -579,6 +580,8 @@ async function prepare(flags) {
       run_id: prepared.run_id,
       attempt_hash: prepared.intent.attempt_hash,
       contract_hash: prepared.intent.contract_hash,
+      recovered: prepared.recovered === true,
+      intent_status: prepared.intent_status ?? 'pending',
       live_execution: false,
     };
   });
@@ -629,6 +632,20 @@ function restorePrepared({ store, sessionId, runId }) {
     intent,
     projection,
     runtime_prompt: attemptRuntimePrompt(projection),
+  };
+}
+
+function recoverPreparedIdentity({ store, sessionId, runId }) {
+  const stored = store.readLaunchIntent(runId);
+  const { status: intentStatus, ...intent } = stored;
+  if (intent.session_id !== sessionId) throw cliError('LAUNCH_INTENT_SESSION_MISMATCH');
+  return {
+    session_id: sessionId,
+    attempt_id: intent.attempt_id,
+    run_id: runId,
+    intent_status: intentStatus,
+    intent,
+    recovered: true,
   };
 }
 
@@ -705,13 +722,17 @@ async function launch(flags) {
 }
 
 async function resume(flags) {
-  assertCurrentLiveRollout(flags['state-root']);
   return withStore(flags['state-root'], async (store) => {
     const input = readJson(flags.input);
     exactFields(input, [
       'attempt_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
     ], 'resume_input');
-    const prepared = await prepareCore({ store, sessionId: flags['session-id'], input });
+    const prepared = await prepareCore({
+      store,
+      sessionId: flags['session-id'],
+      input,
+      beforeCreate: () => assertCurrentLiveRollout(flags['state-root']),
+    });
     return {
       ok: true,
       command: 'resume',
@@ -722,6 +743,8 @@ async function resume(flags) {
       disposition: 'prepared',
       attempt_hash: prepared.intent.attempt_hash,
       contract_hash: prepared.intent.contract_hash,
+      recovered: prepared.recovered === true,
+      intent_status: prepared.intent_status ?? 'pending',
       live_execution: false,
     };
   });

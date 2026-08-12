@@ -343,6 +343,79 @@ test('init captures a baseline and resume durably prepares before a separate lau
   assert.equal(recovered.stdoutJson.run_id, preparedAgain.stdoutJson.run_id);
 });
 
+test('a lost prepare response remains recoverable after the Session revision changes', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'target');
+  await mkdir(target);
+  const draft = validCliInput('7'.repeat(32));
+  draft.authority.target_roots = [target];
+  draft.authority.hard_prohibitions = [];
+  draft.initial_design.active_boundary.target_roots = [target];
+  draft.initial_design.conditions[0].verifier.cwd = target;
+  draft.initial_design.conditions[0].verifier.argv = [process.execPath, '--version'];
+  const initialized = run([
+    'init', '--state-root', stateRoot,
+    '--input', await writeJson(root, 'recovery-draft.json', draft),
+    '--capture-baseline', 'true',
+  ]).stdoutJson;
+  assert.equal(run([
+    'confirm', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', await writeJson(root, 'recovery-confirmation.json', {
+      authorization_hash: initialized.authorization_hash,
+      thread_id: 'thread-recovery', message_ref: 'message-recovery', source: 'codex-task',
+    }),
+  ]).status, 0);
+  assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'recovery-mode.json', {
+    action: 'set', next: 'canary', changed_at: '2026-08-12T00:00:00.000Z', canary_session_id: null,
+  })]).status, 0);
+  const prepareInput = {
+    attempt_id: 'attempt-lost-response',
+    nonce: '77889900aabbccddeeff001122334455',
+    expires_at: '2099-08-12T00:00:00.000Z',
+    hard_prohibition_capabilities: [],
+  };
+  const preparePath = await writeJson(root, 'recovery-prepare.json', prepareInput);
+  const first = run([
+    'prepare', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', preparePath,
+  ]);
+  assert.equal(first.status, 0, first.stderr);
+
+  const condition = structuredClone(draft.initial_design.conditions[0]);
+  condition.id = 'condition-after-lost-response';
+  condition.verifier.id = 'verify-after-lost-response';
+  condition.projection.criterion_id = 'success-after-lost-response';
+  const revised = run([
+    'revise', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', await writeJson(root, 'recovery-revision.json', {
+      operation: {
+        version: 1,
+        type: 'ADD_CONDITION',
+        reason: 'simulate a controller revision after stdout was lost',
+        evidence_refs: [],
+        payload: { condition },
+      },
+    }),
+  ]);
+  assert.equal(revised.status, 0, revised.stderr);
+  const disabled = run([
+    'mode', '--state-root', stateRoot,
+    '--input', await writeJson(root, 'recovery-mode-disabled.json', {
+      action: 'set', next: 'disabled', changed_at: '2026-08-12T00:01:00.000Z', canary_session_id: null,
+    }),
+  ]);
+  assert.equal(disabled.status, 0, disabled.stderr);
+
+  const recovered = run([
+    'prepare', '--state-root', stateRoot, '--session-id', initialized.session_id,
+    '--input', preparePath,
+  ]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(recovered.stdoutJson.run_id, first.stdoutJson.run_id);
+  assert.equal(recovered.stdoutJson.recovered, true);
+  assert.equal(recovered.stdoutJson.intent_status, 'pending');
+});
+
 test('read-only Authority rejects target mutations before prepare', async () => {
   const { root, stateRoot } = await workspace();
   const target = join(root, 'target');
