@@ -52,6 +52,7 @@ import {
   ensureRolloutState,
   writeRolloutMode,
 } from './rollout.mjs';
+import { resolveControllerStateRoot } from './state-root.mjs';
 import { openSessionStore } from './store.mjs';
 import { assertRootIdentities, assertStableStateRoot, exactFields } from './values.mjs';
 import { verifyConditions } from './verification.mjs';
@@ -120,7 +121,10 @@ function parseArgs(argv) {
     flags[name] = value;
   }
   for (const name of specification.required) {
-    if (!(name in flags)) throw cliError('CLI_FLAG_REQUIRED');
+    if (!(name in flags) && name !== 'state-root') throw cliError('CLI_FLAG_REQUIRED');
+  }
+  if (specification.required.includes('state-root')) {
+    flags['state-root'] = resolveControllerStateRoot({ explicit: flags['state-root'] });
   }
   return { command, flags };
 }

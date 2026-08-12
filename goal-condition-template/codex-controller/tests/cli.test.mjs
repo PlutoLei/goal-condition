@@ -23,8 +23,8 @@ async function writeJson(root, name, value) {
   return path;
 }
 
-function run(args) {
-  const child = spawnSync(process.execPath, [cliPath, ...args], { encoding: 'utf8' });
+function run(args, { env = process.env } = {}) {
+  const child = spawnSync(process.execPath, [cliPath, ...args], { encoding: 'utf8', env });
   return {
     ...child,
     stdoutJson: child.stdout.trim() === '' ? null : JSON.parse(child.stdout),
@@ -74,6 +74,72 @@ test('controlled CLI executes through the installed release symlink', async () =
   assert.equal(child.status, 1);
   assert.equal(child.stdout, '');
   assert.deepEqual(JSON.parse(child.stderr), { ok: false, code: 'CLI_COMMAND_UNKNOWN' });
+});
+
+test('stateful commands share the canonical environment store while an explicit root stays isolated', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'target');
+  await mkdir(target);
+  const draft = validDraft();
+  draft.authority.target_roots = [target];
+  draft.authority.hard_prohibitions = [];
+  draft.initial_design.active_boundary.target_roots = [target];
+  draft.initial_design.conditions[0].verifier.cwd = target;
+  draft.initial_design.conditions[0].verifier.argv = [process.execPath, '--version'];
+  const env = { ...process.env, GOAL_CONDITION_CODEX_STATE_ROOT: stateRoot };
+  const draftPath = await writeJson(root, 'canonical-draft.json', draft);
+
+  const initialized = run([
+    'init', '--input', draftPath, '--capture-baseline', 'true',
+  ], { env });
+  assert.equal(initialized.status, 0, initialized.stderr);
+  assert.equal(initialized.stdoutJson.status, 'AwaitingConfirmation');
+
+  const previewed = run(['preview', '--session-id', draft.session_id], { env });
+  assert.equal(previewed.status, 0, previewed.stderr);
+  assert.equal(previewed.stdoutJson.authorization_hash, initialized.stdoutJson.authorization_hash);
+
+  const confirmation = await writeJson(root, 'canonical-confirmation.json', {
+    authorization_hash: initialized.stdoutJson.authorization_hash,
+    thread_id: 'thread-canonical',
+    message_ref: 'message-canonical-confirmed',
+    source: 'codex-task',
+  });
+  const confirmed = run([
+    'confirm', '--session-id', draft.session_id, '--input', confirmation,
+  ], { env });
+  assert.equal(confirmed.status, 0, confirmed.stderr);
+  assert.equal(confirmed.stdoutJson.status, 'Ready');
+
+  const get = await writeJson(root, 'canonical-mode-get.json', {
+    action: 'get', next: null, changed_at: null, canary_session_id: null,
+  });
+  assert.equal(run(['mode', '--input', get], { env }).stdoutJson.mode, 'disabled');
+
+  const explicitRoot = join(root, 'explicit-state');
+  const explicit = run([
+    'mode', '--state-root', explicitRoot, '--input', get,
+  ], { env });
+  assert.equal(explicit.status, 0, explicit.stderr);
+  assert.equal(explicit.stdoutJson.mode, 'disabled');
+  assert.equal(run([
+    'status', '--state-root', explicitRoot, '--session-id', draft.session_id,
+  ], { env }).stderrJson.code, 'SESSION_NOT_FOUND');
+});
+
+test('invalid canonical state-root environment values fail closed without a home fallback', async () => {
+  const { root } = await workspace();
+  const get = await writeJson(root, 'invalid-mode-get.json', {
+    action: 'get', next: null, changed_at: null, canary_session_id: null,
+  });
+  for (const invalid of ['', 'relative-state-root']) {
+    const result = run(['mode', '--input', get], {
+      env: { ...process.env, GOAL_CONDITION_CODEX_STATE_ROOT: invalid },
+    });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderrJson.code, 'STATE_ROOT_INVALID');
+  }
 });
 
 test('init can capture a controller-owned root baseline and prepare a durable Attempt', async () => {
