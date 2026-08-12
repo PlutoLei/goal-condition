@@ -96,6 +96,7 @@ export function prepareControlledAttempt({
     creationRequest,
   });
   const effectiveIntent = intentWithoutStatus(persisted);
+  const recovered = effectiveIntent.run_id !== runId;
   const effectiveOwnerToken = sha256(canonicalJson({
     session_id: effectiveIntent.session_id,
     attempt_id: effectiveIntent.attempt_id,
@@ -108,8 +109,10 @@ export function prepareControlledAttempt({
     run_id: effectiveIntent.run_id,
     intent: effectiveIntent,
     owner_token: effectiveOwnerToken,
-    projection,
-    runtime_prompt: attemptRuntimePrompt(projection),
+    intent_status: persisted.status,
+    recovered,
+    projection: recovered ? null : projection,
+    runtime_prompt: recovered ? null : attemptRuntimePrompt(projection),
   };
 }
 
