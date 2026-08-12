@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://goal-condition.dev/schema/codex/revision-operation-v1.schema.json",
+  "title": "Codex GoalSession typed revision operation v1",
+  "$ref": "#/$defs/operationBase",
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "operationType": {
+      "enum": [
+        "ADD_CONDITION",
+        "ADD_AND_VERIFIER",
+        "TIGHTEN_TYPED_THRESHOLD",
+        "NARROW_ACTIVE_BOUNDARY",
+        "EXPAND_WITHIN_AUTHORITY",
+        "REFRESH_CONTEXT",
+        "REPLACE_EQUIVALENT_VERIFIER",
+        "CONTROLLER_CORRECTION",
+        "EXPAND_AUTHORITY",
+        "WEAKEN_CONDITION",
+        "CHANGE_GOAL",
+        "UNCLASSIFIED"
+      ]
+    },
+    "operationBase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "type", "reason", "evidence_refs", "payload"],
+      "properties": {
+        "version": { "const": 1 },
+        "type": { "$ref": "#/$defs/operationType" },
+        "reason": { "type": "string", "minLength": 1 },
+        "evidence_refs": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "payload": {
+          "oneOf": [
+            { "$ref": "#/$defs/conditionPayload" },
+            { "$ref": "#/$defs/thresholdPayload" },
+            { "$ref": "#/$defs/boundaryPayload" },
+            { "$ref": "#/$defs/contextPayload" },
+            { "$ref": "#/$defs/verifierPayload" },
+            { "$ref": "#/$defs/correctionPayload" },
+            { "$ref": "#/$defs/authorityPayload" },
+            { "$ref": "#/$defs/weakeningPayload" },
+            { "$ref": "#/$defs/goalPayload" },
+            { "$ref": "#/$defs/unclassifiedPayload" }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "enum": ["ADD_CONDITION", "ADD_AND_VERIFIER"] } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/conditionPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "TIGHTEN_TYPED_THRESHOLD" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/thresholdPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "enum": ["NARROW_ACTIVE_BOUNDARY", "EXPAND_WITHIN_AUTHORITY"] } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/boundaryPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "REFRESH_CONTEXT" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/contextPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "REPLACE_EQUIVALENT_VERIFIER" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/verifierPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "CONTROLLER_CORRECTION" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/correctionPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "EXPAND_AUTHORITY" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/authorityPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "WEAKEN_CONDITION" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/weakeningPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "CHANGE_GOAL" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/goalPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "UNCLASSIFIED" } } },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/unclassifiedPayload" } } }
+        }
+      ]
+    },
+    "conditionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition"],
+      "properties": {
+        "condition": { "$ref": "goal-session-v2.schema.json#/$defs/condition" }
+      }
+    },
+    "thresholdPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition_id", "comparator", "from", "to"],
+      "properties": {
+        "condition_id": { "type": "string", "minLength": 1 },
+        "comparator": { "enum": ["gte", "lte", "eq", "subset"] },
+        "from": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "boolean" },
+            { "type": "array", "uniqueItems": true, "items": { "type": "string" } }
+          ]
+        },
+        "to": {
+          "oneOf": [
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "boolean" },
+            { "type": "array", "uniqueItems": true, "items": { "type": "string" } }
+          ]
+        }
+      }
+    },
+    "boundaryPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["active_boundary"],
+      "properties": {
+        "active_boundary": { "$ref": "goal-session-v2.schema.json#/$defs/activeBoundary" }
+      }
+    },
+    "contextPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dependency_id", "prior_hash", "next_hash"],
+      "properties": {
+        "dependency_id": { "type": "string", "minLength": 1 },
+        "prior_hash": { "$ref": "#/$defs/hash" },
+        "next_hash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "verifierPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition_id", "verifier", "proof_ref"],
+      "properties": {
+        "condition_id": { "type": "string", "minLength": 1 },
+        "verifier": { "$ref": "goal-session-v2.schema.json#/$defs/verifier" },
+        "proof_ref": { "type": "string", "minLength": 1 }
+      }
+    },
+    "correctionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "prior_hash", "next_value"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "prior_hash": { "$ref": "#/$defs/hash" },
+        "next_value": true
+      }
+    },
+    "authorityPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["authority"],
+      "properties": {
+        "authority": { "$ref": "goal-session-v2.schema.json#/$defs/authority" }
+      }
+    },
+    "weakeningPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["condition_id", "replacement"],
+      "properties": {
+        "condition_id": { "type": "string", "minLength": 1 },
+        "replacement": { "$ref": "goal-session-v2.schema.json#/$defs/condition" }
+      }
+    },
+    "goalPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "non_goals"],
+      "properties": {
+        "goal": { "$ref": "goal-session-v2.schema.json#/$defs/goal" },
+        "non_goals": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "unclassifiedPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["description"],
+      "properties": {
+        "description": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

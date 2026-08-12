@@ -4,6 +4,13 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 const evidenceUrl = new URL('../evidence/pressure-evidence.json', import.meta.url);
+const codexV2EvidenceUrl = new URL(
+  '../evidence/codex-goal-session-v2-pressure-evidence.json',
+  import.meta.url,
+);
+const codexV2SkillUrl = new URL('../SKILL.md', import.meta.url);
+const codexV2ReferenceUrl = new URL('../references/adapters/codex.md', import.meta.url);
+const codexV2ProtocolUrl = new URL('../references/codex-goal-session-v2.md', import.meta.url);
 
 function digest(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex');
@@ -44,5 +51,89 @@ test('public pressure evidence contains five genuine paired text-only samples', 
         sample.variant === 'with-skill' ? evidence.skill_instructions.sha256 : null,
       );
     }
+  }
+});
+
+test('Codex GoalSession v2 pressure evidence preserves RED and requires paired GREEN samples', async () => {
+  const evidence = JSON.parse(await readFile(codexV2EvidenceUrl, 'utf8'));
+  assert.equal(evidence.schema_version, 1);
+  assert.ok(['red_captured', 'green_verified'].includes(evidence.campaign_status));
+  assert.equal(evidence.protocol.fresh_context_per_sample, true);
+  assert.match(evidence.protocol.limitation, /observational.*not deterministic proof/i);
+  assert.equal(
+    evidence.v2_guidance.skill_sha256,
+    digest(await readFile(codexV2SkillUrl, 'utf8')),
+    'GREEN samples must bind the exact Skill bytes they read',
+  );
+  assert.equal(
+    evidence.v2_guidance.codex_reference_sha256,
+    digest(await readFile(codexV2ReferenceUrl, 'utf8')),
+    'GREEN samples must bind the exact Codex reference bytes they read',
+  );
+  assert.equal(
+    evidence.v2_guidance.protocol_reference_sha256,
+    digest(await readFile(codexV2ProtocolUrl, 'utf8')),
+    'GREEN samples must bind the exact GoalSession protocol bytes they read',
+  );
+
+  const expectedScenarios = [
+    'repeated-contract-pressure',
+    'false-green-pressure',
+    'grill-confusion',
+  ];
+  assert.deepEqual(evidence.scenarios.map((item) => item.id).sort(), expectedScenarios.sort());
+
+  const groups = [...evidence.scenarios, ...evidence.controls];
+  for (const group of groups) {
+    assert.equal(typeof group.prompt, 'string');
+    assert.ok(group.prompt.length > 0);
+    if (group.prompt_redacted === true) {
+      assert.equal(group.prompt_template_sha256, digest(group.prompt));
+      assert.match(group.actual_prompt_sha256, /^[0-9a-f]{64}$/);
+    }
+    for (const sample of group.samples) {
+      assert.equal(
+        sample.prompt_sha256,
+        group.prompt_redacted === true ? group.actual_prompt_sha256 : digest(group.prompt),
+      );
+      assert.ok(['no-v2-guidance', 'with-v2-guidance'].includes(sample.variant));
+      assert.ok(['PASS', 'FAIL'].includes(sample.verdict));
+      assert.equal(typeof sample.output, 'string');
+      assert.ok(sample.output.length > 0);
+      assert.equal(typeof sample.tools_used, 'boolean');
+      assert.equal(typeof sample.private_context_used, 'boolean');
+      assert.equal(typeof sample.limitation, 'string');
+      assert.ok(sample.limitation.length > 0);
+    }
+  }
+
+  const repeated = evidence.scenarios.find((item) => item.id === 'repeated-contract-pressure');
+  assert.ok(
+    repeated.samples.filter((sample) => sample.variant === 'no-v2-guidance').length >= 5,
+    'S1 needs at least five independently judged no-guidance controls',
+  );
+
+  const allSamples = groups.flatMap((group) => group.samples);
+  assert.ok(
+    allSamples.some((sample) => sample.variant === 'no-v2-guidance' && sample.verdict === 'FAIL'),
+    'the baseline campaign must preserve a genuine RED sample',
+  );
+
+  if (evidence.campaign_status === 'green_verified') {
+    for (const group of evidence.scenarios) {
+      const variants = new Set(group.samples.map((sample) => sample.variant));
+      assert.equal(variants.has('no-v2-guidance'), true);
+      assert.equal(variants.has('with-v2-guidance'), true);
+      assert.equal(
+        group.samples
+          .filter((sample) => sample.variant === 'with-v2-guidance')
+          .every((sample) => sample.verdict === 'PASS'),
+        true,
+      );
+    }
+    assert.ok(
+      repeated.samples.filter((sample) => sample.variant === 'with-v2-guidance').length >= 5,
+      'S1 needs at least five independently judged with-guidance controls',
+    );
   }
 });

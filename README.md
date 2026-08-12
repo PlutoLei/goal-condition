@@ -55,7 +55,7 @@ GOAL: <一句话，带语境>
 | runtime adapter | 以已确认 contract 启动 Claude 或 Codex | 不补写目标、预算或权限承诺 |
 | postflight / close | 主会话独立复验产物与边界 | 使用原先保存的 digest 比较基线；任一差异都不得完成 |
 
-`success_criteria.command` 仅是给人审阅的精确命令说明。机器执行只接受 `cwd` 加 `argv[]` 的结构化 command；不会使用 `eval`、`sh -c` 或 shell 拼接。
+`success_criteria.command` 仅是给人审阅的精确命令说明。机器执行只接受 `cwd` 加 `argv[]` 的结构化 command，并以 `shell:false` 启动；不会使用 `eval` 或隐式 shell 拼接。若 Condition 明确把 `/bin/sh -c` 写进 argv，它仍是被审计、hash-bound 且在 verifier sandbox 内执行的显式程序。
 
 ### 完整 preview、hash 与基线握手
 
@@ -80,9 +80,15 @@ Claude 与 Codex 共用同一 contract 和基线握手，但终态按各自接�
 
 两个 runtime 都必须先由主会话建立 controller-owned `runBinding`，并提交同一 binding 的 `preflightEvidence` 后才能 launch；两者的独立终验也都使用 bound `postflightEvidence`。Codex 另外要求 `finalizationReceipt` 与 `runtimeReadback`。候选 runtimeResult 不得伪造这些证据；任何缺项、乱序、cross-binding、blocked、权限错误或 remaining work 都 fail closed。
 
+### Codex GoalSession v2
+
+新 Codex task 在 default rollout 下使用 Codex-only GoalSession v2：用户只确认稳定 Goal 与 Maximum Authority，Boundary、Condition 与 content-bound Context 在授权内以 typed Design Revision 演化，每次 revision 产生新的 immutable Attempt。Grill 只用于设计评审，不进入 runtime。Context path 必须在 Active Boundary 内；无 `write` Authority 的 Attempt 使用 `read-only` sandbox，获授 `write` 才使用 `workspace-write`。
+
+LaunchIntent MAC 绑定 controller release digest、Attempt 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。`opt-in→default` 的 canary receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary，不能复用旧版本绿证据。
+
 ## 安装与私有 profile
 
-安装器从明确的 Git commit 物化共享核心，而不是复制目录。它把私有 profile 注入 release，并为 Claude 与 Codex 创建指向同一 release 的链接；profile 不应提交到这个公开仓。安装输出包含 `manifestDigest`，它是 release 外部（external）保留的信任根，不能从待验证 release 自己重建。本节两段命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`，两者指的是同一个文件，差别只在你站在哪一层。下面仅展示参数形状，所有值都是占位符，示例不执行安装：
+安装器从明确的 Git commit 物化共享核心，而不是复制目录。它把私有 profile 注入 release，并只切换命令中显式给出的 runtime link；因此可以同时切 Claude/Codex，也可以像本次 Codex-only rollout 一样只给 `--link codex=...`，Claude link 保持旧 release。profile 不应提交到这个公开仓。安装输出包含 `manifestDigest`，它是 release 外部（external）保留的信任根，不能从待验证 release 自己重建。本节两段命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`，两者指的是同一个文件，差别只在你站在哪一层。下面仅展示 Codex-only 参数形状，所有值都是占位符，示例不执行安装：
 
 ```text
 node goal-condition-template/scripts/install.mjs install \
@@ -90,7 +96,6 @@ node goal-condition-template/scripts/install.mjs install \
   --ref <COMMIT_SHA> \
   --profile <PRIVATE_PROFILE_FILE> \
   --release-root <RELEASE_DIRECTORY> \
-  --link claude=<CLAUDE_SKILL_LINK> \
   --link codex=<CODEX_SKILL_LINK>
 ```
 
@@ -108,6 +113,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `references/run-contract.md`
 - `references/adapters/claude.md`
 - `references/adapters/codex.md`
+- `references/codex-goal-session-v2.md`
 - `schema/run-contract.schema.json`
 - `scripts/validate-contract.mjs`
 - `scripts/snapshot.mjs`
@@ -119,6 +125,27 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `scripts/launch.mjs`
 - `scripts/lib/adapters/claude.mjs`
 - `scripts/lib/adapters/codex.mjs`
+- `codex-controller/package.json`
+- `codex-controller/schema/goal-session-v2.schema.json`
+- `codex-controller/schema/revision-operation-v1.schema.json`
+- `codex-controller/src/adoption.mjs`
+- `codex-controller/src/attempt.mjs`
+- `codex-controller/src/capabilities.mjs`
+- `codex-controller/src/cli.mjs`
+- `codex-controller/src/compiler.mjs`
+- `codex-controller/src/domain.mjs`
+- `codex-controller/src/evidence.mjs`
+- `codex-controller/src/execution.mjs`
+- `codex-controller/src/index.mjs`
+- `codex-controller/src/policy.mjs`
+- `codex-controller/src/projector.mjs`
+- `codex-controller/src/recovery.mjs`
+- `codex-controller/src/release.mjs`
+- `codex-controller/src/rollout.mjs`
+- `codex-controller/src/shadow.mjs`
+- `codex-controller/src/store.mjs`
+- `codex-controller/src/values.mjs`
+- `codex-controller/src/verification.mjs`
 
 安装事务对 runtime link parent、release root 与 backup root 的物理 directory identity 反复核对；stage、backup、cutover、readback、rollback 或 owned cleanup 期间发生祖先重定向都会 fail closed。
 
@@ -134,7 +161,7 @@ npm test
 
 发布面泄漏闸（`tests/publish-surface.test.mjs`）扫描**每一个被 Git 跟踪的文本文件**，按模式类而不是按已知样例判定：家目录绝对路径、per-user 临时目录 salt、真实 UUID、凭证样式串、真实邮箱地址。合成占位靠形态与真值区分（合成 UUID 的首段是 8 个相同字符），因此新增占位值不需要维护白名单。它与上面那道 Markdown 隐私门禁关注点不同，互不替代：后者只看 loader 会读进上下文的 Markdown，还要管 `$1` 展开这类 loader hazard。自动测试不会启动真实 goal、访问网络或写入真实 runtime 安装位置；installer 回归会在测试专属临时目录中执行真实 materialize、backup、atomic link switch、rollback 与 TOCTOU fault injection。
 
-`goal-condition-template/evidence/pressure-evidence.json` 保存 prompt injection、多目标压力、伪 physical mechanism、临时 context 和虚假完成五类无工具、无私有上下文的成对模型样本。它用于公开审阅指令是否改变模型行为；model sample evidence is not deterministic unit proof，也不替代 schema、状态机与故障注入测试。`pressure-cases.json` 只是确定性的状态机 regression fixture，不被包装成独立行为实验。
+`goal-condition-template/evidence/pressure-evidence.json` 保存 prompt injection、多目标压力、伪 physical mechanism、临时 context 和虚假完成五类无工具、无私有上下文的成对模型样本；`codex-goal-session-v2-pressure-evidence.json` 保存动态修订、false-green 与 Grill/runtime 混淆的 RED/GREEN 样本。它们用于公开审阅指令是否改变模型行为；model sample evidence is not deterministic unit proof，也不替代 schema、状态机、真实 canary 与故障注入测试。`pressure-cases.json` 只是确定性的状态机 regression fixture，不被包装成独立行为实验。
 
 ## 历史评估说明
 

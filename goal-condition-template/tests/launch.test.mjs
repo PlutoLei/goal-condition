@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile as execFileCallback, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import {
@@ -14,7 +15,7 @@ import { promisify } from 'node:util';
 import {
   MAX_AUTO_RESUMES, stateDirFor, initStateDir, nextAttempt, AttemptClaimError, classifyPostflightRed,
   compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, runClaudeAttempt,
-  prepareCodexProbesOnly, runCodexLaunch, runCodexResume, runCodexFinalize, runCodexClose,
+  prepareCodexProbesOnly, runCodexLaunch, runCodexReadback, runCodexResume, runCodexFinalize, runCodexClose,
   POLL_INTERVAL_MS, WALL_CLOCK_DEADLINE_MS, LEASE_TTL_MS, releaseOwnLease, releaseResidualLease,
   MAX_TURNS_PER_ATTEMPT, MAX_TOKENS_PER_ATTEMPT,
 } from '../scripts/launch.mjs';
@@ -1021,6 +1022,19 @@ function makeFakeCodexClientFactory({
         emit('thread/goal/get', params, { goal });
         return { result: { goal } };
       },
+      async threadRead(params) {
+        calls.push(['threadRead', params]);
+        const text = calls.find(([method]) => method === 'turnStart')?.[1]?.text;
+        const items = typeof text === 'string' ? [{
+          type: 'userMessage',
+          content: [{ type: 'text', text, text_elements: [] }],
+        }] : [];
+        const result = {
+          thread: { id: threadId, turns: [{ id: 'turn-1', status: 'completed', items }] },
+        };
+        emit('thread/read', params, result);
+        return { result };
+      },
       onNotification(cb) { notifyCbs.push(cb); },
       async stop() { calls.push(['stop']); },
     };
@@ -1071,6 +1085,71 @@ test('runCodexLaunch happy path: active set, polls to complete, candidate + ledg
   ]);
   const goalSetCall = calls.find((c) => c[0] === 'goalSet');
   assert.equal(goalSetCall[1].tokenBudget, 50000);   // budget.user_provided && max_tokens → 带 tokenBudget
+});
+
+test('runCodexLaunch passes an explicitly selected read-only sandbox to thread/start', async () => {
+  const contract = makeCodexContract({
+    constraints: [{
+      id: 'c-sandbox',
+      enforcement: 'physical',
+      rule: 'the target root is read-only',
+      mechanism: 'OS sandbox (macOS Seatbelt) enforces --sandbox read-only',
+      verify: 'inspect the sandbox mode applied to thread/start',
+    }],
+  });
+  const { stateDir, binding } = await setupCodexState({ contract });
+  const authSource = await makeFakeAuthSource();
+  const { factory, calls } = makeFakeCodexClientFactory({
+    setGoal: makeGoal('active'), pollGoals: [makeGoal('complete')],
+  });
+
+  const result = await runCodexLaunch({
+    contract,
+    stateDir,
+    prompt: 'OBJECTIVE TEXT',
+    binding,
+    sandboxMode: 'read-only',
+    clientFactory: factory,
+    authSource,
+    pollIntervalMs: 5,
+  });
+
+  assert.equal(result.outcome, 'candidate');
+  assert.equal(calls.find(([method]) => method === 'threadStart')[1].sandbox, 'read-only');
+});
+
+test('runCodexLaunch keeps the native objective short and readback attributes the started turn', async () => {
+  const { stateDir, contract, binding } = await setupCodexState();
+  const authSource = await makeFakeAuthSource();
+  const { factory, calls } = makeFakeCodexClientFactory({
+    setGoal: makeGoal('active'),
+    pollGoals: [makeGoal('complete')],
+  });
+  const launched = await runCodexLaunch({
+    contract,
+    stateDir,
+    prompt: 'SHORT GOAL',
+    turnText: 'LONG HASH-BOUND CONTEXT PACKAGE',
+    binding,
+    clientFactory: factory,
+    authSource,
+    pollIntervalMs: 1,
+  });
+  assert.equal(launched.outcome, 'candidate');
+  assert.equal(calls.find(([name]) => name === 'goalSet')[1].objective, 'SHORT GOAL');
+  const sentText = calls.find(([name]) => name === 'turnStart')[1].text;
+  assert.match(sentText, /^LONG HASH-BOUND CONTEXT PACKAGE/);
+  assert.match(sentText, /Controller Turn Correlation: [0-9a-f]{64}/);
+  assert.equal(
+    launched.turnInputSha256,
+    createHash('sha256').update(sentText, 'utf8').digest('hex'),
+  );
+  const readback = await runCodexReadback({ stateDir, clientFactory: factory, authSource });
+  assert.deepEqual(readback, {
+    available: true,
+    thread_id: 't-fake',
+    turns: [{ id: 'turn-1', status: 'completed', input_sha256: launched.turnInputSha256 }],
+  });
 });
 
 test('runCodexLaunch omits tokenBudget from goal.set when the contract budget has no max_tokens', async () => {
@@ -1464,7 +1543,7 @@ function dyingCodexStdioStub() {
   Object.assign(child, { stdin, stdout, kill: () => {} });
   const results = {
     initialize: {},
-    'thread/start': { thread: { id: 't-stub' } },
+    'thread/start': { thread: { id: 't-stub', turns: [] } },
     'thread/goal/set': { goal: makeGoal('active', { threadId: 't-stub' }) },
     'turn/start': { turn: { id: 'turn-1' } },
   };
@@ -2104,11 +2183,13 @@ const RESUMED_SESSION_DEFAULTS = () => ({
 
 function makeFakeCodexSessionFactory({
   setGoal, pollGoals = [], readbackGoal, threadId = 't-fake', resumeConfig,
+  threadReadTurns = [[{ id: 'turn-1', status: 'completed' }]],
 } = {}) {
   const calls = [];
   const factory = ({ onEnvelope }) => {
     let nextId = 0;
     let pollIndex = 0;
+    let threadReadIndex = 0;
     const notifyCbs = [];
     const emit = (method, params, result) => {
       nextId += 1;
@@ -2171,6 +2252,12 @@ function makeFakeCodexSessionFactory({
       async goalClear(params) {
         calls.push({ method: 'thread/goal/clear', params });
         return emit('thread/goal/clear', params, {});
+      },
+      async threadRead(params) {
+        calls.push({ method: 'thread/read', params });
+        const turns = threadReadTurns[Math.min(threadReadIndex, threadReadTurns.length - 1)];
+        threadReadIndex += 1;
+        return emit('thread/read', params, { thread: { id: threadId, turns } });
       },
       onNotification(cb) { notifyCbs.push(cb); },
       async stop() { calls.push({ method: 'stop' }); },
@@ -2706,7 +2793,7 @@ test('runCodexFinalize happy path writes both controller-owned evidence files an
   });
 
   const result = await runCodexFinalize({
-    stateDir, binding, clientFactory: factory, authSource,
+    stateDir, binding, clientFactory: factory, authSource, expectedTurnIds: ['turn-1'],
   });
 
   assert.equal(result.attribution.ok, true);
@@ -2730,11 +2817,11 @@ test('runCodexFinalize happy path writes both controller-owned evidence files an
     binding,
   });
 
-  // set 在前、readback 在后（顺序本身是归因的一部分）。
+  // Native turn fence surrounds the terminal mutation; both observations must match the receipt.
   assert.deepEqual(calls.map((c) => c.method), [
-    'start', 'initialize', 'thread/goal/set', 'thread/goal/get', 'stop',
+    'start', 'initialize', 'thread/read', 'thread/goal/set', 'thread/goal/get', 'thread/read', 'stop',
   ]);
-  assert.deepEqual(calls[2].params, { threadId: 't-fake', status: 'complete' });
+  assert.deepEqual(calls[3].params, { threadId: 't-fake', status: 'complete' });
 
   const ledger = (await readFile(join(stateDir, 'goal-set-ledger.jsonl'), 'utf8'))
     .trim().split('\n').map((line) => JSON.parse(line));
@@ -2742,6 +2829,110 @@ test('runCodexFinalize happy path writes both controller-owned evidence files an
   assert.equal(ledger[1].requestedStatus, 'complete');
   assert.equal(ledger[1].threadId, 't-fake');
   assert.equal(ledger[1].updatedAt, 1786000900);
+});
+
+test('runCodexFinalize binds the persisted turn input bytes for GoalSession v2', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const sentText = 'controller turn\n\nController Turn Correlation: ' + '7'.repeat(64);
+  const inputSha256 = createHash('sha256').update(sentText, 'utf8').digest('hex');
+  const persistedTurn = {
+    id: 'turn-1',
+    status: 'completed',
+    items: [{
+      type: 'userMessage',
+      content: [{ type: 'text', text: sentText, text_elements: [] }],
+    }],
+  };
+  const { factory } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal,
+    readbackGoal: completeGoal,
+    threadReadTurns: [[persistedTurn]],
+  });
+
+  const result = await runCodexFinalize({
+    stateDir,
+    binding,
+    clientFactory: factory,
+    authSource,
+    expectedTurns: [{ id: 'turn-1', input_sha256: inputSha256 }],
+  });
+
+  assert.equal(result.attribution.ok, true);
+  assert.equal(result.turnFence.ok, true);
+});
+
+test('runCodexFinalize rejects a matching turn id with different persisted input bytes', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const { factory, calls } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal,
+    readbackGoal: completeGoal,
+    threadReadTurns: [[{
+      id: 'turn-1',
+      status: 'completed',
+      items: [{
+        type: 'userMessage',
+        content: [{ type: 'text', text: 'external turn', text_elements: [] }],
+      }],
+    }]],
+  });
+
+  const result = await runCodexFinalize({
+    stateDir,
+    binding,
+    clientFactory: factory,
+    authSource,
+    expectedTurns: [{ id: 'turn-1', input_sha256: '7'.repeat(64) }],
+  });
+
+  assert.equal(result.attribution.ok, false);
+  assert.deepEqual(result.turnFence.reason_codes, ['UNRECEIPTED_NATIVE_TURN']);
+  assert.equal(calls.some((call) => call.method === 'thread/goal/set'), false);
+});
+
+test('runCodexFinalize refuses an unreceipted turn before terminal mutation', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const { factory, calls } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal,
+    readbackGoal: completeGoal,
+    threadReadTurns: [[
+      { id: 'turn-1', status: 'completed' },
+      { id: 'turn-unreceipted', status: 'completed' },
+    ]],
+  });
+
+  const result = await runCodexFinalize({
+    stateDir, binding, clientFactory: factory, authSource, expectedTurnIds: ['turn-1'],
+  });
+
+  assert.equal(result.attribution.ok, false);
+  assert.deepEqual(result.turnFence.reason_codes, ['UNRECEIPTED_NATIVE_TURN']);
+  assert.equal(calls.some((call) => call.method === 'thread/goal/set'), false);
+});
+
+test('runCodexFinalize catches an unreceipted turn created during terminal mutation', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const { factory } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal,
+    readbackGoal: completeGoal,
+    threadReadTurns: [
+      [{ id: 'turn-1', status: 'completed' }],
+      [
+        { id: 'turn-1', status: 'completed' },
+        { id: 'turn-unreceipted', status: 'completed' },
+      ],
+    ],
+  });
+
+  const result = await runCodexFinalize({
+    stateDir, binding, clientFactory: factory, authSource, expectedTurnIds: ['turn-1'],
+  });
+
+  assert.equal(result.attribution.ok, false);
+  assert.deepEqual(result.turnFence.reason_codes, ['UNRECEIPTED_NATIVE_TURN']);
 });
 
 test('runCodexFinalize: a readback attributed to another thread writes ok:false into both files (fail closed)', async () => {
@@ -2830,6 +3021,7 @@ test('runCodexClose: an already-complete goal is not cleared, but the codexHome 
 
   const result = await runCodexClose({ stateDir, clientFactory: factory, authSource });
 
+  assert.equal(result.cleanupComplete, true);
   assert.equal(result.goalCleared, false);
   assert.ok(!calls.some((c) => c.method === 'thread/goal/clear'));
   await assert.rejects(() => stat(codexHome));
@@ -2844,6 +3036,7 @@ test('runCodexClose refuses to delete a codex-home.path outside the managed temp
 
   const result = await runCodexClose({ stateDir, clientFactory: factory, authSource });
 
+  assert.equal(result.cleanupComplete, false);
   assert.equal(result.goalCleared, false);
   assert.equal(calls.length, 0);
   assert.ok(result.reasons.length > 0);
@@ -2974,6 +3167,8 @@ test('runCodexClose leaves another run’s live lease in place even when there i
   const closed = await runCodexClose({ stateDir, clientFactory: factory, authSource });
 
   assert.equal(closed.leaseReleased, false);
+  assert.equal(closed.cleanupComplete, false);
+  assert.equal(closed.runtimeQuiesced, false);
   assert.deepEqual(JSON.parse(await readFile(join(stateDir, 'lease.json'), 'utf8')), liveLease);
   assert.ok(closed.reasons.some((reason) => reason.includes('left in place')), JSON.stringify(closed.reasons));
 
@@ -3409,7 +3604,9 @@ test('releaseResidualLease clears every residue shape except another run’s liv
   const leasePath = join(dir, 'lease.json');
 
   // 不存在：没什么可释放，也没什么可说。
-  assert.deepEqual(releaseResidualLease({ leasePath }), { released: false, reasons: [] });
+  assert.deepEqual(releaseResidualLease({ leasePath }), {
+    present: false, released: false, runtimeQuiesced: true, reasons: [],
+  });
 
   // 过期租约、坏字节、缺 heartbeatAt：都是残留，删。
   for (const lease of [
@@ -3470,7 +3667,7 @@ async function installFakeCodex(setup) {
     '    if (!line) continue;',
     '    const msg = JSON.parse(line);',
     '    writeSync(1, JSON.stringify({ jsonrpc: "2.0", id: msg.id,',
-    '      result: { thread: { id: "t-fake" }, goal, turn: { id: "turn-1" } } }) + "\\n");',
+    '      result: { thread: { id: "t-fake", turns: [] }, goal, turn: { id: "turn-1" } } }) + "\\n");',
     '    if (msg.method === "turn/start") process.exit(0);',
     '  }',
     '});',

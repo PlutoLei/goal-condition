@@ -75,6 +75,18 @@ test('core skill exposes every required reference and every relative Markdown li
   }
 });
 
+test('Codex controlled execution detail stays in linked references and Grill stays out of runtime', () => {
+  const skill = read(skillPath);
+  const adapter = read(join(referencesRoot, 'adapters/codex.md'));
+  const protocol = read(join(referencesRoot, 'codex-goal-session-v2.md'));
+  assert.match(skill, /\]\(references\/adapters\/codex\.md(?:#[^)]+)?\)/);
+  assert.match(skill, /\]\(references\/codex-goal-session-v2\.md(?:#[^)]+)?\)/);
+  assert.ok(skill.split('\n').length <= 201, 'SKILL.md must contain at most 200 lines');
+  assert.match(adapter, /^## GoalSession v2 受控执行面$/m);
+  assert.match(protocol, /完整输入直接编译，不运行 Grill/);
+  assert.match(skill, /Brainstorm\/Grill 只用于设计前或对本 skill 做压力测试/);
+});
+
 // REQUIRED_CORE_FILES 既是「安装闭包该包含什么」的声明又是校验时的对照表——自建型自证：
 // 常量少一项，install.test.mjs 的旧字面 fixture 清单不会跟着变小，测试照样全绿（见
 // task-16-report.md 盲区 2 的 15 项逐一实测）。这里换一个独立于常量本身的真相源——checkout 里
@@ -89,9 +101,15 @@ test('core skill exposes every required reference and every relative Markdown li
 // 实际不是：那条断言两侧都读同一个 REQUIRED_CORE_FILES，是自证的，测不出常量本身漂移。删掉这条
 // 磁盘对账测试，就等于原地恢复 task-16-report.md 记录的「删 12/15 项零反应」那个盲区。
 test('REQUIRED_CORE_FILES matches every script, schema, and adapter reference actually shipped on disk', () => {
+  const codexControllerCore = [
+    'codex-controller/package.json',
+    ...coreCandidateFiles(templateRoot, 'codex-controller/schema'),
+    ...coreCandidateFiles(templateRoot, 'codex-controller/src'),
+  ];
   const onDisk = [
     ...(existsSync(skillPath) ? ['SKILL.md'] : []),
     ...['scripts', 'references', 'schema'].flatMap((dir) => coreCandidateFiles(templateRoot, dir)),
+    ...codexControllerCore,
   ].filter((relativePath) => relativePath !== PROFILE_PATH);
   assert.deepEqual(
     [...onDisk].sort(),
@@ -133,7 +151,10 @@ test('loader-read Markdown contains no positional-dollar expansion or private da
 
 test('core skill preserves the complete fail-closed workflow and package', () => {
   const skill = read(skillPath);
-  assert.ok(skill.includes('Classify → Compile → Validate → Preview → Confirm(hash)\n→ Preflight → Launch(adapter) → Postflight → Close'));
+  assert.ok(skill.includes('Codex v2: Compile Goal+Authority+Design → Preview → Confirm(authorization_hash)'));
+  assert.ok(skill.includes('→ Prepare Attempt → Launch → Verify → Revise/Next Attempt → Finalize → Close'));
+  assert.ok(skill.includes('Claude/legacy: Compile v1 → Validate → Preview → Confirm(contract hash)'));
+  assert.ok(skill.includes('→ Preflight → Launch(adapter) → Postflight → Close'));
   for (const term of [
     'single objective', 'stable context', 'judgment_criteria', 'success_criteria',
     'constraints', 'physical', 'audit_only', 'allowed_mutations', 'preflight',
@@ -174,11 +195,17 @@ test('public docs expose the external release trust root and complete required c
   }
   for (const term of [
     'SKILL.md', 'references/run-contract.md', 'references/adapters/claude.md',
-    'references/adapters/codex.md', 'schema/run-contract.schema.json',
+    'references/adapters/codex.md', 'references/codex-goal-session-v2.md',
+    'schema/run-contract.schema.json',
     'scripts/validate-contract.mjs', 'scripts/snapshot.mjs', 'scripts/install.mjs',
     'scripts/lib/contract.mjs', 'scripts/lib/snapshot.mjs',
     'scripts/lib/installer.mjs', 'scripts/lib/workflow.mjs',
     'scripts/launch.mjs', 'scripts/lib/adapters/claude.mjs', 'scripts/lib/adapters/codex.mjs',
+    'codex-controller/src/adoption.mjs', 'codex-controller/src/attempt.mjs',
+    'codex-controller/src/capabilities.mjs', 'codex-controller/src/execution.mjs',
+    'codex-controller/src/recovery.mjs', 'codex-controller/src/release.mjs',
+    'codex-controller/src/rollout.mjs',
+    'codex-controller/src/verification.mjs',
   ]) {
     assert.ok(readme.includes(term), `README is missing required release member ${term}`);
   }

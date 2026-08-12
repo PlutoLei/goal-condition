@@ -286,6 +286,7 @@ test('CLI close on a state dir with no codex-home.path exits 0 with a JSON repor
   assert.equal(code, 0);
   assert.equal(stderr, '');
   const report = JSON.parse(stdout);
+  assert.equal(report.cleanupComplete, true);
   assert.equal(report.codexHome, null);
   assert.equal(report.goalCleared, false);
   assert.deepEqual(report.reasons, ['no codex-home.path in the state dir: nothing to close']);

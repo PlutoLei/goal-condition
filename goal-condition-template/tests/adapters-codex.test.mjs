@@ -219,7 +219,9 @@ function stubSpawn({ spawnError, autoRespond = true } = {}) {
       written.push(msg);
       // autoRespond:false 造「rpc 真的在飞」的形态——M-1 的要害就在这种在飞状态上。
       if (!autoRespond) continue;
-      stdout.write(`${JSON.stringify({ id: msg.id, result: { thread: { id: 't-stub' }, goal: null } })}\n`);
+      stdout.write(`${JSON.stringify({
+        id: msg.id, result: { thread: { id: 't-stub', turns: [] }, goal: null },
+      })}\n`);
     }
   });
   const child = new EventEmitter();
@@ -272,16 +274,18 @@ test('threadStart forces ephemeral:false and exact method names are used', async
   const client = new GoalRpcClient({ codexHome: '/iso/home', cwd: '/x', spawnImpl });
   await client.start();
   await client.initialize();
-  await client.threadStart({ ephemeral: true });        // 调用方尝试覆盖也必须被钉回 false
+  const started = await client.threadStart({ ephemeral: true }); // 调用方尝试覆盖也必须被钉回 false
   await client.goalSet({ threadId: 't-stub', objective: 'o' });
   await client.goalGet({ threadId: 't-stub' });
+  await client.threadRead({ threadId: 't-stub', includeTurns: true });
   // inject 没有具名方法（M8：唯一调用方 runCodexResume 走通用 rpc，params 只认 resumeRpcOps）。
   await client.rpc('thread/inject_items', resumeRpcOps({ threadId: 't-stub', diagnosticText: 'd' })[1].params);
   await client.turnStart({ threadId: 't-stub', text: 'go' });
   const methods = written.map((msg) => msg.method);
   assert.deepEqual(methods, ['initialize', 'thread/start', 'thread/goal/set', 'thread/goal/get',
-    'thread/inject_items', 'turn/start']);
+    'thread/read', 'thread/inject_items', 'turn/start']);
   assert.equal(client.injectItems, undefined, 'no named injectItems wrapper may reappear');
+  assert.deepEqual(started.initialTurnIds, []);
   assert.equal(written[1].params.ephemeral, false);
   assert.equal(written[0].params.clientInfo.name, 'goal-condition-launch');
 });
