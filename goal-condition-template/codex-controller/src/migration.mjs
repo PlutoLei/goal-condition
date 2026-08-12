@@ -83,7 +83,6 @@ export function migrateV1Contract({ contract, sessionId, currentStateDigest, ori
     ? contract.budget.max_cost_usd ?? null
     : null;
   const draft = {
-    session_id: sessionId,
     goal: {
       statement: contract.objective,
       deliverables: [{ id: deliverableId, description: contract.objective }],
@@ -125,7 +124,7 @@ export function migrateV1Contract({ contract, sessionId, currentStateDigest, ori
       reason: 'explicit v1 to GoalSession v2 migration',
     },
   };
-  const compiled = compileDraft(draft);
+  const compiled = compileDraft(draft, { sessionId });
   if (compiled.session === null) {
     throw migrationError('V1_MIGRATION_COMPILE_FAILED', compiled.gaps.map((item) => item.code).join(','));
   }

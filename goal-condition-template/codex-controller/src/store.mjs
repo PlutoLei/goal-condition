@@ -20,9 +20,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 import { canonicalJson } from '../../scripts/lib/contract.mjs';
 import { validateGoalSession } from './domain.mjs';
-import { assertStableStateRoot, digestCanonical } from './values.mjs';
+import { assertCreationRequestId } from './identity.mjs';
+import { assertStableStateRoot, digestCanonical, exactFields } from './values.mjs';
 
 const SHA256 = /^[0-9a-f]{64}$/;
+const CREATION_KINDS = new Set(['session', 'run']);
 const META_BYTES = Buffer.from('{"schema_version":1}\n', 'utf8');
 
 function storeError(code, message) {
@@ -148,6 +150,20 @@ function rollback(db) {
   }
 }
 
+function validateCreationRequest(request, expectedKind = null) {
+  exactFields(request, ['kind', 'scopeId', 'requestKey', 'requestHash'], 'creation_request');
+  if (!CREATION_KINDS.has(request.kind) || (expectedKind !== null && request.kind !== expectedKind)) {
+    throw storeError('CREATION_REQUEST_KIND_INVALID', 'creation request kind does not match the resource');
+  }
+  if (typeof request.scopeId !== 'string' || request.scopeId.trim().length === 0) {
+    throw storeError('CREATION_REQUEST_SCOPE_INVALID', 'creation request scope must be a non-empty string');
+  }
+  assertCreationRequestId(request.requestKey);
+  if (typeof request.requestHash !== 'string' || !SHA256.test(request.requestHash)) {
+    throw storeError('CREATION_REQUEST_HASH_INVALID', 'creation request hash must be lowercase SHA-256');
+  }
+}
+
 export class SessionStore {
   constructor({ stateRoot, clock = () => new Date(), faultInjector = () => {}, targetRoots = [] }) {
     assertStableStateRoot({ stateRoot, targetRoots });
@@ -215,6 +231,16 @@ export class SessionStore {
         updated_at TEXT NOT NULL,
         FOREIGN KEY (session_id) REFERENCES sessions(session_id)
       ) STRICT;
+      CREATE TABLE IF NOT EXISTS creation_receipts (
+        kind TEXT NOT NULL CHECK (kind IN ('session', 'run')),
+        scope_id TEXT NOT NULL,
+        request_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        identifier TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (kind, scope_id, request_key),
+        UNIQUE (kind, identifier)
+      ) STRICT;
       CREATE TABLE IF NOT EXISTS target_leases (
         root TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -231,12 +257,58 @@ export class SessionStore {
     this.db.enableDefensive(true);
   }
 
-  create(session) {
+  readCreationReceipt(request) {
+    validateCreationRequest(request);
+    const row = this.db.prepare(`
+      SELECT kind, scope_id, request_key, request_hash, identifier, created_at
+      FROM creation_receipts
+      WHERE kind = ? AND scope_id = ? AND request_key = ?
+    `).get(request.kind, request.scopeId, request.requestKey);
+    if (row === undefined) return null;
+    if (row.request_hash !== request.requestHash) {
+      throw storeError(
+        'CREATION_REQUEST_CONFLICT',
+        'a creation request id was reused with different immutable input',
+      );
+    }
+    return {
+      kind: row.kind,
+      scopeId: row.scope_id,
+      requestKey: row.request_key,
+      requestHash: row.request_hash,
+      identifier: row.identifier,
+      createdAt: row.created_at,
+    };
+  }
+
+  #insertCreationReceipt({ request, identifier, createdAt }) {
+    this.db.prepare(`
+      INSERT INTO creation_receipts (
+        kind, scope_id, request_key, request_hash, identifier, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      request.kind,
+      request.scopeId,
+      request.requestKey,
+      request.requestHash,
+      identifier,
+      createdAt,
+    );
+  }
+
+  create(session, { creationRequest = null, blobs = [] } = {}) {
     const diagnostics = validateGoalSession(session);
     if (diagnostics.length > 0) {
       throw storeError('GOAL_SESSION_INVALID', diagnostics.map((entry) => entry.code).join(','));
     }
     if (session.revision !== 0) throw storeError('SESSION_REVISION_INVALID', 'new sessions must start at revision 0');
+    if (!Array.isArray(blobs)) throw storeError('BLOBS_INVALID', 'blobs must be an array');
+    if (creationRequest !== null) validateCreationRequest(creationRequest, 'session');
+    if (creationRequest !== null && creationRequest.scopeId !== 'machine') {
+      throw storeError('CREATION_REQUEST_SCOPE_INVALID', 'session creation requests use the machine scope');
+    }
+    const descriptors = blobs.map((blob) => publishBlob({ blobsRoot: this.blobsRoot, ...blob }));
+    if (descriptors.length > 0) this.faultInjector('after_blob_publish');
     const stateJson = canonicalState(session);
     const stateHash = digestCanonical(session);
     const createdAt = timestamp(this.clock);
@@ -251,6 +323,13 @@ export class SessionStore {
     const eventHash = eventDigest(eventBody);
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      if (creationRequest !== null) {
+        const existing = this.readCreationReceipt(creationRequest);
+        if (existing !== null) {
+          this.db.exec('COMMIT');
+          return this.read(existing.identifier);
+        }
+      }
       this.db.prepare(`
         INSERT INTO sessions (session_id, schema_version, revision, status, state_json, state_hash, updated_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -275,6 +354,20 @@ export class SessionStore {
         eventHash,
         createdAt,
       );
+      const insertBlob = this.db.prepare(
+        'INSERT OR IGNORE INTO blobs (hash, kind, byte_length, created_at) VALUES (?, ?, ?, ?)',
+      );
+      for (const descriptor of descriptors) {
+        insertBlob.run(descriptor.hash, descriptor.kind, descriptor.byte_length, createdAt);
+      }
+      if (creationRequest !== null) {
+        this.#insertCreationReceipt({
+          request: creationRequest,
+          identifier: session.session_id,
+          createdAt,
+        });
+        this.faultInjector('after_session_creation_receipt_insert');
+      }
       this.db.exec('COMMIT');
     } catch (error) {
       rollback(this.db);
@@ -491,11 +584,22 @@ export class SessionStore {
     }
   }
 
-  persistLaunchIntent({ intent, roots, ownerToken, writable = true }) {
+  persistLaunchIntent({ intent, roots, ownerToken, writable = true, creationRequest = null }) {
+    if (creationRequest !== null) validateCreationRequest(creationRequest, 'run');
+    if (creationRequest !== null && creationRequest.scopeId !== intent.session_id) {
+      throw storeError('CREATION_REQUEST_SCOPE_INVALID', 'run creation requests use their session scope');
+    }
     const canonical = [...new Set(roots.map(canonicalRoot))].sort();
     const now = timestamp(this.clock);
     this.db.exec('BEGIN IMMEDIATE');
     try {
+      if (creationRequest !== null) {
+        const existing = this.readCreationReceipt(creationRequest);
+        if (existing !== null) {
+          this.db.exec('COMMIT');
+          return this.readLaunchIntent(existing.identifier);
+        }
+      }
       const conflict = this.#leaseConflict(canonical, now, writable);
       if (conflict !== null) {
         this.db.exec('COMMIT');
@@ -520,6 +624,14 @@ export class SessionStore {
         intent.run_id, intent.session_id, intent.attempt_id,
         intentJson, digestCanonical(intent), now, now,
       );
+      if (creationRequest !== null) {
+        this.#insertCreationReceipt({
+          request: creationRequest,
+          identifier: intent.run_id,
+          createdAt: now,
+        });
+        this.faultInjector('after_run_creation_receipt_insert');
+      }
       this.db.exec('COMMIT');
       return this.readLaunchIntent(intent.run_id);
     } catch (error) {

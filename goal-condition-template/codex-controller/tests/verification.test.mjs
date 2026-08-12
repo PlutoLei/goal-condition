@@ -7,10 +7,10 @@ import test from 'node:test';
 
 import { compileDraft } from '../src/compiler.mjs';
 import { runCommandVerifier, verifyConditions } from '../src/verification.mjs';
-import { validDraft } from './helpers.mjs';
+import { validCompilerInput } from './helpers.mjs';
 
 test('controller verifier hashes bounded output and can certify a clean Attempt', async () => {
-  const { session } = compileDraft(validDraft());
+  const { session } = compileDraft(validCompilerInput());
   const result = await verifyConditions({
     session,
     attemptId: 'attempt-0001',
@@ -29,7 +29,7 @@ test('controller verifier hashes bounded output and can certify a clean Attempt'
 });
 
 test('a bypass caps completion at Verified even when all verifiers pass', async () => {
-  const { session } = compileDraft(validDraft());
+  const { session } = compileDraft(validCompilerInput());
   const result = await verifyConditions({
     session,
     attemptId: 'attempt-0001',

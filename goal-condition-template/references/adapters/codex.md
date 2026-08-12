@@ -27,7 +27,11 @@ Attempt projector 生成私有 immutable `AttemptManifest`：原生 Codex object
 
 完成等级分三层：executor/runtime 输出只能形成 `Candidate`；当前 controller-owned Evidence 全部有效可到 `Verified`；没有 control-plane bypass、unmediated turn 或未对账变化时才可 `Certified`。reviewer 文字、executor 的 all-green 或模型自报都不能直接认证完成。
 
-GoalSession v2 controller 通过 `capabilities`、`migrate-v1`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层创建新的不可变 Attempt；它不复用已经被拒绝的 candidate，也不修改共享 schema。
+GoalSession v2 controller 通过 `capabilities`、`migrate-v1`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层只持久化新的不可变 Attempt 并回传 run ID，后续 `launch` 才执行；它不复用已经被拒绝的 candidate，也不修改共享 schema。
+
+普通命令不传 `--state-root`：controller 依次选择显式 flag、`GOAL_CONDITION_CODEX_STATE_ROOT`、`$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。无效的已选输入 fail closed；显式 override 创建独立 deployment namespace，必须独立 rollout，不能继承默认 store 的 release gate 或 canary receipt。解析后仍由物理路径、祖先 symlink、临时目录与 target-root isolation 门禁决定是否可用。
+
+deployment namespace 扩大到机器级后，identity ownership 同步上收：`session_id` 与 `run_id` 由 controller 生成 128-bit 随机值并通过 `init`/`migrate-v1`、`prepare`/`resume` 回传。调用方提供 128-bit `request_id`/`nonce` 作为幂等恢复键；resource、creation receipt、intent/lease 在同一事务提交，相同 key 的不同请求 fail closed。调用方只能传播回传的机器级主键；`attempt_id` 仍只需在所属 Session 内稳定唯一。旧持久化 ID 保持可读，不反向伪造成 controller-issued receipt。
 
 controller 不复制 app-server 执行器：live 副作用仍只经本 adapter 的 `runCodexLaunch` / `runCodexFinalize` / `runCodexClose`。v2 在同一写事务检查租约并保存 LaunchIntent；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path/device/inode，dispatch 时在一个事务内原子 claim `dispatching` 与 Session `Dispatching`，重核版本及物理身份后才调用 launcher。由于当前 app-server 的 `turn/start` 响应 ID 与持久化 readback ID 可能漂移，LaunchReceipt v2 分别绑定两者；controller 在输入中生成 256-bit correlation，并把 exact text SHA-256 与唯一持久化 ID 一起核回，fresh thread 还必须证明精确 `0→1`。只满足集合基数而输入不匹配、初始非空、首次多 turn、后续或 finalize 前后的额外 turn 都是旁路。claim 后读回不明不重发，转 `ReconciliationRequired`。完整命令与状态顺序见 [GoalSession v2 操作协议](../codex-goal-session-v2.md)。
 
@@ -51,7 +55,7 @@ goal 由控制器创建，不是模型的 `create_goal`：objective 文本必须
 
 无法在当前 Codex 环境物理限制的外部动作必须标为 `audit_only`。如果用户要求 physical 保证，应在只读凭证、proxy、sandbox 或可验证 deny mechanism 就绪前停止 launch。本 adapter 侧唯一可核的物理面是 `thread/start` 的 `--sandbox`：GoalSession v2 从 Active Boundary 投影，actions 不含 `write` 时必须是 `read-only`，包含 `write` 才允许 `workspace-write`。launch 前置闸逐条比对 `enforcement="physical"` 的 constraint，`mechanism` 指向 sandbox 但与实际模式不符即红，`mechanism` 指不到 sandbox 或缺失同样红。
 
-GoalSession v2 的 `resume` 建立新的 immutable Attempt 和 `thread/start`，每次都从 Active Boundary 重新投影 `read-only | workspace-write`。同一个模式在请求参数写 `workspace-write`，响应体写 `workspaceWrite`；controller 必须核回而不能按词形猜测。
+GoalSession v2 的 `resume` 建立新的 immutable Attempt creation receipt、LaunchIntent 与 lease，并返回 run ID；显式 `launch` 才执行该 Attempt 的 `thread/start`。每次都从 Active Boundary 重新投影 `read-only | workspace-write`。同一个模式在请求参数写 `workspace-write`，响应体写 `workspaceWrite`；controller 必须核回而不能按词形猜测。
 
 ## 姿态：app-server 是外部编排的唯一表面
 

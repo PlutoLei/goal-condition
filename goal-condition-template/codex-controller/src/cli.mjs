@@ -20,7 +20,7 @@ import {
   CODEX_SANDBOX_MODE,
   CODEX_SANDBOX_PROFILE,
 } from '../../scripts/lib/adapters/codex.mjs';
-import { canonicalJson, contractHash } from '../../scripts/lib/contract.mjs';
+import { canonicalJson, contractHash, validateContract } from '../../scripts/lib/contract.mjs';
 import {
   captureSnapshot,
   compareSnapshot,
@@ -42,6 +42,7 @@ import {
   prepareControlledAttempt,
 } from './execution.mjs';
 import { evaluateRevision } from './policy.mjs';
+import { assertCreationRequestId, createControllerId } from './identity.mjs';
 import { projectAttempt, projectBaselineManifest } from './projector.mjs';
 import { reconcileLaunch } from './recovery.mjs';
 import { currentControllerReleaseDigest } from './release.mjs';
@@ -52,8 +53,14 @@ import {
   ensureRolloutState,
   writeRolloutMode,
 } from './rollout.mjs';
+import { resolveControllerStateRoot } from './state-root.mjs';
 import { openSessionStore } from './store.mjs';
-import { assertRootIdentities, assertStableStateRoot, exactFields } from './values.mjs';
+import {
+  assertRootIdentities,
+  assertStableStateRoot,
+  digestCanonical,
+  exactFields,
+} from './values.mjs';
 import { verifyConditions } from './verification.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -72,7 +79,7 @@ const COMMANDS = Object.freeze({
   'migrate-v1': { required: ['state-root', 'input'], optional: [] },
   prepare: { required: ['state-root', 'session-id', 'input'], optional: [] },
   launch: { required: ['state-root', 'session-id', 'run-id', 'runtime-root'], optional: ['deadline-ms'] },
-  resume: { required: ['state-root', 'session-id', 'runtime-root', 'input'], optional: [] },
+  resume: { required: ['state-root', 'session-id', 'input'], optional: [] },
   verify: {
     required: ['state-root', 'session-id', 'attempt-id', 'run-id', 'runtime-root'],
     optional: [],
@@ -120,7 +127,10 @@ function parseArgs(argv) {
     flags[name] = value;
   }
   for (const name of specification.required) {
-    if (!(name in flags)) throw cliError('CLI_FLAG_REQUIRED');
+    if (!(name in flags) && name !== 'state-root') throw cliError('CLI_FLAG_REQUIRED');
+  }
+  if (specification.required.includes('state-root')) {
+    flags['state-root'] = resolveControllerStateRoot({ explicit: flags['state-root'] });
   }
   return { command, flags };
 }
@@ -196,34 +206,48 @@ async function captureCurrent({ manifest, baseline }) {
 }
 
 async function init(flags) {
-  const input = readJson(flags.input);
-  let compiled = compileDraft(input);
+  const rawInput = readJson(flags.input);
+  const requestId = assertCreationRequestId(rawInput.request_id);
+  const input = structuredClone(rawInput);
+  delete input.request_id;
+  const captureBaseline = flags['capture-baseline'] !== undefined;
+  if (captureBaseline && flags['capture-baseline'] !== 'true') throw cliError('CLI_BOOLEAN_INVALID');
+  const creationRequest = {
+    kind: 'session',
+    scopeId: 'machine',
+    requestKey: requestId,
+    requestHash: digestCanonical({ command: 'init', capture_baseline: captureBaseline, input }),
+  };
+  const sessionId = createControllerId('session');
+  let compiled = compileDraft(input, { sessionId });
   if (compiled.gaps.length > 0) throw cliError(compiled.gaps[0].code);
-  let baseline = null;
-  if (flags['capture-baseline'] !== undefined) {
-    if (flags['capture-baseline'] !== 'true') throw cliError('CLI_BOOLEAN_INVALID');
-    const manifest = projectBaselineManifest({ session: compiled.session });
-    baseline = await captureSnapshot(manifest, { phase: 'capture' });
-    const nextInput = structuredClone(input);
-    nextInput.root_baseline = { kind: 'v1-snapshot', digest: snapshotDigest(baseline) };
-    compiled = compileDraft(nextInput);
-    if (compiled.gaps.length > 0) throw cliError(compiled.gaps[0].code);
-  }
   const session = await withStore(
     flags['state-root'],
-    (store) => {
-      const created = store.create(compiled.session);
-      if (baseline !== null) {
-        const descriptor = store.putBlob({ kind: 'root-baseline', bytes: canonicalJson(baseline) });
-        if (descriptor.hash !== created.root_baseline.digest) throw cliError('ROOT_BASELINE_BLOB_MISMATCH');
+    async (store) => {
+      const existing = store.readCreationReceipt(creationRequest);
+      if (existing !== null) return store.read(existing.identifier);
+      let baseline = null;
+      if (captureBaseline) {
+        const manifest = projectBaselineManifest({ session: compiled.session });
+        baseline = await captureSnapshot(manifest, { phase: 'capture' });
+        const nextInput = structuredClone(input);
+        nextInput.root_baseline = { kind: 'v1-snapshot', digest: snapshotDigest(baseline) };
+        compiled = compileDraft(nextInput, { sessionId });
+        if (compiled.gaps.length > 0) throw cliError(compiled.gaps[0].code);
       }
-      return created;
+      return store.create(compiled.session, {
+        creationRequest,
+        blobs: baseline === null
+          ? []
+          : [{ kind: 'root-baseline', bytes: canonicalJson(baseline) }],
+      });
     },
     compiled.session.authority_revisions.at(-1).authority.target_roots,
   );
   return {
     ok: true,
     command: 'init',
+    request_id: requestId,
     session_id: session.session_id,
     status: session.status,
     authorization_hash: session.authorization_hash,
@@ -409,32 +433,70 @@ async function capabilities(flags) {
 }
 
 async function migrateV1(flags) {
-  const input = readJson(flags.input);
-  exactFields(input, ['contract', 'session_id', 'original_baseline'], 'v1_migration_input');
-  const baseline = input.original_baseline ?? await captureSnapshot(input.contract, { phase: 'capture' });
-  const migrated = migrateV1Contract({
-    contract: input.contract,
-    sessionId: input.session_id,
-    currentStateDigest: snapshotDigest(baseline),
-    originalBaseline: input.original_baseline,
-  });
-  return withStore(flags['state-root'], (store) => {
-    const session = store.create(migrated.session);
-    const descriptor = store.putBlob({ kind: 'root-baseline', bytes: canonicalJson(baseline) });
-    if (descriptor.hash !== session.root_baseline.digest) throw cliError('ROOT_BASELINE_BLOB_MISMATCH');
-    store.putBlob({ kind: 'v1-migration-input', bytes: canonicalJson({
-      contract: input.contract,
-      provenance: migrated.provenance,
-    }) });
+  const rawInput = readJson(flags.input);
+  exactFields(rawInput, ['request_id', 'contract', 'original_baseline'], 'v1_migration_input');
+  const requestId = assertCreationRequestId(rawInput.request_id);
+  const originalBaseline = rawInput.original_baseline ?? null;
+  const diagnostics = validateContract(rawInput.contract);
+  if (diagnostics.length > 0 || rawInput.contract.runtime !== 'codex') {
+    throw cliError('V1_MIGRATION_CONTRACT_INVALID');
+  }
+  const creationRequest = {
+    kind: 'session',
+    scopeId: 'machine',
+    requestKey: requestId,
+    requestHash: digestCanonical({
+      command: 'migrate-v1',
+      contract: rawInput.contract,
+      original_baseline: originalBaseline,
+    }),
+  };
+  return withStore(flags['state-root'], async (store) => {
+    const existing = store.readCreationReceipt(creationRequest);
+    if (existing !== null) {
+      const session = store.read(existing.identifier);
+      return {
+        ok: true,
+        command: 'migrate-v1',
+        request_id: requestId,
+        session_id: session.session_id,
+        status: session.status,
+        provenance: {
+          provenance_version: 1,
+          baseline_provenance: originalBaseline === null ? 'migrated_at_current_state' : 'v1_original',
+          legacy_confirmation: 'unverified',
+          certifies_pre_migration_state: false,
+        },
+        live_execution: false,
+      };
+    }
+    const baseline = originalBaseline ?? await captureSnapshot(rawInput.contract, { phase: 'capture' });
+    const migrated = migrateV1Contract({
+      contract: rawInput.contract,
+      sessionId: createControllerId('session'),
+      currentStateDigest: snapshotDigest(baseline),
+      originalBaseline,
+    });
+    const session = store.create(migrated.session, {
+      creationRequest,
+      blobs: [
+        { kind: 'root-baseline', bytes: canonicalJson(baseline) },
+        { kind: 'v1-migration-input', bytes: canonicalJson({
+          contract: rawInput.contract,
+          provenance: migrated.provenance,
+        }) },
+      ],
+    });
     return {
       ok: true,
       command: 'migrate-v1',
+      request_id: requestId,
       session_id: session.session_id,
       status: session.status,
       provenance: migrated.provenance,
       live_execution: false,
     };
-  }, migrated.session.authority_revisions.at(-1).authority.target_roots);
+  }, rawInput.contract.target_roots);
 }
 
 function hardProhibitionClaims(session, claims) {
@@ -449,10 +511,22 @@ function hardProhibitionClaims(session, claims) {
   });
 }
 
-async function prepareCore({ store, sessionId, input }) {
+async function prepareCore({ store, sessionId, input, beforeCreate = () => {} }) {
   exactFields(input, [
-    'attempt_id', 'run_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
+    'attempt_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
   ], 'prepare_input');
+  assertCreationRequestId(input.nonce);
+  const creationRequest = {
+    kind: 'run',
+    scopeId: sessionId,
+    requestKey: input.nonce,
+    requestHash: digestCanonical({ command: 'attempt', session_id: sessionId, input }),
+  };
+  const existing = store.readCreationReceipt(creationRequest);
+  if (existing !== null) {
+    return recoverPreparedIdentity({ store, sessionId, runId: existing.identifier });
+  }
+  beforeCreate();
   const session = store.read(sessionId);
   const targetRoots = session.design_revisions.at(-1).active_boundary.target_roots;
   const writable = session.design_revisions.at(-1).active_boundary.actions.includes('write');
@@ -481,21 +555,22 @@ async function prepareCore({ store, sessionId, input }) {
     sessionId,
     attemptId: input.attempt_id,
     workspaceDigest: snapshotDigest(current),
-    runId: input.run_id,
+    runId: createControllerId('run'),
     expiresAt: input.expires_at,
     nonce: input.nonce,
     capabilityReport,
     controllerReleaseDigest: CONTROLLER_RELEASE_DIGEST,
+    creationRequest,
   });
 }
 
 async function prepare(flags) {
-  assertCurrentLiveRollout(flags['state-root']);
   return withStore(flags['state-root'], async (store) => {
     const prepared = await prepareCore({
       store,
       sessionId: flags['session-id'],
       input: readJson(flags.input),
+      beforeCreate: () => assertCurrentLiveRollout(flags['state-root']),
     });
     return {
       ok: true,
@@ -505,6 +580,8 @@ async function prepare(flags) {
       run_id: prepared.run_id,
       attempt_hash: prepared.intent.attempt_hash,
       contract_hash: prepared.intent.contract_hash,
+      recovered: prepared.recovered === true,
+      intent_status: prepared.intent_status ?? 'pending',
       live_execution: false,
     };
   });
@@ -555,6 +632,20 @@ function restorePrepared({ store, sessionId, runId }) {
     intent,
     projection,
     runtime_prompt: attemptRuntimePrompt(projection),
+  };
+}
+
+function recoverPreparedIdentity({ store, sessionId, runId }) {
+  const stored = store.readLaunchIntent(runId);
+  const { status: intentStatus, ...intent } = stored;
+  if (intent.session_id !== sessionId) throw cliError('LAUNCH_INTENT_SESSION_MISMATCH');
+  return {
+    session_id: sessionId,
+    attempt_id: intent.attempt_id,
+    run_id: runId,
+    intent_status: intentStatus,
+    intent,
+    recovered: true,
   };
 }
 
@@ -631,35 +722,30 @@ async function launch(flags) {
 }
 
 async function resume(flags) {
-  assertCurrentLiveRollout(flags['state-root']);
   return withStore(flags['state-root'], async (store) => {
     const input = readJson(flags.input);
     exactFields(input, [
-      'attempt_id', 'run_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities', 'deadline_ms',
+      'attempt_id', 'nonce', 'expires_at', 'hard_prohibition_capabilities',
     ], 'resume_input');
-    const prepared = await prepareCore({ store, sessionId: flags['session-id'], input: {
-      attempt_id: input.attempt_id,
-      run_id: input.run_id,
-      nonce: input.nonce,
-      expires_at: input.expires_at,
-      hard_prohibition_capabilities: input.hard_prohibition_capabilities,
-    } });
-    const result = await launchCore({
+    const prepared = await prepareCore({
       store,
       sessionId: flags['session-id'],
-      runId: prepared.run_id,
-      runtimeRoot: flags['runtime-root'],
-      deadlineMs: input.deadline_ms,
+      input,
+      beforeCreate: () => assertCurrentLiveRollout(flags['state-root']),
     });
     return {
-      ok: result.disposition === 'candidate',
+      ok: true,
       command: 'resume',
       continuation_kind: 'new-immutable-attempt',
       session_id: flags['session-id'],
       attempt_id: prepared.attempt_id,
-      disposition: result.disposition,
-      receipt: result.receipt ?? null,
-      live_execution: result.receipt !== undefined,
+      run_id: prepared.run_id,
+      disposition: 'prepared',
+      attempt_hash: prepared.intent.attempt_hash,
+      contract_hash: prepared.intent.contract_hash,
+      recovered: prepared.recovered === true,
+      intent_status: prepared.intent_status ?? 'pending',
+      live_execution: false,
     };
   });
 }

@@ -63,3 +63,8 @@ export function validDraft() {
     },
   };
 }
+
+export function validCompilerInput() {
+  const { session_id: ignored, ...input } = validDraft();
+  return input;
+}
