@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
@@ -39,7 +38,6 @@ test.afterEach(async () => {
 
 test('controlled CLI exposes the closed GoalSession lifecycle', () => {
   assert.deepEqual(commandNames().sort(), [
-    'adopt',
     'capabilities',
     'close',
     'confirm',
@@ -48,6 +46,7 @@ test('controlled CLI exposes the closed GoalSession lifecycle', () => {
     'finalize',
     'init',
     'launch',
+    'migrate-v1',
     'mode',
     'prepare',
     'preview',
@@ -55,10 +54,14 @@ test('controlled CLI exposes the closed GoalSession lifecycle', () => {
     'reconcile',
     'resume',
     'revise',
-    'shadow',
     'status',
     'verify',
   ]);
+  for (const retired of ['adopt', 'shadow']) {
+    const result = run([retired]);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stderrJson.code, 'CLI_COMMAND_UNKNOWN');
+  }
 });
 
 test('controlled CLI executes through the installed release symlink', async () => {
@@ -104,7 +107,7 @@ test('init can capture a controller-owned root baseline and prepare a durable At
     'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'mode.json', {
-    action: 'set', next: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
+    action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
   const prepared = run([
     'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
@@ -164,7 +167,7 @@ test('read-only Authority rejects target mutations before prepare', async () => 
     'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'read-only-mode.json', {
-    action: 'set', next: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
+    action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
 
   await writeFile(join(target, 'unauthorized.txt'), 'must be detected\n');
@@ -200,16 +203,16 @@ test('mode and capability commands are closed-world and controller-only', async 
     action: 'get', next: null, changed_at: null, canary_session_id: null,
   });
   const initialMode = run(['mode', '--state-root', stateRoot, '--input', get]).stdoutJson;
-  assert.equal(initialMode.mode, 'shadow');
+  assert.equal(initialMode.mode, 'disabled');
   assert.match(initialMode.release_manifest_digest, /^[0-9a-f]{64}$/);
   const set = await writeJson(root, 'mode-set.json', {
-    action: 'set', next: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
+    action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   });
-  assert.equal(run(['mode', '--state-root', stateRoot, '--input', set]).stdoutJson.mode, 'opt-in');
-  const defaultWithoutCanary = await writeJson(root, 'mode-default-no-canary.json', {
-    action: 'set', next: 'default', changed_at: '2026-08-11T00:01:00.000Z', canary_session_id: null,
+  assert.equal(run(['mode', '--state-root', stateRoot, '--input', set]).stdoutJson.mode, 'canary');
+  const enabledWithoutCanary = await writeJson(root, 'mode-enabled-no-canary.json', {
+    action: 'set', next: 'enabled', changed_at: '2026-08-11T00:01:00.000Z', canary_session_id: null,
   });
-  const rejected = run(['mode', '--state-root', stateRoot, '--input', defaultWithoutCanary]);
+  const rejected = run(['mode', '--state-root', stateRoot, '--input', enabledWithoutCanary]);
   assert.notEqual(rejected.status, 0);
   assert.equal(rejected.stderrJson.code, 'ROLLOUT_CANARY_REQUIRED');
 });
@@ -237,7 +240,7 @@ test('close preserves the controller lease when a foreign live runtime lease pre
     'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'close-mode.json', {
-    action: 'set', next: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
+    action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
   const prepared = run([
     'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
@@ -293,7 +296,7 @@ test('prepare rejects a caller-selected capability mapping for a different hard 
     'confirm', '--state-root', stateRoot, '--session-id', draft.session_id, '--input', confirmation,
   ]).status, 0);
   assert.equal(run(['mode', '--state-root', stateRoot, '--input', await writeJson(root, 'mode.json', {
-    action: 'set', next: 'opt-in', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
+    action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   })]).status, 0);
   const prepared = run([
     'prepare', '--state-root', stateRoot, '--session-id', draft.session_id,
@@ -444,29 +447,6 @@ test('EXPAND_AUTHORITY moves the session to AwaitingReauthorization', async () =
   ]);
   assert.equal(confirmed.status, 0, confirmed.stderr);
   assert.equal(confirmed.stdoutJson.status, 'Ready');
-});
-
-test('shadow never mutates a legacy state directory', async () => {
-  const { root } = await workspace();
-  const legacy = join(root, 'legacy-state');
-  await writeFile(legacy, 'legacy bytes', { mode: 0o600 });
-  const validContract = JSON.parse(
-    await readFile(new URL('../../tests/fixtures/valid-contract.json', import.meta.url), 'utf8'),
-  );
-  const input = {
-    legacy_contract: validContract,
-    current_contract: structuredClone(validContract),
-    candidate: { terminal_reason: 'completed' },
-    postflight: { ok: false },
-    observations: { typed_operation: { type: 'ADD_CONDITION' } },
-    legacy_state_path: legacy,
-  };
-  const before = createHash('sha256').update(await readFile(legacy)).digest('hex');
-  const result = run(['shadow', '--input', await writeJson(root, 'shadow.json', input)]);
-  const after = createHash('sha256').update(await readFile(legacy)).digest('hex');
-  assert.equal(result.status, 0, result.stderr);
-  assert.equal(result.stdoutJson.live_execution, false);
-  assert.equal(before, after);
 });
 
 test('unknown flags and unknown JSON fields fail closed without echoing values', async () => {
