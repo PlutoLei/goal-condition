@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
@@ -10,6 +10,10 @@ import { validCompilerInput } from './helpers.mjs';
 
 const cliPath = new URL('../src/cli.mjs', import.meta.url).pathname;
 const roots = [];
+
+function validCliInput(requestId = 'a'.repeat(32)) {
+  return { ...validCompilerInput(), request_id: requestId };
+}
 
 async function workspace() {
   const root = await mkdtemp(join(process.cwd(), '.gc-cli-test-'));
@@ -80,7 +84,7 @@ test('stateful commands share the canonical environment store while an explicit 
   const { root, stateRoot } = await workspace();
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.hard_prohibitions = [];
   draft.initial_design.active_boundary.target_roots = [target];
@@ -147,10 +151,10 @@ test('canonical shared store issues distinct machine-global session and run ids 
   const { root, stateRoot } = await workspace();
   const env = { ...process.env, GOAL_CONDITION_CODEX_STATE_ROOT: stateRoot };
   const sessions = [];
-  for (const project of ['alpha', 'beta']) {
+  for (const [index, project] of ['alpha', 'beta'].entries()) {
     const target = join(root, project);
     await mkdir(target);
-    const draft = validCompilerInput();
+    const draft = validCliInput(String(index + 2).repeat(32));
     draft.authority.target_roots = [target];
     draft.authority.hard_prohibitions = [];
     draft.initial_design.active_boundary.target_roots = [target];
@@ -162,9 +166,24 @@ test('canonical shared store issues distinct machine-global session and run ids 
     ], { env });
     assert.equal(initialized.status, 0, initialized.stderr);
     assert.match(initialized.stdoutJson.session_id, /^session-[0-9a-f]{32}$/);
-    sessions.push({ project, sessionId: initialized.stdoutJson.session_id, initialized });
+    const retried = run([
+      'init', '--input', await writeJson(root, `${project}-draft-retry.json`, draft),
+      '--capture-baseline', 'true',
+    ], { env });
+    assert.equal(retried.status, 0, retried.stderr);
+    assert.equal(retried.stdoutJson.session_id, initialized.stdoutJson.session_id);
+    sessions.push({ project, sessionId: initialized.stdoutJson.session_id, initialized, draft });
   }
   assert.notEqual(sessions[0].sessionId, sessions[1].sessionId);
+
+  const conflictingDraft = structuredClone(sessions[0].draft);
+  conflictingDraft.goal.statement = 'A changed request may not reuse the same request id.';
+  const conflictingInit = run([
+    'init', '--input', await writeJson(root, 'alpha-draft-conflict.json', conflictingDraft),
+    '--capture-baseline', 'true',
+  ], { env });
+  assert.notEqual(conflictingInit.status, 0);
+  assert.equal(conflictingInit.stderrJson.code, 'CREATION_REQUEST_CONFLICT');
 
   for (const { project, sessionId, initialized } of sessions) {
     const confirmation = await writeJson(root, `${project}-confirmation.json`, {
@@ -196,16 +215,64 @@ test('canonical shared store issues distinct machine-global session and run ids 
     ], { env });
     assert.equal(prepared.status, 0, prepared.stderr);
     assert.match(prepared.stdoutJson.run_id, /^run-[0-9a-f]{32}$/);
+    const retried = run([
+      'prepare', '--session-id', sessionId,
+      '--input', await writeJson(root, `${project}-prepare-retry.json`, {
+        attempt_id: `attempt-${project}`,
+        nonce: project === 'alpha'
+          ? '00112233445566778899aabbccddeeff'
+          : 'ffeeddccbbaa99887766554433221100',
+        expires_at: '2099-08-12T00:00:00.000Z',
+        hard_prohibition_capabilities: [],
+      }),
+    ], { env });
+    assert.equal(retried.status, 0, retried.stderr);
+    assert.equal(retried.stdoutJson.run_id, prepared.stdoutJson.run_id);
     runIds.push(prepared.stdoutJson.run_id);
   }
   assert.notEqual(runIds[0], runIds[1]);
 });
 
-test('init can capture a controller-owned root baseline and prepare a durable Attempt', async () => {
+test('migrate-v1 recovers its controller session id from a caller-known request id', async () => {
+  const { root, stateRoot } = await workspace();
+  const target = join(root, 'legacy-target');
+  await mkdir(target);
+  const contract = JSON.parse(await readFile(
+    new URL('../../tests/fixtures/valid-contract.json', import.meta.url),
+    'utf8',
+  ));
+  contract.target_roots = [target];
+  contract.preflight[0].target = target;
+  contract.postflight[0].cwd = target;
+  contract.context_sources[0].path = join(target, 'context.md');
+  const migration = {
+    request_id: '6'.repeat(32),
+    contract,
+    original_baseline: { baseline_version: 1, entries: [] },
+  };
+  const inputPath = await writeJson(root, 'migration.json', migration);
+  const first = run(['migrate-v1', '--state-root', stateRoot, '--input', inputPath]);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdoutJson.session_id, /^session-[0-9a-f]{32}$/);
+
+  const retry = run(['migrate-v1', '--state-root', stateRoot, '--input', inputPath]);
+  assert.equal(retry.status, 0, retry.stderr);
+  assert.equal(retry.stdoutJson.session_id, first.stdoutJson.session_id);
+
+  migration.contract.objective = 'A changed migration request.';
+  const conflict = run([
+    'migrate-v1', '--state-root', stateRoot,
+    '--input', await writeJson(root, 'migration-conflict.json', migration),
+  ]);
+  assert.notEqual(conflict.status, 0);
+  assert.equal(conflict.stderrJson.code, 'CREATION_REQUEST_CONFLICT');
+});
+
+test('init captures a baseline and resume durably prepares before a separate launch', async () => {
   const { root, stateRoot } = await workspace();
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.hard_prohibitions = [];
   draft.initial_design.active_boundary.target_roots = [target];
@@ -254,16 +321,26 @@ test('init can capture a controller-owned root baseline and prepare a durable At
   assert.equal(closed.status, 0, closed.stderr);
   assert.equal(closed.stdoutJson.root_lease_released, true);
   await writeFile(join(target, 'run-product.txt'), 'allowed controller product\n');
-  const preparedAgain = run([
-    'prepare', '--state-root', stateRoot, '--session-id', sessionId,
-    '--input', await writeJson(root, 'prepare-again.json', {
+  const resumeInput = await writeJson(root, 'resume.json', {
       attempt_id: 'attempt-cli-live-2',
       nonce: 'ffeeddccbbaa99887766554433221100',
       expires_at: '2099-08-11T00:00:00.000Z',
       hard_prohibition_capabilities: [],
-    }),
+  });
+  const preparedAgain = run([
+    'resume', '--state-root', stateRoot, '--session-id', sessionId,
+    '--input', resumeInput,
   ]);
   assert.equal(preparedAgain.status, 0, preparedAgain.stderr);
+  assert.equal(preparedAgain.stdoutJson.disposition, 'prepared');
+  assert.equal(preparedAgain.stdoutJson.live_execution, false);
+  assert.match(preparedAgain.stdoutJson.run_id, /^run-[0-9a-f]{32}$/);
+  const recovered = run([
+    'resume', '--state-root', stateRoot, '--session-id', sessionId,
+    '--input', resumeInput,
+  ]);
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.equal(recovered.stdoutJson.run_id, preparedAgain.stdoutJson.run_id);
 });
 
 test('read-only Authority rejects target mutations before prepare', async () => {
@@ -271,7 +348,7 @@ test('read-only Authority rejects target mutations before prepare', async () => 
   const target = join(root, 'target');
   await mkdir(target);
   await writeFile(join(target, 'baseline.txt'), 'trusted baseline\n');
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.actions = ['read', 'execute'];
   draft.authority.hard_prohibitions = [];
@@ -347,7 +424,7 @@ test('close preserves the controller lease when a foreign live runtime lease pre
   const target = join(root, 'target');
   const runtimeRoot = join(root, 'runtime');
   await mkdir(target);
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.authority.hard_prohibitions = [];
   draft.initial_design.active_boundary.target_roots = [target];
@@ -406,7 +483,7 @@ test('prepare rejects a caller-selected capability mapping for a different hard 
   const { root, stateRoot } = await workspace();
   const target = join(root, 'target');
   await mkdir(target);
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   draft.authority.target_roots = [target];
   draft.initial_design.active_boundary.target_roots = [target];
   draft.initial_design.conditions[0].verifier.cwd = target;
@@ -439,7 +516,7 @@ test('prepare rejects a caller-selected capability mapping for a different hard 
 
 test('init, confirm, revise, project, evaluate, status, and export stay controller-only', async () => {
   const { root, stateRoot } = await workspace();
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   draft.authority.secret_refs = ['secret-ref-prod-api'];
   const draftPath = await writeJson(root, 'draft.json', draft);
   const initialized = run(['init', '--state-root', stateRoot, '--input', draftPath]);
@@ -526,7 +603,7 @@ test('init, confirm, revise, project, evaluate, status, and export stay controll
 
 test('EXPAND_AUTHORITY moves the session to AwaitingReauthorization', async () => {
   const { root, stateRoot } = await workspace();
-  const draft = validCompilerInput();
+  const draft = validCliInput();
   const initialized = run([
     'init',
     '--state-root', stateRoot,
@@ -586,7 +663,7 @@ test('unknown flags and unknown JSON fields fail closed without echoing values',
   assert.equal(badFlag.stderr.includes('private-value'), false);
   assert.equal(badFlag.stderrJson.code, 'CLI_FLAG_UNKNOWN');
 
-  const input = { ...validCompilerInput(), unknown_private_field: 'private-value' };
+  const input = { ...validCliInput(), unknown_private_field: 'private-value' };
   const badJson = run([
     'init', '--state-root', stateRoot, '--input', await writeJson(root, 'bad.json', input),
   ]);

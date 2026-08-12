@@ -43,7 +43,7 @@ export function attemptRuntimePrompt(projection) {
 
 export function prepareControlledAttempt({
   store, sessionId, attemptId, workspaceDigest, runId, expiresAt, nonce,
-  capabilityReport, controllerReleaseDigest,
+  capabilityReport, controllerReleaseDigest, creationRequest = null,
 }) {
   if (capabilityReport?.launchable !== true) {
     throw executionError('CAPABILITY_PREFLIGHT_FAILED', 'required runtime capabilities are not enforced');
@@ -88,18 +88,26 @@ export function prepareControlledAttempt({
     run_id: runId,
     nonce,
   }));
-  store.persistLaunchIntent({
+  const persisted = store.persistLaunchIntent({
     intent,
     roots: session.design_revisions.at(-1).active_boundary.target_roots,
     ownerToken,
     writable: session.design_revisions.at(-1).active_boundary.actions.includes('write'),
+    creationRequest,
   });
+  const effectiveIntent = intentWithoutStatus(persisted);
+  const effectiveOwnerToken = sha256(canonicalJson({
+    session_id: effectiveIntent.session_id,
+    attempt_id: effectiveIntent.attempt_id,
+    run_id: effectiveIntent.run_id,
+    nonce: effectiveIntent.nonce,
+  }));
   return {
-    session_id: sessionId,
-    attempt_id: attemptId,
-    run_id: runId,
-    intent,
-    owner_token: ownerToken,
+    session_id: effectiveIntent.session_id,
+    attempt_id: effectiveIntent.attempt_id,
+    run_id: effectiveIntent.run_id,
+    intent: effectiveIntent,
+    owner_token: effectiveOwnerToken,
     projection,
     runtime_prompt: attemptRuntimePrompt(projection),
   };

@@ -201,11 +201,15 @@ test('Codex production guidance defines the canonical controller store and isola
     '独立 rollout',
     'controller 生成',
     '128-bit',
+    'request_id',
+    'creation receipt',
+    'CREATION_REQUEST_CONFLICT',
   ]) {
     assert.ok(production.includes(term), `canonical controller-store guidance is missing ${term}`);
   }
   assert.match(protocol, /普通命令.*省略 `--state-root`/);
   assert.match(production, /无效.*fail closed/);
+  assert.match(protocol, /`resume`.*只持久化.*显式调用 `launch`/);
 });
 
 // R-4：状态机对可续类与终局类红 postflight 返回的**都是** `reject`，真正的分流在

@@ -10,7 +10,7 @@ Controller state 与 runtime state 必须在所有 target root 和系统临时�
 
 普通命令可以省略 `--state-root`，controller 按以下优先级只解析一次：显式 `--state-root`、`GOAL_CONDITION_CODEX_STATE_ROOT`、绝对且 normalized 的 `$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。任一已出现的高优先级值无效时立即 fail closed，不向下回退。默认路径是跨项目共享的机器级 store；显式 override 创建独立 deployment namespace，其 rollout、release-bound canary receipt、session 与 lease 都独立，缺失 rollout 仍视为 `disabled`。下文命令展示普通零配置路径；只有运维另建 namespace 时才追加 `--state-root <controller-state>`。
 
-共享 store 中的 `session_id` 与 `run_id` 是机器级主键，只能由 controller 生成 128-bit 随机 ID。Draft、V1 migration、prepare 与 resume 输入不得自选它们：`init`/`migrate-v1` stdout 回传 `session_id`，后续命令使用该值；`prepare`/`resume` stdout 回传 `run_id`，launch/verify/finalize/close 使用该值。已有 store 中的旧 ID 仍可读取，但所有新建路径都使用 controller-issued identity。
+共享 store 中的 `session_id` 与 `run_id` 是机器级主键，只能由 controller 生成 128-bit 随机 ID。调用方只提供自己已知的 128-bit `request_id`（session 创建）或 `nonce`（run 创建）；controller 在同一 SQLite 事务中保存资源和 creation receipt。响应丢失后重发完全相同的输入会返回原 ID，同 key 绑定不同输入则 `CREATION_REQUEST_CONFLICT`。Draft、V1 migration、prepare 与 resume 输入不得自选机器级主键：`init`/`migrate-v1` stdout 回传 `session_id`，`prepare`/`resume` stdout 回传 `run_id`。已有 store 中的旧 ID 仍可读取。
 
 ## 1. Rollout 与能力
 
@@ -30,7 +30,7 @@ Controller state 与 runtime state 必须在所有 target root 和系统临时�
 
 ## 2. Init、Preview、Confirm
 
-完整输入直接编译，不运行 Grill。draft 的 `root_baseline.digest` 可先放合法占位 SHA-256；`init --capture-baseline true` 会在确认前由 controller 捕获真实 baseline、重新编译并把 snapshot 写入 CAS。
+完整输入直接编译，不运行 Grill。init 输入是在 Draft 顶层增加 `"request_id":"<32 lowercase hex>"`；该字段只用于恢复创建结果，不进入 GoalSession 或授权哈希。draft 的 `root_baseline.digest` 可先放合法占位 SHA-256；`init --capture-baseline true` 会在确认前由 controller 捕获真实 baseline、重新编译并把 snapshot 写入 CAS。
 
 ```text
 init --input <draft.json> --capture-baseline true
@@ -59,7 +59,7 @@ prepare 输入：
 ```json
 {
   "attempt_id": "attempt-0001",
-  "nonce": "<32+ lowercase hex>",
+  "nonce": "<32 lowercase hex>",
   "expires_at": "<future ISO-8601>",
   "hard_prohibition_capabilities": [
     {"rule": "network-deny", "capability": "network-deny"}
@@ -73,9 +73,9 @@ launch --session-id <session-id> \
   --run-id <run-id> --runtime-root <runtime-state> --deadline-ms <positive-ms>
 ```
 
-prepare 由 controller 读回 root baseline、核当前 workspace、投影 immutable `AttemptManifest`、保存 Context Package/Projection Proof，并在一个写事务内检查/写入 LaunchIntent + root lease。`AttemptManifest.version=1` 只是私有 launcher ABI 的格式版本，不参与 runtime 路由。LaunchIntent 同时 MAC 绑定当前 controller release digest 与每个 target root 的 canonical path、device、inode；launch 在 dispatch 前重核版本和物理身份，再于同一 SQLite 事务把 pending intent 改为 `dispatching`、Session 改为 `Dispatching`。Active Boundary 不含 `write` 时 `thread/start` 必须使用 `read-only` sandbox；只有明确获授 `write` 才能使用 `workspace-write`。随后使用短 Goal 作为原生 objective，把完整 hash-bound Context Package 放进 `turn/start`。claim 后崩溃的同 run 重试只做 readback/reconcile，绝不再发副作用。
+prepare 由 controller 读回 root baseline、核当前 workspace、投影 immutable `AttemptManifest`、保存 Context Package/Projection Proof，并在一个写事务内检查/写入 creation receipt + LaunchIntent + root lease。相同 nonce 的重试先读 receipt，因此 stdout 丢失不会制造无法寻址的 intent 或 lease。`AttemptManifest.version=1` 只是私有 launcher ABI 的格式版本，不参与 runtime 路由。LaunchIntent 同时 MAC 绑定当前 controller release digest 与每个 target root 的 canonical path、device、inode；launch 在 dispatch 前重核版本和物理身份，再于同一 SQLite 事务把 pending intent 改为 `dispatching`、Session 改为 `Dispatching`。Active Boundary 不含 `write` 时 `thread/start` 必须使用 `read-only` sandbox；只有明确获授 `write` 才能使用 `workspace-write`。随后使用短 Goal 作为原生 objective，把完整 hash-bound Context Package 放进 `turn/start`。claim 后崩溃的同 run 重试只做 readback/reconcile，绝不再发副作用。
 
-`prepare` 返回 controller-issued `run_id`；调用方不得预先提供。`resume` 同样为新 immutable Attempt 生成并返回新的 `run_id`。
+`prepare` 返回 controller-issued `run_id`；调用方不得预先提供。`resume` 同样只持久化新 immutable Attempt 并返回新的 `run_id`，不在同一个调用里启动 runtime；调用方拿到 durable ID 后显式调用 `launch`。这样 runtime 初始化失败不会吞掉唯一可寻址的创建结果。
 
 若 launch 返回 `reconciliation_required`，只运行 `reconcile` 或 `close`，不重发 launch。`CONTROL_PLANE_BYPASS` 不能自动洗成受控执行。
 
@@ -90,14 +90,16 @@ verify --session-id <session-id> --attempt-id <attempt-id> \
 
 当前 app-server 的 `turn/start` 响应 ID 与 `thread/read` 持久化 ID 可能不同，不能把二者强行视为同一个字段，也不能把任意 readback turn 洗入授权。LaunchReceipt v2 要求 controller 新建 thread 时读取到空 turn 集，在待发送文本中加入随机 256-bit `Controller Turn Correlation`，保存响应 ID 与 exact text SHA-256；运行结束后的首次 `thread/read(includeTurns=true)` 必须在同一 thread 上精确出现一个持久化 turn，且其中唯一 user message 的文本哈希必须核回 `turn_input_sha256`，才把该 ID 写入严格单元素的 `turn_id/authorized_turn_ids`。这才形成 request-to-persisted-input 加 `0→1` 的联合因果栅栏；只满足集合基数而输入不同、初始非空、零个或多于一个 turn、后续或 finalize 前后的任何 ID/输入变化都持久化为 `CONTROL_PLANE_BYPASS`，readback 不可归因则进入 `ReconciliationRequired`。随后 controller 在 default-deny Seatbelt 中执行 active Conditions：只读显式系统 runtime 依赖与 target roots、唯一可写 verifier 临时目录、无网络、最小环境、有界进程/CPU/文件资源，不能检查或 signal 宿主进程；启动使用结构化 argv 与 `shell:false`，Condition 仍可显式声明 `/bin/sh -c`，但不会发生隐式 shell 拼接。Evidence 绑定 root baseline、当前 context、runtime version、projection、snapshot 与 Attempt。
 
-verify 红，或 Candidate 阶段的新 reviewer 发现 Authority 内缺口时，把 controller 事实编译为封闭 typed operation，调用 `revise`；revision 输入只有 `operation`，不接受调用方提供的 `controller_facts` 布尔值。`auto_apply` 后先 `close` 被取代 Attempt，释放它的 target-root lease，再用新的 `attempt_id/run_id/nonce` 调 `resume`；GoalSession 层的 resume 是新 immutable Attempt，不复用旧 candidate：
+verify 红，或 Candidate 阶段的新 reviewer 发现 Authority 内缺口时，把 controller 事实编译为封闭 typed operation，调用 `revise`；revision 输入只有 `operation`，不接受调用方提供的 `controller_facts` 布尔值。`auto_apply` 后先 `close` 被取代 Attempt，释放它的 target-root lease，再用新的 `attempt_id/nonce` 调 `resume`；GoalSession 层的 resume 是新 immutable Attempt，不复用旧 candidate：
 
 ```text
 revise --session-id <session-id> --input <revision.json>
 close --session-id <session-id> \
   --run-id <prior-run-id> --runtime-root <runtime-state>
 resume --session-id <session-id> \
-  --runtime-root <runtime-state> --input <next-attempt.json>
+  --input <next-attempt.json>
+launch --session-id <session-id> \
+  --run-id <resume-returned-run-id> --runtime-root <runtime-state>
 ```
 
 `ADD_CONDITION`、`ADD_AND_VERIFIER` 只能 byte-preserve 原 Conditions 并追加一个唯一、closed-world、Authority 内 Condition；结构化加强、controller 实读 bytes 的 Context refresh、包络内 Boundary 调整不重新确认。`maximum_budget:null` 表示尚未授予预算；显式预算只接受正数，`0` 不代表“无预算”也不进入投影。`null→有限值` 是需要新 hash 的 Authority 扩大，已有有限值不能用 `null` 删除。越出 Maximum Authority 的 Boundary 直接拒绝，调用方必须显式提交 `EXPAND_AUTHORITY`；它追加 hash-chained AuthorityRevision 后进入再授权，旧 hash 确认无效。`REPLACE_EQUIVALENT_VERIFIER` 与 `CONTROLLER_CORRECTION` 在独立 proof API 落地前拒绝；`WEAKEN_CONDITION` 与 `CHANGE_GOAL` 创建 successor；`UNCLASSIFIED` fail closed。
@@ -126,4 +128,4 @@ reconcile --session-id <session-id> \
 
 ## 6. V1 单向迁移
 
-旧 v1 contract 只有在用户明确迁移时运行 `migrate-v1`。迁移输入不接受 caller-selected `session_id`；controller 生成并在 stdout 回传。迁移输入保存为 immutable provenance，输出是 `AwaitingConfirmation` 的 V2 Draft；必须重新展示并确认 Goal + Authority。缺原始 baseline 时标记 `migrated_at_current_state`，只认证迁移之后的修改；不得把历史确认、runtime state 或完成证据伪造成 V2 Receipt，也不得给迁移前状态补发 Certified Complete。迁移后只能进入新的 V2 Attempt，不存在 v1 resume。
+旧 v1 contract 只有在用户明确迁移时运行 `migrate-v1`。迁移输入必须带 caller-known 128-bit `request_id`，但不接受 caller-selected `session_id`；controller 事务化保存 creation receipt，生成并在 stdout 回传 session ID。迁移输入保存为 immutable provenance，输出是 `AwaitingConfirmation` 的 V2 Draft；必须重新展示并确认 Goal + Authority。缺原始 baseline 时标记 `migrated_at_current_state`，只认证迁移之后的修改；不得把历史确认、runtime state 或完成证据伪造成 V2 Receipt，也不得给迁移前状态补发 Certified Complete。迁移后只能进入新的 V2 Attempt，不存在 v1 resume。

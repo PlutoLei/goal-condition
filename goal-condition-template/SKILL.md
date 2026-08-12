@@ -32,7 +32,7 @@ V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live�
 
 普通命令省略 `--state-root`，共享机器级 controller store：显式 flag > `GOAL_CONDITION_CODEX_STATE_ROOT` > `$XDG_STATE_HOME/goal-condition/codex-v2` > `<home>/.local/state/goal-condition/codex-v2`。无效的高优先级输入 fail closed，不向低优先级回退；显式 override 是独立 deployment namespace，必须独立 rollout。
 
-机器级 store 的 `session_id` 与 `run_id` 只能由 controller 生成 128-bit 随机 ID：`init`/`migrate-v1` 回传 session ID，`prepare`/`resume` 回传 run ID，后续命令消费回传值。新建输入不得自选这两个全局主键。
+机器级 store 的 `session_id` 与 `run_id` 只能由 controller 生成 128-bit 随机 ID：调用方用 128-bit `request_id`/`nonce` 绑定创建请求，controller 在同一事务保存 resource 与 creation receipt；相同请求可找回原 ID，同 key 改输入 fail closed。`init`/`migrate-v1` 回传 session ID，`prepare`/`resume` 只持久化 Attempt 并回传 run ID，后续显式 `launch`；新建输入不得自选全局主键。
 
 旧 Codex v1 contract 只能显式运行 `migrate-v1`。迁移保存输入与 provenance，创建未确认的 V2 Draft，并重新展示 Goal + Authority；旧确认、旧 runtime state 与旧完成证据都不继承，迁移后只能创建新的 V2 Attempt。
 

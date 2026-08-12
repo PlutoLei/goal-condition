@@ -18,3 +18,16 @@ test('controller identifier kinds are closed-world', () => {
     (error) => error.code === 'CONTROLLER_ID_KIND_INVALID',
   );
 });
+
+test('caller-known creation request ids are exactly 128-bit lowercase hex', () => {
+  assert.equal(
+    controller.assertCreationRequestId('00112233445566778899aabbccddeeff'),
+    '00112233445566778899aabbccddeeff',
+  );
+  for (const invalid of ['0'.repeat(31), '0'.repeat(33), 'A'.repeat(32), 'request-key']) {
+    assert.throws(
+      () => controller.assertCreationRequestId(invalid),
+      (error) => error.code === 'CREATION_REQUEST_ID_INVALID',
+    );
+  }
+});

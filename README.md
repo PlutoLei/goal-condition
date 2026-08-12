@@ -89,6 +89,8 @@ Claude 使用 controller-owned `runBinding`、`preflightEvidence` 与 `postfligh
 
 Codex 只使用 GoalSession v2：用户只确认稳定 Goal 与 Maximum Authority，Boundary、Condition 与 content-bound Context 在授权内以 typed Design Revision 演化，每次 revision 产生新的 immutable Attempt。controller 不可用或 V2 gate 关闭时 fail closed，不回退到旧 Codex lifecycle。旧 contract 只能通过 `migrate-v1` 生成未确认 V2 Draft。Grill 只用于设计评审，不进入 runtime。Context path 必须在 Active Boundary 内；无 `write` Authority 的 Attempt 使用 `read-only` sandbox，获授 `write` 才使用 `workspace-write`。
 
+机器级 store 的 session/run 主键由 controller 生成；调用方用已知的 128-bit `request_id`/`nonce` 绑定创建请求，creation receipt 与 session，或与 LaunchIntent + lease，在同一事务提交。响应丢失后重发完全相同的输入会找回原 ID，同 key 改输入 fail closed。`resume` 只完成这次 durable prepare 并返回 run ID，显式 `launch` 才启动 runtime，避免 runtime 初始化失败吞掉唯一可寻址结果。
+
 LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；`canary→enabled` 的 receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary，不能复用旧版本绿证据。
 
 ## 安装与私有 profile

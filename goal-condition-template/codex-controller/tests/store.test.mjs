@@ -57,6 +57,130 @@ test('target-root leases are exclusive and expired owners require reconciliation
   store.close();
 });
 
+test('session creation receipts recover the controller id after response loss and reject key reuse', async () => {
+  const { stateRoot, store } = await openTestStore();
+  const creationRequest = {
+    kind: 'session',
+    scopeId: 'machine',
+    requestKey: '0'.repeat(32),
+    requestHash: 'a'.repeat(64),
+  };
+  const first = createGoalSession({ ...validDraft(), session_id: 'session-first' });
+  assert.equal(
+    store.create(first, { creationRequest }).session_id,
+    'session-first',
+  );
+  store.close();
+
+  const reopened = openSessionStore({ stateRoot });
+  const retry = createGoalSession({ ...validDraft(), session_id: 'session-retry' });
+  assert.equal(
+    reopened.create(retry, { creationRequest }).session_id,
+    'session-first',
+  );
+  assert.equal(
+    reopened.readCreationReceipt(creationRequest).identifier,
+    'session-first',
+  );
+  assert.throws(
+    () => reopened.create(retry, {
+      creationRequest: { ...creationRequest, requestHash: 'b'.repeat(64) },
+    }),
+    (error) => error.code === 'CREATION_REQUEST_CONFLICT',
+  );
+  reopened.close();
+});
+
+test('run creation receipts atomically recover the original intent and lease', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-store-run-receipt-test-'));
+  roots.push(root);
+  const target = join(root, 'target-root');
+  await mkdir(target);
+  const store = openSessionStore({
+    stateRoot: join(root, 'state'),
+    targetRoots: [target],
+    clock: () => new Date('2026-08-11T00:00:00.000Z'),
+  });
+  const session = store.create(createGoalSession(validDraft()));
+  const creationRequest = {
+    kind: 'run',
+    scopeId: session.session_id,
+    requestKey: '1'.repeat(32),
+    requestHash: 'c'.repeat(64),
+  };
+  const first = {
+    intent_version: 1, session_id: session.session_id, attempt_id: 'attempt-first', run_id: 'run-first',
+    expires_at: '2099-08-11T00:01:00.000Z', payload: 'opaque-for-store',
+  };
+  assert.equal(store.persistLaunchIntent({
+    intent: first, roots: [target], ownerToken: 'owner-first', creationRequest,
+  }).run_id, 'run-first');
+
+  const retry = { ...first, attempt_id: 'attempt-retry', run_id: 'run-retry' };
+  assert.equal(store.persistLaunchIntent({
+    intent: retry, roots: [target], ownerToken: 'owner-retry', creationRequest,
+  }).run_id, 'run-first');
+  assert.equal(store.readRootLease(target).run_id, 'run-first');
+  assert.equal(store.readCreationReceipt(creationRequest).identifier, 'run-first');
+  assert.throws(
+    () => store.persistLaunchIntent({
+      intent: retry,
+      roots: [target],
+      ownerToken: 'owner-retry',
+      creationRequest: { ...creationRequest, requestHash: 'd'.repeat(64) },
+    }),
+    (error) => error.code === 'CREATION_REQUEST_CONFLICT',
+  );
+  store.close();
+});
+
+test('creation receipt fault windows roll back sessions, intents, and leases together', async () => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-store-receipt-rollback-test-'));
+  roots.push(root);
+  const target = join(root, 'target-root');
+  await mkdir(target);
+  let failurePoint = 'after_session_creation_receipt_insert';
+  const store = openSessionStore({
+    stateRoot: join(root, 'state'),
+    targetRoots: [target],
+    clock: () => new Date('2026-08-11T00:00:00.000Z'),
+    faultInjector: (point) => {
+      if (point === failurePoint) throw new Error(`injected:${point}`);
+    },
+  });
+  const sessionRequest = {
+    kind: 'session', scopeId: 'machine', requestKey: '4'.repeat(32), requestHash: 'e'.repeat(64),
+  };
+  const session = createGoalSession({ ...validDraft(), session_id: 'session-rollback' });
+  assert.throws(
+    () => store.create(session, { creationRequest: sessionRequest }),
+    /injected:after_session_creation_receipt_insert/,
+  );
+  assert.equal(store.readCreationReceipt(sessionRequest), null);
+  assert.throws(() => store.read(session.session_id), (error) => error.code === 'SESSION_NOT_FOUND');
+
+  failurePoint = null;
+  const durable = store.create(createGoalSession(validDraft()));
+  const runRequest = {
+    kind: 'run', scopeId: durable.session_id, requestKey: '5'.repeat(32), requestHash: 'f'.repeat(64),
+  };
+  const intent = {
+    intent_version: 1, session_id: durable.session_id, attempt_id: 'attempt-rollback', run_id: 'run-rollback',
+    expires_at: '2099-08-11T00:01:00.000Z', payload: 'opaque-for-store',
+  };
+  failurePoint = 'after_run_creation_receipt_insert';
+  assert.throws(
+    () => store.persistLaunchIntent({
+      intent, roots: [target], ownerToken: 'owner-rollback', creationRequest: runRequest,
+    }),
+    /injected:after_run_creation_receipt_insert/,
+  );
+  assert.equal(store.readCreationReceipt(runRequest), null);
+  assert.throws(() => store.readLaunchIntent(intent.run_id), (error) => error.code === 'LAUNCH_INTENT_NOT_FOUND');
+  assert.throws(() => store.readRootLease(target), (error) => error.code === 'TARGET_ROOT_LEASE_NOT_FOUND');
+  store.close();
+});
+
 test('controller state rejects a symlinked ancestor that resolves inside an executor target', async () => {
   const root = await mkdtemp(join(process.cwd(), '.gc-store-symlink-state-test-'));
   roots.push(root);

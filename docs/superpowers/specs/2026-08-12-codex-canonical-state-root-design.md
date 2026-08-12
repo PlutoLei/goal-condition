@@ -31,7 +31,7 @@ All commands that currently require `--state-root` will accept it as an optional
 
 The normal path is one shared controller store across projects. That gives rollout mode, release-bound canary receipt, event/blob integrity, and target-root lease arbitration one machine-local namespace. An operator who deliberately selects another state root is creating another deployment namespace; its missing rollout state remains `disabled` and must be promoted independently.
 
-Machine-wide deployment also makes session and run identities machine-wide. The controller therefore generates new `session_id` and `run_id` values from 128 bits of randomness and returns them to the caller; new Draft, migration, prepare, and resume inputs cannot select these database keys. Existing persisted IDs remain readable.
+Machine-wide deployment also makes session and run identities machine-wide. The controller therefore generates new `session_id` and `run_id` values from 128 bits of randomness and returns them to the caller; new Draft, migration, prepare, and resume inputs cannot select these database keys. Because a response can be lost after durable commit, callers supply a known 128-bit `request_id` for session creation or `nonce` for run creation. The controller transactionally binds that key and an immutable request hash to the generated identifier. An identical retry returns the original identifier; key reuse with different input fails closed. `resume` durably prepares and returns its run ID before a separate `launch` performs runtime work. Existing persisted IDs remain readable.
 
 ## Security Boundary
 
@@ -71,6 +71,8 @@ Tests must prove:
 7. the installed Skill documents the zero-config normal path and V2-only routing;
 8. the full root and Codex controller suites pass.
 9. two unrelated projects using the canonical store receive distinct controller-issued session and run IDs without caller coordination.
+10. response-loss retries recover the original session/run ID, while request-key reuse with changed input fails closed.
+11. injected failures cannot commit a creation receipt without its session, intent, and lease, or vice versa.
 
 Live acceptance for the new release must run the existing promotion shape in the canonical store:
 
