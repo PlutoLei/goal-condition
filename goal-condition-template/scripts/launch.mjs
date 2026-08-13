@@ -16,6 +16,7 @@ import {
 
 // Preserve the historical library surface while ownership follows the implementation module.
 export * from './lib/runner-common.mjs';
+export * from './lib/claude-capability.mjs';
 export * from './lib/runners/claude.mjs';
 export * from './lib/runners/codex.mjs';
 

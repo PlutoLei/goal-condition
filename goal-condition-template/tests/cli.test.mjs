@@ -190,11 +190,9 @@ test('CLI refuses a free-text diagnostics file before anything is launched', asy
   assert.equal(existsSync(join(dir, 'attempts')), false);
 });
 
-// 第二次冒烟 N-1：`outcome=terminal_report` 此前与「起飞且拿到候选」同为 exit 0——「根本没起飞」
-// 对只读退出码的编排器完全不可见。改置 3，与进程级失败(1)、usage(2) 各占一格。
-// 用例安全性同上：binding 文件不存在 → readBindingFile 归一为 undefined → 三方交叉在读 probes.json
-// 之前就 fail-closed，两个 runtime 都是零 spawn、零 daemon、零凭证接触。
-test('CLI launch refused by a pre-flight gate exits 3 with the terminal report on stdout', async () => {
+// Codex 保留既有 terminal-report 语义；Claude 现在还有一个更外层的 machine capability gate。
+// 未提供 controller-owned Certified context 时，它必须在 binding/probes 之前以进程级失败拒绝，且零 mutation。
+test('CLI launch distinguishes an uncertified Claude process failure from a Codex terminal report', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gc-cli-terminal-'));
   const promptPath = join(dir, 'prompt.txt');
   await writeFile(promptPath, 'OBJECTIVE TEXT\n');
@@ -205,11 +203,17 @@ test('CLI launch refused by a pre-flight gate exits 3 with the terminal report o
       '--contract', await writeContract(dir, runtime), '--state', dir,
       '--prompt-file', promptPath, '--binding-file', missingBinding]);
 
-    assert.equal(code, 3, runtime);
-    assert.equal(stderr, '', runtime);
-    const report = JSON.parse(stdout);
-    assert.equal(report.outcome, 'terminal_report', runtime);
-    assert.ok(report.reasons.length > 0, runtime);   // 权威在报告体，退出码只是可读的粗信号
+    if (runtime === 'claude') {
+      assert.equal(code, 1, runtime);
+      assert.equal(stdout, '', runtime);
+      assert.match(stderr, /CLAUDE_CAPABILITY_UNCERTIFIED/, runtime);
+    } else {
+      assert.equal(code, 3, runtime);
+      assert.equal(stderr, '', runtime);
+      const report = JSON.parse(stdout);
+      assert.equal(report.outcome, 'terminal_report', runtime);
+      assert.ok(report.reasons.length > 0, runtime);   // 权威在报告体，退出码只是可读的粗信号
+    }
   }
 
   // 同一条路径的 N-2 面：被闸挡下的 launch 一格 attempt 都没占（attempts/ 压根没被建出来）。

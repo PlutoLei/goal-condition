@@ -13,6 +13,7 @@ import {
   assertLaunchable, buildSettings, buildStopHook, launchSpec, normalizeTerminal, resumeSpec,
 } from '../adapters/claude.mjs';
 import { PermissionSpecifierError } from '../claude-permissions.mjs';
+import { assertClaudeCertified } from '../claude-capability.mjs';
 import { contractHash } from '../contract.mjs';
 import {
   AttemptClaimError, canonicalPath, initStateDir, nextAttempt, readControllerJsonNoFollow,
@@ -272,8 +273,12 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // not ok→终局报告）。候选与终局都不做 postflight——那是主会话的独立职责。
 export async function runClaudeAttempt({
   contract, stateDir, prompt, kind, diagnosticText, binding, execFileImpl = execFile,
-  beforeDispatch = async () => {},
+  beforeDispatch = async () => {}, capabilityContext,
 }) {
+  // Capability is the outermost ordinary-launch gate. Candidate state must not reach any state-dir
+  // mutation, attempt reservation, session claim, settings publication, or executor dispatch.
+  assertClaudeCertified(capabilityContext);
+
   // attempt 号只在所有前置闸全绿、真要 spawn 执行器时才占（第二次冒烟 N-2）：真实 dispatch
   // 之后不可撤销；pre-dispatch rollback 只能在下面的 Claude 独占 lease 内进行。前置闸拒绝的原因
   // 经常在 contract 之外（binding 笔误、claude 版本掉出 allowlist、hook 文件

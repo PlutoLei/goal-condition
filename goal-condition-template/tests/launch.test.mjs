@@ -14,15 +14,58 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
   MAX_AUTO_RESUMES, stateDirFor, initStateDir, nextAttempt, AttemptClaimError, classifyPostflightRed,
-  compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, renderCliError, runClaudeAttempt,
+  compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, renderCliError,
+  runClaudeAttempt as runClaudeAttemptImpl,
   runClaudeReadback, claudeTranscriptPath, readControllerJsonNoFollow, writeControllerJsonExclusive,
   helpAdvertisesLongOption,
   prepareCodexProbesOnly, runCodexLaunch, runCodexReadback, runCodexResume, runCodexFinalize, runCodexClose,
   POLL_INTERVAL_MS, WALL_CLOCK_DEADLINE_MS, LEASE_TTL_MS, releaseOwnLease, releaseResidualLease,
   MAX_TURNS_PER_ATTEMPT, MAX_TOKENS_PER_ATTEMPT,
 } from '../scripts/launch.mjs';
+import { CLAUDE_CANARY_CONDITIONS } from '../scripts/lib/claude-capability.mjs';
 import { GoalRpcClient } from '../scripts/lib/adapters/codex.mjs';
 import { canonicalJson, contractHash, ContractArtifactError } from '../scripts/lib/contract.mjs';
+
+const TEST_CAPABILITY_SOURCE = Object.freeze({
+  kind: 'git_checkout', root_realpath: '/test/controller/source', commit: 'a'.repeat(40),
+});
+const TEST_CAPABILITY_ENVIRONMENT = Object.freeze({
+  cli_version: '2.1.228', os: 'darwin', arch: 'arm64',
+  auth_mode: 'claude_ai', auth_context_id: 'launch-test',
+});
+const TEST_RUNTIME_SURFACE_DIGEST = '1'.repeat(64);
+const TEST_CAPABILITY_RECEIPT = Object.freeze({
+  schema_version: 1,
+  source: TEST_CAPABILITY_SOURCE,
+  runtime_surface_digest: TEST_RUNTIME_SURFACE_DIGEST,
+  environment: TEST_CAPABILITY_ENVIRONMENT,
+  canary_contract_hash: '2'.repeat(64),
+  baseline_digest: '3'.repeat(64),
+  run_identity: { run_id: 'launch-test', session_id: '11111111-1111-4111-8111-111111111111' },
+  conditions: Object.fromEntries(CLAUDE_CANARY_CONDITIONS.map((id) => [id, true])),
+  evidence_aggregate_hash: '4'.repeat(64),
+  candidate_result_hash: '5'.repeat(64),
+  postflight_report_hash: '6'.repeat(64),
+  certified_at: '2026-08-13T08:00:00.000Z',
+});
+const TEST_CAPABILITY_CONTEXT = Object.freeze({
+  state: {
+    schema_version: 1,
+    mode: 'certified',
+    changed_at: '2026-08-13T08:00:00.000Z',
+    active_source: TEST_CAPABILITY_SOURCE,
+    runtime_surface_digest: TEST_RUNTIME_SURFACE_DIGEST,
+    environment: TEST_CAPABILITY_ENVIRONMENT,
+    canary_receipt: TEST_CAPABILITY_RECEIPT,
+  },
+  source: TEST_CAPABILITY_SOURCE,
+  runtimeSurfaceDigest: TEST_RUNTIME_SURFACE_DIGEST,
+  environment: TEST_CAPABILITY_ENVIRONMENT,
+});
+
+function runClaudeAttempt(options) {
+  return runClaudeAttemptImpl({ capabilityContext: TEST_CAPABILITY_CONTEXT, ...options });
+}
 
 test('nextAttempt is O_EXCL monotonic and refuses beyond 1+MAX_AUTO_RESUMES', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gc-launch-test-'));
@@ -439,6 +482,33 @@ async function setupClaudeState(t, { contract = makeContract(), collect = stubCo
     stateDir, contract, binding,
   };
 }
+
+test('Claude Candidate gate runs before settings, attempt, claim, lease, or executor mutation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-claude-candidate-gate-'));
+  const stateDir = join(root, 'state');
+  await mkdir(stateDir, { mode: 0o700 });
+  const settingsPath = join(stateDir, 'settings.json');
+  await writeFile(settingsPath, 'pre-existing-settings', { mode: 0o600 });
+  let executorCalls = 0;
+
+  await assert.rejects(() => runClaudeAttemptImpl({
+    contract: makeContract(),
+    stateDir,
+    binding: { contractHash: 'not-reached' },
+    prompt: 'OBJECTIVE TEXT',
+    kind: 'launch',
+    execFileImpl: async () => { executorCalls += 1; },
+  }), (error) => {
+    assert.equal(error.code, 'CLAUDE_CAPABILITY_UNCERTIFIED');
+    return true;
+  });
+
+  assert.equal(executorCalls, 0);
+  assert.equal(await readFile(settingsPath, 'utf8'), 'pre-existing-settings');
+  for (const name of ['attempts', 'thread.json', 'claude-attempt.lock']) {
+    assert.equal(existsSync(join(stateDir, name)), false, name);
+  }
+});
 
 test('runClaudeAttempt(kind=launch) on a green probe set produces a candidate and calls execFileImpl once', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);

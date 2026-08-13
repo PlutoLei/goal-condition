@@ -27,6 +27,20 @@
 
 `preflightEvidence` 是 closed-world controller channel，不能从执行会话或 launch 输出反序列化得到。失败必须用 `ok=false` 和非空安全 reasons 表达，并停止 launch。
 
+普通 Claude launch 之前还有一道 machine-level capability gate。Controller 从
+`<controller-state-root>/runtime-certifications/claude.json` 读取 mode `0600` 的闭世界状态；父目录必须是
+真实的 mode `0700` 目录。只有 `mode="certified"`，并且 receipt 与当前已验证 source identity、Claude
+runtime-surface digest、CLI version、OS、arch、非秘密 `auth_mode` 及 operator 管理的 opaque
+`auth_context_id` 全部精确一致，才允许进入 attempt 生命周期。任何缺失、字段漂移、source
+commit/manifest drift 或五项 canary condition 不完整都有效降级为 Candidate；旧 receipt 保留作审计，
+不因有效态降级而被覆盖。
+
+这道闸是 `runClaudeAttempt` 的最外层检查：`CLAUDE_CAPABILITY_UNCERTIFIED` 发生时不创建
+`attempts/`、不改 `settings.json`、不 claim `thread.json`、不取得 `claude-attempt.lock`、不 spawn。
+禁止 `--force`、`skip` 或任意 contract 复用 Candidate 执行豁口；唯一豁口由固定认证命令拥有。
+Codex runner 不读取这份 Claude state。认证身份只保存 `claude_ai` / `api_key` 枚举与 opaque context ID，
+不保存邮箱、组织、subscription、key hash，也不从 credential 派生 ID。
+
 ## 启动姿态与 Stop hook
 
 **弃用 `/goal`**：`/goal` 是 session-scoped 的 prompt-based Stop hook 包装，每轮由默认小模型（Haiku，弱判官）判条件是否满足；condition 上限 4000 字符，压缩长 contract 会丢语义；一旦 settings 出现 `disableAllHooks`（或 `allowManagedHooksOnly`），`/goal` 整体失效、无降级路径。记名保留、明确弃用，不再作为本 adapter 的启动姿态。改用裸 `claude -p` 直接起会话，配合控制器生成的 command 型 Stop hook 自建确定性续轮自检；协议核心（contract 格式、hash、证据通道）不受影响。
@@ -79,7 +93,7 @@ max-turns 的特殊恢复路由不只看 17-key 全集，还要求实测 discrim
 | 退出码 | 含义 | stdout |
 |---|---|---|
 | 0 | 命令跑完并产出它声明的结果；`launch`/`resume` 特指 `outcome="candidate"` | 报告体 JSON |
-| 1 | 进程级失败：contract / prompt / diagnostics 文件读不出**或红项清单不合形状**、attempt 号没占上（配额已耗尽 `ATTEMPT_LIMIT_EXCEEDED`，或并发下被别的进程抢先 `ATTEMPT_SLOT_TAKEN`）、flag 落在不支持的 runtime 上 | 空（诊断在 stderr） |
+| 1 | 进程级失败：Claude capability 未认证、contract / prompt / diagnostics 文件读不出**或红项清单不合形状**、attempt 号没占上（配额已耗尽 `ATTEMPT_LIMIT_EXCEEDED`，或并发下被别的进程抢先 `ATTEMPT_SLOT_TAKEN`）、flag 落在不支持的 runtime 上 | 空（诊断在 stderr） |
 | 2 | usage 错误：未知子命令、缺必填 flag、重复或无值 flag | 空（usage 在 stderr） |
 | 3 | `launch`/`resume` 返回 `outcome="terminal_report"`：被前置闸挡下没起飞，或起飞后判定终局 | 完整报告体 JSON，`reasons` 非空 |
 
