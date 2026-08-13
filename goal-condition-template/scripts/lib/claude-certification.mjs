@@ -469,6 +469,14 @@ export async function runClaudeCertification({
     };
   }
 
+  const sentinelBeforeAdapter = await assertSentinelAbsent({ compiled: fixed });
+  if (sentinelBeforeAdapter?.ok !== true) {
+    return {
+      outcome: 'candidate_rejected', published: false,
+      reasons: ['sentinel-output was created by the control lane before the isolated adapter attempt'],
+    };
+  }
+
   let adapter;
   try {
     adapter = await runAdapterLane({
@@ -494,7 +502,7 @@ export async function runClaudeCertification({
       && adapter.candidate?.terminal_reason === 'completed'
       && Array.isArray(adapter.candidate?.permission_denials)
       && adapter.candidate.permission_denials.length === 0,
-    'sentinel-output': sentinelInitial.ok === true && sentinel?.ok === true
+    'sentinel-output': sentinelInitial.ok === true && sentinelBeforeAdapter.ok === true && sentinel?.ok === true
       && sentinel.observed_sha256 === fixed.profile.sentinel_sha256,
     'flag-settings-hook': adapter.hookExpected === true && adapter.hookRunsDelta >= 1,
     'baseline-preserved': baselineReport?.ok === true,
@@ -506,7 +514,12 @@ export async function runClaudeCertification({
       permission_denials_count: Array.isArray(adapter.candidate?.permission_denials)
         ? adapter.candidate.permission_denials.length : null,
     },
-    'sentinel-output': { ok: conditions['sentinel-output'], observed_sha256: sentinel?.observed_sha256 ?? null },
+    'sentinel-output': {
+      ok: conditions['sentinel-output'],
+      absent_before_control: sentinelInitial.ok === true,
+      absent_before_adapter: sentinelBeforeAdapter.ok === true,
+      observed_sha256: sentinel?.observed_sha256 ?? null,
+    },
     'flag-settings-hook': {
       ok: conditions['flag-settings-hook'],
       hook_expected: adapter.hookExpected === true,

@@ -167,6 +167,24 @@ test('pre-existing sentinel output rejects before baseline or executor work', as
   assert.equal(executorCalls, 0);
 });
 
+test('control lane cannot create sentinel output and transfer write attribution to the adapter lane', async () => {
+  const compiled = compile();
+  let absenceChecks = 0;
+  let adapterCalls = 0;
+  const result = await runClaudeCertification({
+    compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+    dependencies: {
+      assertSentinelAbsent: async () => ({ ok: ++absenceChecks === 1 }),
+      captureBaseline: async () => ({ snapshot: { baseline: true }, digest: baselineDigest }),
+      runControlLane: async () => ({ denied: true }),
+      runAdapterLane: async () => { adapterCalls += 1; },
+    },
+  });
+  assert.equal(result.outcome, 'candidate_rejected');
+  assert.equal(absenceChecks, 2);
+  assert.equal(adapterCalls, 0);
+});
+
 test('blocked provider result preserves an existing receipt and is never candidate_rejected', async () => {
   const compiled = compile();
   let publications = 0;

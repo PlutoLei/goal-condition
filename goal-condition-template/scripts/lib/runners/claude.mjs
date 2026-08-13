@@ -274,7 +274,7 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // not ok→终局报告）。候选与终局都不做 postflight——那是主会话的独立职责。
 async function executeClaudeAttempt({
   contract, stateDir, prompt, kind, diagnosticText, binding, execFileImpl = execFile,
-  beforeDispatch = async () => {},
+  beforeDispatch = async () => {}, providerFailuresAreBlocked = false,
 }) {
   // attempt 号只在所有前置闸全绿、真要 spawn 执行器时才占（第二次冒烟 N-2）：真实 dispatch
   // 之后不可撤销；pre-dispatch rollback 只能在下面的 Claude 独占 lease 内进行。前置闸拒绝的原因
@@ -579,6 +579,16 @@ async function executeClaudeAttempt({
     });
   }
 
+  if (normalized.providerBlocker !== null) {
+    return finish({
+      outcome: providerFailuresAreBlocked ? 'blocked' : 'terminal_report',
+      provider_error: true,
+      api_error_status: normalized.providerBlocker.api_error_status,
+      reasons: ['Claude provider was unavailable for this attempt'],
+      sessionId,
+    });
+  }
+
   await writeFile(join(stateDir, 'candidate.json'), JSON.stringify(normalized.candidate, null, 2));
 
   // budgetExhausted 是报告体字段不进 candidate（candidate 恒 4 字段，见 normalizeTerminal）：
@@ -601,7 +611,7 @@ export async function runClaudeAttempt(options) {
   // Capability is the outermost ordinary-launch gate. Candidate state must not reach any state-dir
   // mutation, attempt reservation, session claim, settings publication, or executor dispatch.
   assertClaudeCertified(options?.capabilityContext);
-  return executeClaudeAttempt(options ?? {});
+  return executeClaudeAttempt({ ...(options ?? {}), providerFailuresAreBlocked: false });
 }
 
 export async function runClaudeCertificationAttempt({ compiled, ...options }) {
@@ -610,7 +620,7 @@ export async function runClaudeCertificationAttempt({ compiled, ...options }) {
     throw new Error('CLAUDE_CERTIFICATION_PROFILE_INVALID: adapter contract differs from the fixed canary');
   }
   const hookRunsBefore = await hookRunCount(options.stateDir);
-  const result = await executeClaudeAttempt(options);
+  const result = await executeClaudeAttempt({ ...options, providerFailuresAreBlocked: true });
   return {
     ...result,
     hookRunsBefore,

@@ -69,12 +69,20 @@ export function normalizeTerminal(raw) {
     reasons.push('Claude error_max_turns result does not match the measured discriminator tuple');
   }
   if (reasons.length) return { ok: false, reasons };
+  // Provider availability belongs to the controller report, not the four-field candidate. Preserve
+  // only the bounded status needed for routing; never propagate result/errors/transcript bytes.
+  const apiErrorStatus = Number(raw.api_error_status);
+  const providerBlocker = Number.isInteger(apiErrorStatus)
+    && (apiErrorStatus === 429 || apiErrorStatus >= 500)
+    ? { api_error_status: apiErrorStatus }
+    : null;
   // budgetExhausted 是给控制器报告体的路由信号（「预算耗尽、可续跑」），不进 candidate——
   // candidate 恒为 4 字段：workflow.mjs 的 claudeTerminalState 做闭世界形状检查，多一个字段
   // 就把「未达标候选」变成 reject 里的形状错误，两种红不是一回事。
   return {
     ok: true,
     budgetExhausted,
+    providerBlocker,
     candidate: {
       subtype: raw.subtype,
       is_error: raw.is_error,

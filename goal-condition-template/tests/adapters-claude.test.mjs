@@ -95,6 +95,15 @@ test('the success path reports budgetExhausted=false explicitly', () => {
   assert.equal(normalizeTerminal(realResult).budgetExhausted, false);
 });
 
+test('provider status is preserved outside the four-field candidate as a privacy-safe blocker signal', () => {
+  const normalized = normalizeTerminal({ ...realResult, api_error_status: 429, is_error: true });
+  assert.equal(normalized.ok, true);
+  assert.deepEqual(normalized.providerBlocker, { api_error_status: 429 });
+  assert.deepEqual(Object.keys(normalized.candidate).sort(),
+    ['is_error', 'permission_denials', 'subtype', 'terminal_reason']);
+  assert.equal(JSON.stringify(normalized.providerBlocker).includes(realResult.result), false);
+});
+
 test('the error anchor is exhaustive: every key removed or added fails closed', () => {
   for (const key of CLAUDE_ERROR_MAX_TURNS_KEYS) {
     const mutated = { ...errorMaxTurnsResult };

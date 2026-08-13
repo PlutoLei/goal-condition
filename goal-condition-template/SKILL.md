@@ -61,7 +61,7 @@ session 或 spawn；不得使用 `force`/`skip`。
 该 hash → `certify-claude-run`。hash 覆盖 source/runtime/auth/disposable roots/sentinel/budget/contract 的闭世界
 certification artifact；source 必须是实际执行根，state 输出固定从已确认 state root 派生。认证命令只接受 controller 内置 profile，必须同时证明
 `ambient-deny-control`、`isolated-adapter-candidate`、`sentinel-output`、`flag-settings-hook`、
-`baseline-preserved`；output 必须在本轮前不存在，ambient denial 必须精确命中 sentinel Read，hook 只计本轮
+`baseline-preserved`；output 必须在 control 前与 adapter 前都不存在，ambient denial 必须精确命中 sentinel Read，hook 只计本轮
 增量；全绿才原子发布 Certified receipt。429、subscription/session limit、网络或 provider
 错误归 `blocked`，保留旧 receipt，不得写成 canary red。`auth_context_id` 由 operator 管理且不从 secret
 派生；认证主体或 administrative policy context 变化时必须轮换。

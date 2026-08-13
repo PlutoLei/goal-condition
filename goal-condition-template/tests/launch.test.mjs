@@ -20,6 +20,7 @@ import {
 import {
   hookRunCount, prepareClaude,
   runClaudeAttempt as runClaudeAttemptImpl,
+  runClaudeCertificationAttempt,
   runClaudeReadback, claudeTranscriptPath, helpAdvertisesLongOption,
 } from '../scripts/lib/runners/claude.mjs';
 import {
@@ -31,6 +32,7 @@ import { renderCliError } from '../scripts/launch.mjs';
 import { CLAUDE_CANARY_CONDITIONS } from '../scripts/lib/claude-capability.mjs';
 import { GoalRpcClient } from '../scripts/lib/adapters/codex.mjs';
 import { canonicalJson, contractHash, ContractArtifactError } from '../scripts/lib/contract.mjs';
+import { compileClaudeCertificationContract } from '../scripts/lib/claude-certification.mjs';
 
 const TEST_CAPABILITY_SOURCE = Object.freeze({
   kind: 'git_checkout', root_realpath: '/test/controller/source', commit: 'a'.repeat(40),
@@ -645,6 +647,46 @@ test('runClaudeAttempt: execFile throw recovers the result JSON from error.stdou
   assert.equal(result.outcome, 'candidate');
   const args = stub.calls[0].args;
   assert.equal(result.sessionId, args[args.indexOf('--session-id') + 1]);
+});
+
+test('runClaudeCertificationAttempt turns a normalized 429 envelope into blocked without persisting a candidate', async (t) => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-state-test-provider-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const targetRoot = join(root, 'target');
+  const stateRoot = join(root, 'state');
+  await mkdir(targetRoot);
+  await mkdir(stateRoot);
+  const compiled = compileClaudeCertificationContract({
+    source: TEST_CAPABILITY_SOURCE,
+    runtimeSurfaceDigest: TEST_RUNTIME_SURFACE_DIGEST,
+    targetRoot: realpathSync(targetRoot),
+    stateRoot: realpathSync(stateRoot),
+    authMode: 'claude_ai',
+    authContextId: 'launch-test',
+    sentinelSha256: '7'.repeat(64),
+    maxTurns: 5,
+  });
+  const hash = contractHash(compiled.contract);
+  const stateDir = stateDirFor({ stateRoot, controller: 'claude-certification', contractHash: hash });
+  await prepareClaude({ contract: compiled.contract, stateDir, collect: stubCollect });
+  const binding = { contractHash: hash, baselineDigest: 'b'.repeat(64), runId: 'cert-provider' };
+  const providerResult = { ...claudeResultFixture, api_error_status: 429, is_error: true };
+
+  const result = await runClaudeCertificationAttempt({
+    compiled,
+    contract: compiled.contract,
+    stateDir,
+    binding,
+    prompt: compiled.contract.objective,
+    kind: 'launch',
+    execFileImpl: stubRejectingEchoing(providerResult, 'Claude exited after provider error').impl,
+  });
+
+  assert.equal(result.outcome, 'blocked');
+  assert.equal(result.provider_error, true);
+  assert.equal(result.api_error_status, 429);
+  assert.equal('candidate' in result, false);
+  await assert.rejects(() => readFile(join(stateDir, 'candidate.json')));
 });
 
 test('runClaudeAttempt: execFile throw without a parseable stdout is a process-failure terminal report', async (t) => {
