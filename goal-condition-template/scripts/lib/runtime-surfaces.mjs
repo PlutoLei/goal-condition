@@ -1,4 +1,9 @@
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import {
+  existsSync, lstatSync, readFileSync, realpathSync,
+} from 'node:fs';
+import { join, relative, resolve, sep } from 'node:path';
 
 import { canonicalJson } from './contract.mjs';
 
@@ -67,6 +72,10 @@ export class RuntimeSurfaceError extends Error {
 
 function digestCanonical(value) {
   return createHash('sha256').update(canonicalJson(value), 'utf8').digest('hex');
+}
+
+function sha256(bytes) {
+  return createHash('sha256').update(bytes).digest('hex');
 }
 
 function sameFields(value, fields) {
@@ -147,21 +156,33 @@ function normalizedSourceEntries(sourceEntries) {
   return normalized;
 }
 
-export function runtimeSurfaceDigests(sourceEntries) {
-  classifyCoreFiles(REQUIRED_CORE_FILES);
-  const entries = normalizedSourceEntries(sourceEntries);
-  const forRuntime = (runtime) => entries.filter(({ path }) => {
+function runtimePaths(runtime) {
+  if (!['claude', 'codex'].includes(runtime)) {
+    throw new RuntimeSurfaceError('RUNTIME_SURFACE_RUNTIME_INVALID', 'runtime must be claude or codex');
+  }
+  return REQUIRED_CORE_FILES.filter((path) => {
     const capability = CORE_FILE_CAPABILITIES[path];
     return capability === 'runtime_shared' || capability === runtime;
   });
-  const claude = forRuntime('claude');
-  const codex = forRuntime('codex');
-  if (claude.length === 0 || codex.length === 0) {
-    throw new RuntimeSurfaceError('RUNTIME_SURFACE_EMPTY', 'runtime surface must not be empty');
+}
+
+function digestRuntimeEntries(runtime, entries) {
+  const expected = runtimePaths(runtime);
+  const selected = entries.filter(({ path }) => expected.includes(path));
+  if (selected.length !== expected.length
+    || expected.some((path) => !selected.some((entry) => entry.path === path))) {
+    throw new RuntimeSurfaceError('RUNTIME_SURFACE_EMPTY', 'runtime surface is incomplete');
   }
+  selected.sort((left, right) => left.path.localeCompare(right.path));
+  return digestCanonical(selected);
+}
+
+export function runtimeSurfaceDigests(sourceEntries) {
+  classifyCoreFiles(REQUIRED_CORE_FILES);
+  const entries = normalizedSourceEntries(sourceEntries);
   return Object.freeze({
-    claude: digestCanonical(claude),
-    codex: digestCanonical(codex),
+    claude: digestRuntimeEntries('claude', entries),
+    codex: digestRuntimeEntries('codex', entries),
   });
 }
 
@@ -183,4 +204,158 @@ export function validateRuntimeSurfaces(manifest) {
     );
   }
   return computed;
+}
+
+function physicalRoot(root) {
+  if (typeof root !== 'string' || root.length === 0) {
+    throw new RuntimeSurfaceError('RUNTIME_SOURCE_ROOT_INVALID', 'runtime source root must be a path');
+  }
+  let canonical;
+  try {
+    canonical = realpathSync(resolve(root));
+    const stat = lstatSync(canonical);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not physical');
+  } catch {
+    throw new RuntimeSurfaceError('RUNTIME_SOURCE_ROOT_INVALID', 'runtime source root must be physical');
+  }
+  return canonical;
+}
+
+function physicalFile(root, path) {
+  const pathname = resolve(root, path);
+  const delta = relative(root, pathname);
+  if (delta === '' || delta === '..' || delta.startsWith(`..${sep}`) || delta.startsWith(sep)) {
+    throw new RuntimeSurfaceError('RUNTIME_SOURCE_PATH_INVALID', 'runtime source path escapes its root');
+  }
+  let stat;
+  try {
+    stat = lstatSync(pathname);
+    if (!stat.isFile() || stat.isSymbolicLink() || realpathSync(pathname) !== pathname) throw new Error('not physical');
+  } catch {
+    throw new RuntimeSurfaceError('RUNTIME_SOURCE_FILE_INVALID', 'runtime source file must be physical');
+  }
+  return { pathname, stat, bytes: readFileSync(pathname) };
+}
+
+function expectedFilesystemMode(gitMode) {
+  return gitMode === '100755' ? 0o755 : 0o644;
+}
+
+function inspectImmutableRelease(root, runtime, expectedManifestDigest) {
+  if (!SHA256.test(expectedManifestDigest ?? '')) {
+    throw new RuntimeSurfaceError(
+      'RELEASE_MANIFEST_DIGEST_REQUIRED',
+      'immutable runtime source requires an external manifest digest',
+    );
+  }
+  const manifestFile = physicalFile(root, 'manifest.json');
+  const manifestDigest = sha256(manifestFile.bytes);
+  if (manifestDigest !== expectedManifestDigest) {
+    throw new RuntimeSurfaceError(
+      'RELEASE_MANIFEST_DIGEST_MISMATCH',
+      'immutable runtime source does not match the external manifest digest',
+    );
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(manifestFile.bytes.toString('utf8'));
+  } catch {
+    throw new RuntimeSurfaceError('RELEASE_MANIFEST_INVALID', 'release manifest is not valid JSON');
+  }
+  const manifestFields = ['commit', 'profile_sha256', 'runtime_surfaces', 'schema_version', 'source_files'];
+  if (!sameFields(manifest, manifestFields)
+    || manifest.schema_version !== 2
+    || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(manifest.commit ?? '')
+    || !SHA256.test(manifest.profile_sha256 ?? '')) {
+    throw new RuntimeSurfaceError('RELEASE_MANIFEST_INVALID', 'release manifest is not schema v2');
+  }
+  const surfaces = validateRuntimeSurfaces(manifest);
+  for (const entry of manifest.source_files) {
+    const current = physicalFile(root, entry.path);
+    if (sha256(current.bytes) !== entry.sha256
+      || (current.stat.mode & 0o7777) !== expectedFilesystemMode(entry.mode)) {
+      throw new RuntimeSurfaceError('RELEASE_SOURCE_DRIFT', 'release source no longer matches its manifest');
+    }
+  }
+  const profile = physicalFile(root, 'references/anchors-and-rules.md');
+  if (sha256(profile.bytes) !== manifest.profile_sha256 || (profile.stat.mode & 0o7777) !== 0o600) {
+    throw new RuntimeSurfaceError('RELEASE_SOURCE_DRIFT', 'release private profile no longer matches its manifest');
+  }
+  return {
+    source: {
+      kind: 'immutable_release', root_realpath: root, manifest_digest: manifestDigest,
+    },
+    releaseManifestDigest: manifestDigest,
+    runtimeSurfaceDigest: surfaces[runtime],
+  };
+}
+
+function git(root, args, options = {}) {
+  try {
+    return execFileSync('git', ['-C', root, ...args], {
+      encoding: options.encoding ?? 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    throw new RuntimeSurfaceError(
+      'CHECKOUT_SOURCE_INVALID',
+      'checkout runtime source could not be read from Git',
+      { exitCode: error?.status },
+    );
+  }
+}
+
+function inspectGitCheckout(root, runtime) {
+  const gitRoot = realpathSync(git(root, ['rev-parse', '--show-toplevel']).trim());
+  const relativeTemplate = relative(gitRoot, root);
+  if (relativeTemplate === '' || relativeTemplate === '..'
+    || relativeTemplate.startsWith(`..${sep}`) || relativeTemplate.startsWith(sep)) {
+    throw new RuntimeSurfaceError('CHECKOUT_SOURCE_INVALID', 'runtime source is not inside its Git checkout');
+  }
+  const commit = git(gitRoot, ['rev-parse', '--verify', 'HEAD^{commit}']).trim();
+  if (!/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(commit)) {
+    throw new RuntimeSurfaceError('CHECKOUT_SOURCE_INVALID', 'checkout HEAD is not a full commit');
+  }
+  const selectedPaths = runtimePaths(runtime);
+  const gitPaths = selectedPaths.map((path) => `${relativeTemplate.split(sep).join('/')}/${path}`);
+  try {
+    execFileSync('git', ['-C', gitRoot, 'diff', '--quiet', 'HEAD', '--', ...gitPaths], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+    });
+  } catch (error) {
+    if (error?.status === 1) {
+      throw new RuntimeSurfaceError('CHECKOUT_RUNTIME_DIRTY', 'runtime material differs from checkout HEAD');
+    }
+    throw new RuntimeSurfaceError('CHECKOUT_SOURCE_INVALID', 'checkout runtime diff could not be verified');
+  }
+  const entries = selectedPaths.map((path, index) => {
+    const gitPath = gitPaths[index];
+    const record = git(gitRoot, ['ls-tree', '-z', commit, '--', gitPath], { encoding: 'buffer' })
+      .toString('utf8').replace(/\0$/, '');
+    const match = /^(100644|100755) blob [0-9a-f]{40,64}\t(.+)$/.exec(record);
+    if (!match || match[2] !== gitPath) {
+      throw new RuntimeSurfaceError('CHECKOUT_SOURCE_INVALID', 'checkout runtime file is not a regular HEAD blob');
+    }
+    const bytes = git(gitRoot, ['show', '--no-textconv', `${commit}:${gitPath}`], { encoding: 'buffer' });
+    const current = physicalFile(root, path);
+    if (sha256(current.bytes) !== sha256(bytes)
+      || (current.stat.mode & 0o7777) !== expectedFilesystemMode(match[1])) {
+      throw new RuntimeSurfaceError('CHECKOUT_RUNTIME_DIRTY', 'runtime material differs from checkout HEAD');
+    }
+    return { path, mode: match[1], sha256: sha256(bytes) };
+  });
+  return {
+    source: { kind: 'git_checkout', root_realpath: root, commit },
+    releaseManifestDigest: null,
+    runtimeSurfaceDigest: digestRuntimeEntries(runtime, entries),
+  };
+}
+
+export function inspectRuntimeSource({ root, runtime, expectedManifestDigest } = {}) {
+  runtimePaths(runtime);
+  const canonicalRoot = physicalRoot(root);
+  return existsSync(join(canonicalRoot, 'manifest.json'))
+    ? inspectImmutableRelease(canonicalRoot, runtime, expectedManifestDigest)
+    : inspectGitCheckout(canonicalRoot, runtime);
 }

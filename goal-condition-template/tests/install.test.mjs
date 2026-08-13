@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import test from 'node:test';
 import { installRelease, verifyRelease, REQUIRED_CORE_FILES } from '../scripts/lib/installer.mjs';
+import { inspectRuntimeSource } from '../scripts/lib/runtime-surfaces.mjs';
 
 const execFile = promisify(execFileCallback);
 
@@ -141,6 +142,27 @@ test('materializes an immutable release from the requested commit without profil
   assert.deepEqual(await verifyRelease(result.releaseDir, {
     expectedManifestDigest: result.manifestDigest,
   }), { ok: true, drift: [], manifestDigest: result.manifestDigest });
+  assert.deepEqual(inspectRuntimeSource({
+    root: result.releaseDir,
+    runtime: 'claude',
+    expectedManifestDigest: result.manifestDigest,
+  }), {
+    source: {
+      kind: 'immutable_release',
+      root_realpath: result.releaseDir,
+      manifest_digest: result.manifestDigest,
+    },
+    releaseManifestDigest: result.manifestDigest,
+    runtimeSurfaceDigest: manifest.runtime_surfaces.claude,
+  });
+  assert.throws(
+    () => inspectRuntimeSource({
+      root: result.releaseDir,
+      runtime: 'claude',
+      expectedManifestDigest: '0'.repeat(64),
+    }),
+    (error) => error.code === 'RELEASE_MANIFEST_DIGEST_MISMATCH',
+  );
 
   const again = await installRelease({
     repo,

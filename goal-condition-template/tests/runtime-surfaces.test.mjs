@@ -1,5 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import {
+  chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -8,6 +14,7 @@ import {
   REQUIRED_CORE_FILES,
   RuntimeSurfaceError,
   classifyCoreFiles,
+  inspectRuntimeSource,
   runtimeSurfaceDigests,
   validateRuntimeSurfaces,
 } from '../scripts/lib/runtime-surfaces.mjs';
@@ -106,4 +113,36 @@ test('manifest runtime surfaces are recomputed from source entries instead of tr
     () => validateRuntimeSurfaces({ source_files, runtime_surfaces: { ...runtime_surfaces, extra: '0'.repeat(64) } }),
     (error) => error.code === 'RUNTIME_SURFACE_SHAPE_INVALID',
   );
+});
+
+test('a checkout runtime identity is Git-bound and rejects runtime worktree drift', (t) => {
+  const parent = mkdtempSync(join(tmpdir(), 'goal-runtime-source-'));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  const template = join(parent, 'goal-condition-template');
+  for (const path of REQUIRED_CORE_FILES) {
+    const pathname = join(template, path);
+    mkdirSync(dirname(pathname), { recursive: true });
+    writeFileSync(pathname, `source:${path}\n`);
+    if (path === 'scripts/install.mjs') chmodSync(pathname, 0o755);
+  }
+  execFileSync('git', ['-C', parent, 'init', '--initial-branch=main']);
+  execFileSync('git', ['-C', parent, 'config', 'user.name', 'Runtime Source Test']);
+  execFileSync('git', ['-C', parent, 'config', 'user.email', 'runtime-source@example.invalid']);
+  execFileSync('git', ['-C', parent, 'add', '.']);
+  execFileSync('git', ['-C', parent, 'commit', '-m', 'runtime source']);
+  const commit = execFileSync('git', ['-C', parent, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+
+  const identity = inspectRuntimeSource({ root: template, runtime: 'claude' });
+  assert.deepEqual(identity.source, {
+    kind: 'git_checkout', root_realpath: realpathSync(template), commit,
+  });
+  assert.equal(identity.releaseManifestDigest, null);
+  assert.match(identity.runtimeSurfaceDigest, /^[0-9a-f]{64}$/);
+
+  writeFileSync(join(template, 'scripts/lib/adapters/claude.mjs'), 'drift\n');
+  assert.throws(
+    () => inspectRuntimeSource({ root: template, runtime: 'claude' }),
+    (error) => error.code === 'CHECKOUT_RUNTIME_DIRTY',
+  );
+  assert.doesNotThrow(() => inspectRuntimeSource({ root: template, runtime: 'codex' }));
 });
