@@ -53,6 +53,7 @@ const capabilityEntries = [
   ['scripts/lib/adapters/claude.mjs', 'claude'],
   ['scripts/lib/adapters/codex.mjs', 'codex'],
   ['scripts/lib/claude-capability.mjs', 'claude'],
+  ['scripts/lib/claude-certification.mjs', 'claude'],
   ['scripts/lib/claude-permissions.mjs', 'claude'],
   ['scripts/lib/runners/claude.mjs', 'claude'],
   ['scripts/lib/runners/codex.mjs', 'codex'],

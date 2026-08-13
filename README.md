@@ -143,6 +143,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `scripts/lib/adapters/claude.mjs`
 - `scripts/lib/adapters/codex.mjs`
 - `scripts/lib/claude-capability.mjs`
+- `scripts/lib/claude-certification.mjs`
 - `scripts/lib/claude-permissions.mjs`
 - `scripts/lib/runners/claude.mjs`
 - `scripts/lib/runners/codex.mjs`

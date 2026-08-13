@@ -41,6 +41,27 @@ commit/manifest drift 或五项 canary condition 不完整都有效降级为 Can
 Codex runner 不读取这份 Claude state。认证身份只保存 `claude_ai` / `api_key` 枚举与 opaque context ID，
 不保存邮箱、组织、subscription、key hash，也不从 credential 派生 ID。
 
+### 固定认证命令
+
+Candidate 只能通过 `certify-claude-prepare` / `certify-claude-run` 进入执行面。prepare 接受当前
+source、disposable target/state、`claude_ai|api_key`、opaque auth context ID 和 sentinel SHA-256，生成
+唯一固定 contract；operator 还必须显式提供 `--max-turns`，Controller 不猜预算。contract 以 mode `0600`
+落盘并打印完整 preview 与当前 hash；它不 launch。target root、state root
+或 sentinel 任一变化都会改变 canonical contract bytes/hash。run 重新验证 Git checkout 或 external
+manifest v2 source identity，重新编译并逐字核对 contract，且必须收到刚展示的 exact hash；stale hash 与
+任意 contract drift 都在 baseline capture、control lane 与 adapter lane 之前失败。
+
+disposable target 由 operator/controller 预置为 clean Git root：`sentinel.input` 已提交且 bytes 匹配确认的
+SHA-256，`.claude/settings.json` 已提交并对该 input 配置 ambient Read deny，`sentinel.output` 不存在。control
+lane 允许 ambient project settings 生效并必须真实观察到 Read denial；adapter lane 仍走标准
+`prepareClaude`、flag settings、`--setting-sources ""`、claim/attempt/result 流程，只是固定认证入口可以在
+Candidate 下调用。随后 Controller 独立验证 output hash、hook attendance、postflight 与 baseline compare。
+
+receipt 仅在五项 `ambient-deny-control`、`isolated-adapter-candidate`、`sentinel-output`、
+`flag-settings-hook`、`baseline-preserved` 全绿时原子发布；只保存 canonical evidence aggregate/result/report
+hash，不保存 prompt、transcript、sentinel/settings bytes 或身份信息。API 429、subscription/session limit、
+网络和 provider failure 一律报告 `blocked`，不覆盖旧 receipt，也不伪装成 `candidate_rejected`。
+
 ## 启动姿态与 Stop hook
 
 **弃用 `/goal`**：`/goal` 是 session-scoped 的 prompt-based Stop hook 包装，每轮由默认小模型（Haiku，弱判官）判条件是否满足；condition 上限 4000 字符，压缩长 contract 会丢语义；一旦 settings 出现 `disableAllHooks`（或 `allowManagedHooksOnly`），`/goal` 整体失效、无降级路径。记名保留、明确弃用，不再作为本 adapter 的启动姿态。改用裸 `claude -p` 直接起会话，配合控制器生成的 command 型 Stop hook 自建确定性续轮自检；协议核心（contract 格式、hash、证据通道）不受影响。

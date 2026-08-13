@@ -44,6 +44,17 @@ test('parseArgs accepts each command with exactly its required flags', () => {
   assert.equal(parseArgs(['resume', '--contract', 'c.json', '--state', '/s', '--diagnostics-file', 'd.txt', '--binding-file', 'b.json']).command, 'resume');
   assert.equal(parseArgs(['finalize', '--state', '/s', '--binding-file', 'b.json']).command, 'finalize');
   assert.equal(parseArgs(['close', '--state', '/s']).command, 'close');
+  assert.equal(parseArgs([
+    'certify-claude-prepare', '--source', '/source', '--target', '/target', '--state-root', '/state',
+    '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
+    '--max-turns', '5', '--out', 'canary.json',
+  ]).command, 'certify-claude-prepare');
+  assert.equal(parseArgs([
+    'certify-claude-run', '--source', '/source', '--target', '/target', '--state-root', '/state',
+    '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
+    '--max-turns', '5', '--contract', 'canary.json', '--confirmed-hash', 'b'.repeat(64),
+    '--capability-state', 'claude.json',
+  ]).command, 'certify-claude-run');
 });
 
 test('parseArgs rejects unknown commands, unknown/duplicate/valueless flags, and missing required flags', () => {

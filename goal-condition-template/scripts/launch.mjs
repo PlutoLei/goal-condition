@@ -1,9 +1,16 @@
 // Thin CLI dispatcher. Runtime attempt lifecycles live under scripts/lib/runners/.
+import { execFile as execFileCallback } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { arch, platform } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
 
-import { contractHash, readContract, renderContractDiagnostic } from './lib/contract.mjs';
+import { readClaudeCapabilityState } from './lib/claude-capability.mjs';
+import {
+  compileClaudeCertificationContract, runClaudeCertification,
+} from './lib/claude-certification.mjs';
+import { canonicalJson, contractHash, readContract, renderContractDiagnostic } from './lib/contract.mjs';
 import {
   canonicalPath, compileResumeDiagnostic, DIAGNOSTICS_SHAPE, RESUMABLE_CODES, stateDirFor,
 } from './lib/runner-common.mjs';
@@ -13,10 +20,14 @@ import {
 import {
   prepareCodexProbesOnly, runCodexClose, runCodexFinalize, runCodexLaunch, runCodexResume,
 } from './lib/runners/codex.mjs';
+import { inspectRuntimeSource } from './lib/runtime-surfaces.mjs';
+
+const execFile = promisify(execFileCallback);
 
 // Preserve the historical library surface while ownership follows the implementation module.
 export * from './lib/runner-common.mjs';
 export * from './lib/claude-capability.mjs';
+export * from './lib/claude-certification.mjs';
 export * from './lib/runners/claude.mjs';
 export * from './lib/runners/codex.mjs';
 
@@ -26,16 +37,43 @@ const COMMANDS = {
     required: ['--contract', '--state-root'],
   },
   launch: {
-    allowed: ['--contract', '--state', '--prompt-file', '--binding-file'],
+    allowed: [
+      '--contract', '--state', '--prompt-file', '--binding-file', '--source',
+      '--expected-manifest-digest', '--auth-mode', '--auth-context-id', '--capability-state',
+    ],
     required: ['--contract', '--state', '--prompt-file', '--binding-file'],
   },
   resume: {
-    allowed: ['--contract', '--state', '--diagnostics-file', '--binding-file', '--raise-token-budget'],
+    allowed: [
+      '--contract', '--state', '--diagnostics-file', '--binding-file', '--raise-token-budget', '--source',
+      '--expected-manifest-digest', '--auth-mode', '--auth-context-id', '--capability-state',
+    ],
     required: ['--contract', '--state', '--diagnostics-file', '--binding-file'],
   },
   finalize: { allowed: ['--state', '--binding-file'], required: ['--state', '--binding-file'] },
   close: { allowed: ['--state'], required: ['--state'] },
   readback: { allowed: ['--state'], required: ['--state'] },
+  'certify-claude-prepare': {
+    allowed: [
+      '--source', '--target', '--state-root', '--auth-mode', '--auth-context-id',
+      '--sentinel-sha256', '--max-turns', '--expected-manifest-digest', '--out',
+    ],
+    required: [
+      '--source', '--target', '--state-root', '--auth-mode', '--auth-context-id',
+      '--sentinel-sha256', '--max-turns', '--out',
+    ],
+  },
+  'certify-claude-run': {
+    allowed: [
+      '--source', '--target', '--state-root', '--auth-mode', '--auth-context-id',
+      '--sentinel-sha256', '--max-turns', '--expected-manifest-digest', '--contract', '--confirmed-hash',
+      '--capability-state',
+    ],
+    required: [
+      '--source', '--target', '--state-root', '--auth-mode', '--auth-context-id',
+      '--sentinel-sha256', '--max-turns', '--contract', '--confirmed-hash', '--capability-state',
+    ],
+  },
 };
 
 function usage() {
@@ -47,6 +85,8 @@ function usage() {
     '  node scripts/launch.mjs finalize --state DIR --binding-file FILE',
     '  node scripts/launch.mjs close --state DIR',
     '  node scripts/launch.mjs readback --state DIR',
+    '  node scripts/launch.mjs certify-claude-prepare --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --out CONTRACT [--expected-manifest-digest DIGEST]',
+    '  node scripts/launch.mjs certify-claude-run --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --contract CONTRACT --confirmed-hash DIGEST --capability-state FILE [--expected-manifest-digest DIGEST]',
     '',
     'readback 是 claude 线的只读观测（transcript 活性、prompt 归因），恒 exit 0：available:false',
     '表示观测不可用，不代表 run 出事；它的结论不进任何证据通道，处置留给人工。',
@@ -110,12 +150,88 @@ async function runPrepareCommand(values) {
   throw new Error(`unsupported runtime: ${contract.runtime}`);
 }
 
+function inspectClaudeCertificationSource(values) {
+  return inspectRuntimeSource({
+    root: values['--source'],
+    runtime: 'claude',
+    expectedManifestDigest: values['--expected-manifest-digest'],
+  });
+}
+
+function compileClaudeCertificationFromValues(values, identity) {
+  return compileClaudeCertificationContract({
+    source: identity.source,
+    targetRoot: values['--target'],
+    stateRoot: values['--state-root'],
+    authMode: values['--auth-mode'],
+    authContextId: values['--auth-context-id'],
+    sentinelSha256: values['--sentinel-sha256'],
+    maxTurns: parsePositiveInteger(values['--max-turns'], '--max-turns'),
+  });
+}
+
+function parsePositiveInteger(raw, flag) {
+  if (!/^[1-9][0-9]*$/.test(raw ?? '')) throw new Error(`${flag} must be a positive integer`);
+  return Number(raw);
+}
+
+async function currentClaudeEnvironment(values) {
+  const { stdout } = await execFile('claude', ['--version']);
+  const match = stdout.match(/(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)/);
+  if (!match) throw new Error('CLAUDE_VERSION_UNREADABLE: claude --version returned no version token');
+  return {
+    cli_version: match[1],
+    os: platform(),
+    arch: arch(),
+    auth_mode: values['--auth-mode'],
+    auth_context_id: values['--auth-context-id'],
+  };
+}
+
+async function currentClaudeCapabilityContext(values) {
+  const required = ['--source', '--auth-mode', '--auth-context-id', '--capability-state'];
+  if (required.some((flag) => typeof values[flag] !== 'string' || values[flag].length === 0)) return undefined;
+  const identity = inspectClaudeCertificationSource(values);
+  const stateRead = await readClaudeCapabilityState(values['--capability-state']);
+  return {
+    state: stateRead.ok ? stateRead.state : undefined,
+    source: identity.source,
+    runtimeSurfaceDigest: identity.runtimeSurfaceDigest,
+    environment: await currentClaudeEnvironment(values),
+  };
+}
+
+async function runClaudeCertificationPrepareCommand(values) {
+  const identity = inspectClaudeCertificationSource(values);
+  const compiled = compileClaudeCertificationFromValues(values, identity);
+  await writeFile(values['--out'], compiled.canonicalBytes, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+  process.stdout.write(`${compiled.preview}\n`);
+}
+
+async function runClaudeCertificationRunCommand(values) {
+  const identity = inspectClaudeCertificationSource(values);
+  const compiled = compileClaudeCertificationFromValues(values, identity);
+  const supplied = await readContract(values['--contract']);
+  if (contractHash(supplied) !== compiled.hash || canonicalJson(supplied) !== compiled.canonicalBytes) {
+    throw new Error('CLAUDE_CERTIFICATION_PROFILE_INVALID: contract file is not the current fixed canary');
+  }
+  const result = await runClaudeCertification({
+    compiled,
+    confirmedHash: values['--confirmed-hash'],
+    source: identity.source,
+    runtimeSurfaceDigest: identity.runtimeSurfaceDigest,
+    environment: await currentClaudeEnvironment(values),
+    capabilityStatePath: values['--capability-state'],
+  });
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+  if (result.outcome !== 'certified') process.exitCode = 3;
+}
+
 // 显式传入才抬预算：不传就是 undefined，resumeRpcOps 据此省略 tokenBudget 参数。
 export function parseRaiseTokenBudget(values) {
   const raw = values['--raise-token-budget'];
   if (raw === undefined) return undefined;
-  if (!/^[1-9][0-9]*$/.test(raw)) throw new Error('--raise-token-budget must be a positive integer');
-  return Number(raw);
+  return parsePositiveInteger(raw, '--raise-token-budget');
 }
 
 async function runAttemptCommand(command, values) {
@@ -159,6 +275,7 @@ async function runAttemptCommand(command, values) {
   }
   emit(await runClaudeAttempt({
     contract, stateDir, binding, prompt, kind: command, diagnosticText,
+    capabilityContext: await currentClaudeCapabilityContext(values),
   }));
 }
 
@@ -190,6 +307,14 @@ async function runCli() {
   try {
     if (parsed.command === 'prepare') {
       await runPrepareCommand(parsed.values);
+      return;
+    }
+    if (parsed.command === 'certify-claude-prepare') {
+      await runClaudeCertificationPrepareCommand(parsed.values);
+      return;
+    }
+    if (parsed.command === 'certify-claude-run') {
+      await runClaudeCertificationRunCommand(parsed.values);
       return;
     }
     if (parsed.command === 'finalize') {

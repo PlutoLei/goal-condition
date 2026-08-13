@@ -14,7 +14,8 @@ import {
 } from '../adapters/claude.mjs';
 import { PermissionSpecifierError } from '../claude-permissions.mjs';
 import { assertClaudeCertified } from '../claude-capability.mjs';
-import { contractHash } from '../contract.mjs';
+import { assertFixedClaudeCertificationProfile } from '../claude-certification.mjs';
+import { canonicalJson, contractHash } from '../contract.mjs';
 import {
   AttemptClaimError, canonicalPath, initStateDir, nextAttempt, readControllerJsonNoFollow,
   removeOwnedControllerFile, writeControllerJsonExclusive,
@@ -271,14 +272,10 @@ const HEX64 = /^[0-9a-f]{64}$/;
 // result JSON，先从 error.stdout 回捞再 JSON.parse，解析不出才按进程失败终局）→ normalizeTerminal
 // 归一化（ok→候选，即使 terminal_reason 是 max_turns_reached 等「未达」也如实标注为候选，不是终局；
 // not ok→终局报告）。候选与终局都不做 postflight——那是主会话的独立职责。
-export async function runClaudeAttempt({
+async function executeClaudeAttempt({
   contract, stateDir, prompt, kind, diagnosticText, binding, execFileImpl = execFile,
-  beforeDispatch = async () => {}, capabilityContext,
+  beforeDispatch = async () => {},
 }) {
-  // Capability is the outermost ordinary-launch gate. Candidate state must not reach any state-dir
-  // mutation, attempt reservation, session claim, settings publication, or executor dispatch.
-  assertClaudeCertified(capabilityContext);
-
   // attempt 号只在所有前置闸全绿、真要 spawn 执行器时才占（第二次冒烟 N-2）：真实 dispatch
   // 之后不可撤销；pre-dispatch rollback 只能在下面的 Claude 独占 lease 内进行。前置闸拒绝的原因
   // 经常在 contract 之外（binding 笔误、claude 版本掉出 allowlist、hook 文件
@@ -598,6 +595,21 @@ export async function runClaudeAttempt({
   } finally {
     await releaseClaudeAttemptLease(attemptLease);
   }
+}
+
+export async function runClaudeAttempt(options) {
+  // Capability is the outermost ordinary-launch gate. Candidate state must not reach any state-dir
+  // mutation, attempt reservation, session claim, settings publication, or executor dispatch.
+  assertClaudeCertified(options?.capabilityContext);
+  return executeClaudeAttempt(options ?? {});
+}
+
+export async function runClaudeCertificationAttempt({ compiled, ...options }) {
+  const fixed = assertFixedClaudeCertificationProfile(compiled);
+  if (canonicalJson(options.contract) !== fixed.canonicalBytes) {
+    throw new Error('CLAUDE_CERTIFICATION_PROFILE_INVALID: adapter contract differs from the fixed canary');
+  }
+  return executeClaudeAttempt(options);
 }
 
 // claude 线只读观测通道（transcript readback）：不 spawn、不写盘、不把 transcript 字节放进

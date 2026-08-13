@@ -50,6 +50,18 @@ Hard Prohibition 只能是 controller schema 枚举的 capability ID，且 `rule
 
 ## Claude shared run contract
 
+Claude 普通 launch 还必须通过 machine-level Candidate/Certified capability gate。state 位于
+`<controller-state-root>/runtime-certifications/claude.json`，精确绑定已验证 source identity、Claude
+runtime-surface digest、CLI/OS/arch 与非秘密 auth context。Candidate 不得占 attempt、写 settings、claim
+session 或 spawn；不得使用 `force`/`skip`。
+
+唯一 Candidate 豁口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 用户明确确认
+该 hash → `certify-claude-run`。认证命令只接受 controller 内置 profile，必须同时证明
+`ambient-deny-control`、`isolated-adapter-candidate`、`sentinel-output`、`flag-settings-hook`、
+`baseline-preserved`；全绿才原子发布 Certified receipt。429、subscription/session limit、网络或 provider
+错误归 `blocked`，保留旧 receipt，不得写成 canary red。`auth_context_id` 由 operator 管理且不从 secret
+派生；认证主体或 administrative policy context 变化时必须轮换。
+
 ### Compile
 
 按 [run contract 字段与编译规则](references/run-contract.md) 和 [schema](schema/run-contract.schema.json) 生成 canonical JSON，并读取安装实例的 [项目 profile](references/anchors-and-rules.md)。它必须无损包含 single objective、stable context、`judgment_criteria`、`success_criteria`、`constraints`、`allowed_mutations`、`preflight`、`postflight`，以及用户明确给出的 `execution_permissions` / `budget.user_provided=true`。
