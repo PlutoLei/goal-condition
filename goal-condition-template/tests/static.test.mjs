@@ -247,7 +247,8 @@ test('public docs expose the external release trust root and complete required c
     'schema/run-contract.schema.json',
     'scripts/validate-contract.mjs', 'scripts/snapshot.mjs', 'scripts/install.mjs',
     'scripts/lib/contract.mjs', 'scripts/lib/snapshot.mjs',
-    'scripts/lib/installer.mjs', 'scripts/lib/runner-common.mjs',
+    'scripts/lib/installer.mjs', 'scripts/lib/permission-specifier.mjs',
+    'scripts/lib/runner-common.mjs',
     'scripts/lib/runtime-surfaces.mjs', 'scripts/lib/workflow.mjs',
     'scripts/launch.mjs', 'scripts/lib/adapters/claude.mjs', 'scripts/lib/adapters/codex.mjs',
     'scripts/lib/claude-capability.mjs', 'scripts/lib/claude-certification.mjs',
@@ -330,14 +331,25 @@ test('launcher is a thin dispatcher and runtime attempt lifecycles stay runtime-
   const claude = read(join(templateRoot, 'scripts', 'lib', 'runners', 'claude.mjs'));
   const codex = read(join(templateRoot, 'scripts', 'lib', 'runners', 'codex.mjs'));
 
-  assert.match(launcher, /from '.\/lib\/runners\/claude\.mjs'/);
-  assert.match(launcher, /from '.\/lib\/runners\/codex\.mjs'/);
+  assert.match(launcher, /import\('.\/lib\/runners\/claude\.mjs'\)/);
+  assert.match(launcher, /import\('.\/lib\/runners\/codex\.mjs'\)/);
+  assert.doesNotMatch(launcher, /^import .*\/(?:runners\/(?:claude|codex)|claude-(?:capability|certification))\.mjs';$/m);
   assert.doesNotMatch(launcher, /function (?:prepareClaude|runClaudeAttempt|runCodexLaunch|runCodexResume)\b/);
   assert.doesNotMatch(common, /adapters\/(?:claude|codex)\.mjs/);
   assert.match(claude, /export async function runClaudeAttempt\b/);
   assert.doesNotMatch(claude, /runCodex(?:Launch|Resume|Finalize|Close)/);
   assert.match(codex, /export async function runCodexLaunch\b/);
   assert.doesNotMatch(codex, /runClaude(?:Attempt|Readback)/);
+});
+
+test('Codex controller and shared dispatcher do not statically load the other runtime surface', () => {
+  const launcher = read(join(templateRoot, 'scripts', 'launch.mjs'));
+  const controller = read(join(templateRoot, 'codex-controller', 'src', 'cli.mjs'));
+  assert.doesNotMatch(controller, /scripts\/launch\.mjs/);
+  assert.match(controller, /scripts\/lib\/runner-common\.mjs/);
+  assert.match(controller, /scripts\/lib\/runners\/codex\.mjs/);
+  assert.doesNotMatch(controller, /runners\/claude\.mjs|claude-(?:capability|certification)\.mjs/);
+  assert.doesNotMatch(launcher, /^export \* from .*\/(?:runners|claude-)/m);
 });
 
 test('core and run-contract docs bind launch to canonical artifact bytes and complete preview', () => {

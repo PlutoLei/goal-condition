@@ -14,14 +14,20 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
   MAX_AUTO_RESUMES, stateDirFor, initStateDir, nextAttempt, AttemptClaimError, classifyPostflightRed,
-  compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, renderCliError,
+  compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, readControllerJsonNoFollow,
+  writeControllerJsonExclusive,
+} from '../scripts/lib/runner-common.mjs';
+import {
+  hookRunCount, prepareClaude,
   runClaudeAttempt as runClaudeAttemptImpl,
-  runClaudeReadback, claudeTranscriptPath, readControllerJsonNoFollow, writeControllerJsonExclusive,
-  helpAdvertisesLongOption,
+  runClaudeReadback, claudeTranscriptPath, helpAdvertisesLongOption,
+} from '../scripts/lib/runners/claude.mjs';
+import {
   prepareCodexProbesOnly, runCodexLaunch, runCodexReadback, runCodexResume, runCodexFinalize, runCodexClose,
   POLL_INTERVAL_MS, WALL_CLOCK_DEADLINE_MS, LEASE_TTL_MS, releaseOwnLease, releaseResidualLease,
   MAX_TURNS_PER_ATTEMPT, MAX_TOKENS_PER_ATTEMPT,
-} from '../scripts/launch.mjs';
+} from '../scripts/lib/runners/codex.mjs';
+import { renderCliError } from '../scripts/launch.mjs';
 import { CLAUDE_CANARY_CONDITIONS } from '../scripts/lib/claude-capability.mjs';
 import { GoalRpcClient } from '../scripts/lib/adapters/codex.mjs';
 import { canonicalJson, contractHash, ContractArtifactError } from '../scripts/lib/contract.mjs';
@@ -4264,6 +4270,7 @@ test('runCodexLaunch keeps a candidate outcome free of notification noise', asyn
 
 const execFileAsync = promisify(execFileCallback);
 const launchScriptPath = fileURLToPath(new URL('../scripts/launch.mjs', import.meta.url));
+const codexRunnerScriptPath = fileURLToPath(new URL('../scripts/lib/runners/codex.mjs', import.meta.url));
 
 // timeout 是刻意的：被测的失效形态里有好几种「进程该死却没死」。没有超时的话，回归会表现成
 // 整个测试文件挂死——那不是红，是测试说谎。超时后子进程被 SIGKILL，断言照常判红。
@@ -4376,7 +4383,7 @@ async function waitFor(predicate, timeoutMs, what) {
 async function writeSignalScript(dir) {
   const scriptPath = join(dir, 'signal-probe.mjs');
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const goal = { threadId: "t-fake", objective: "o", status: "active", tokensUsed: 0,',
@@ -4452,7 +4459,7 @@ test('N-1 in place: a missing codex binary is a connection-stage terminal report
 async function writeEscapeScript(dir, mode) {
   const scriptPath = join(dir, `escape-${mode}.mjs`);
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const clientFactory = () => ({',
@@ -4715,7 +4722,7 @@ test('runCodexClose refuses to release the lease of a still-running holder, keep
 async function writeHungClientScript(dir) {
   const scriptPath = join(dir, 'hung-client.mjs');
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const goal = { threadId: "t-fake", objective: "o", status: "active", tokensUsed: 0,',
@@ -4762,7 +4769,7 @@ test('M-1 process-exit net: an event loop that simply runs dry still cleans up t
 async function writeCleanupThrowScript(dir) {
   const scriptPath = join(dir, 'cleanup-throw.mjs');
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { chmodSync, readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const clientFactory = ({ codexHome }) => ({',

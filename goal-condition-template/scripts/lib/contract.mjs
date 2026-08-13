@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { isAbsolute, normalize } from 'node:path';
 import { TextDecoder } from 'node:util';
 
-import { permissionSpecifierProblem } from './claude-permissions.mjs';
+import { permissionSpecifierProblem } from './permission-specifier.mjs';
 
 // This is a deliberately narrow, deterministic validator for this repository's
 // run contract. It is not a general JSON Schema Draft validator.

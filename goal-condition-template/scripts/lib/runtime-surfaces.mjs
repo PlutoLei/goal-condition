@@ -46,6 +46,7 @@ const capabilityEntries = [
   ['scripts/lib/contract.mjs', 'runtime_shared'],
   ['scripts/lib/snapshot.mjs', 'runtime_shared'],
   ['scripts/lib/installer.mjs', 'release_only'],
+  ['scripts/lib/permission-specifier.mjs', 'runtime_shared'],
   ['scripts/lib/runner-common.mjs', 'runtime_shared'],
   ['scripts/lib/runtime-surfaces.mjs', 'runtime_shared'],
   ['scripts/lib/workflow.mjs', 'runtime_shared'],

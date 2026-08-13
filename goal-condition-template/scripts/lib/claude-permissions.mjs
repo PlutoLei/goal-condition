@@ -1,13 +1,9 @@
-// Claude permissions are a Tool(specifier) string DSL with no escaping grammar. Keep the
-// representability rule in one place so contract validation, compilation, and the launch gate
-// cannot drift into accepting different delimiter surfaces.
+// Claude permissions are a Tool(specifier) string DSL with no escaping grammar. The lexical
+// representability rule lives in a runtime-neutral module because the shared contract validator
+// also needs it; compilation and launch remain Claude-owned.
+import { permissionSpecifierProblem } from './permission-specifier.mjs';
 
-export function permissionSpecifierProblem(value) {
-  if (typeof value !== 'string' || value.length === 0) return 'must be a non-empty string';
-  if (value !== value.trim()) return 'must not have leading or trailing whitespace';
-  if (/[()\r\n]/.test(value)) return 'must not contain parentheses or line breaks';
-  return null;
-}
+export { permissionSpecifierProblem } from './permission-specifier.mjs';
 
 export class PermissionSpecifierError extends TypeError {}
 

@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { commandNames } from '../src/cli.mjs';
-import { stateDirFor } from '../../scripts/launch.mjs';
+import { stateDirFor } from '../../scripts/lib/runner-common.mjs';
 import { validCompilerInput } from './helpers.mjs';
 
 const cliPath = new URL('../src/cli.mjs', import.meta.url).pathname;

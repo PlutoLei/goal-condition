@@ -6,14 +6,11 @@ import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 
 import {
-  initStateDir,
-  prepareCodexProbesOnly,
-  runCodexClose,
-  runCodexFinalize,
-  runCodexLaunch,
-  runCodexReadback,
-  stateDirFor,
-} from '../../scripts/launch.mjs';
+  initStateDir, stateDirFor,
+} from '../../scripts/lib/runner-common.mjs';
+import {
+  prepareCodexProbesOnly, runCodexClose, runCodexFinalize, runCodexLaunch, runCodexReadback,
+} from '../../scripts/lib/runners/codex.mjs';
 import {
   CODEX_READ_ONLY_SANDBOX_MODE,
   CODEX_READ_ONLY_SANDBOX_PROFILE,

@@ -87,7 +87,7 @@ Claude 使用 controller-owned `runBinding`、`preflightEvidence` 与 `postfligh
 
 整包 `release integrity` 与供应商原生 `runtime certification` 是两份状态。manifest schema v2 的外部摘要证明整个 release 未漂移；Claude/Codex runtime surface digest 只决定相应运行时认证何时失效。代码完成也不等于已经投产：实现、测试、review、Claude live certification、push、merge、install、release 与 production effect 必须分别报告。
 
-Claude 普通 launch 只接受与当前 source、Claude runtime surface、CLI/OS/arch、auth mode 和 opaque auth context 精确匹配的 Certified state；缺失或漂移只得到 Candidate，并在任何 attempt、settings、pointer、lease 或进程副作用前阻断。唯一入口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 明确确认 exact hash → `certify-claude-run`。开发态 Git checkout receipt 绑定 checkout 的 realpath 与 commit，source checkout 认证不能转移给 staged 或 installed 的 external manifest v2 release；生产认证必须直接针对待激活的 staged release。
+Claude 普通 launch 只接受与当前 source、Claude runtime surface、CLI/OS/arch、auth mode 和 opaque auth context 精确匹配的 Certified state；缺失或漂移只得到 Candidate，并在任何 attempt、settings、pointer、lease 或进程副作用前阻断。唯一入口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 明确确认 exact hash → `certify-claude-run`。确认 hash 覆盖 closed-world certification artifact：source realpath + commit/manifest、runtime digest、auth mode/context、disposable roots、sentinel、预算与固定 run contract；`--source` 还必须正是当前 `launch.mjs` 的执行根。capability state 不接受自由输出路径，只能从已确认且与 source/target 隔离的 state root 派生为 `runtime-certifications/claude.json`。开发态 Git checkout receipt 绑定 checkout 的 realpath 与 commit，source checkout 认证不能转移给 staged 或 installed 的 external manifest v2 release；生产认证必须直接针对待激活的 staged release。
 
 ### Codex GoalSession v2
 
@@ -140,6 +140,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `scripts/lib/contract.mjs`
 - `scripts/lib/snapshot.mjs`
 - `scripts/lib/installer.mjs`
+- `scripts/lib/permission-specifier.mjs`
 - `scripts/lib/runner-common.mjs`
 - `scripts/lib/runtime-surfaces.mjs`
 - `scripts/lib/workflow.mjs`
@@ -175,6 +176,8 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `codex-controller/src/verification.mjs`
 
 安装事务对 runtime link parent、release root 与 backup root 的物理 directory identity 反复核对；stage、backup、cutover、readback、rollback 或 owned cleanup 期间发生祖先重定向都会 fail closed。
+
+runtime surface 分类同时受静态 import-closure 回归约束：shared 文件不能静态加载单一 runtime，Claude/Codex 文件只能静态依赖 shared 与自身 surface。共享 dispatcher 按实际命令延迟加载 runner；Codex controller 直接加载 common + Codex runner，不经混合 dispatcher。这样“摘要未变化”才真正意味着另一 runtime 的代码无法在模块启动期破坏当前运行时。
 
 ## 测试
 

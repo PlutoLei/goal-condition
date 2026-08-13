@@ -606,10 +606,16 @@ export async function runClaudeAttempt(options) {
 
 export async function runClaudeCertificationAttempt({ compiled, ...options }) {
   const fixed = assertFixedClaudeCertificationProfile(compiled);
-  if (canonicalJson(options.contract) !== fixed.canonicalBytes) {
+  if (canonicalJson(options.contract) !== fixed.contractBytes) {
     throw new Error('CLAUDE_CERTIFICATION_PROFILE_INVALID: adapter contract differs from the fixed canary');
   }
-  return executeClaudeAttempt(options);
+  const hookRunsBefore = await hookRunCount(options.stateDir);
+  const result = await executeClaudeAttempt(options);
+  return {
+    ...result,
+    hookRunsBefore,
+    hookRunsDelta: result.hookRuns - hookRunsBefore,
+  };
 }
 
 // claude 线只读观测通道（transcript readback）：不 spawn、不写盘、不把 transcript 字节放进

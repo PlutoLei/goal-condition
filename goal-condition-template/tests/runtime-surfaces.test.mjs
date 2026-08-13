@@ -2,10 +2,10 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync,
+  chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -36,6 +36,33 @@ function mutate(entries, path) {
     ? { ...entry, sha256: sha256(`changed:${path}`) }
     : entry);
 }
+
+test('every static runtime import stays inside its declared capability closure', () => {
+  const templateRoot = realpathSync(new URL('..', import.meta.url));
+  const allowed = {
+    runtime_shared: new Set(['runtime_shared']),
+    claude: new Set(['runtime_shared', 'claude']),
+    codex: new Set(['runtime_shared', 'codex']),
+  };
+  for (const [sourcePath, sourceCapability] of Object.entries(CORE_FILE_CAPABILITIES)) {
+    if (!(sourceCapability in allowed) || !sourcePath.endsWith('.mjs')) continue;
+    const source = readFileSync(join(templateRoot, sourcePath), 'utf8');
+    const specifiers = [
+      ...source.matchAll(/\bfrom\s+['"](\.[^'"]+\.mjs)['"]/g),
+      ...source.matchAll(/\bimport\s+['"](\.[^'"]+\.mjs)['"]/g),
+    ].map((match) => match[1]);
+    for (const specifier of specifiers) {
+      const targetPath = relative(templateRoot, resolve(dirname(join(templateRoot, sourcePath)), specifier))
+        .split('\\').join('/');
+      const targetCapability = CORE_FILE_CAPABILITIES[targetPath];
+      assert.ok(targetCapability, `${sourcePath} statically imports unclassified ${targetPath}`);
+      assert.ok(
+        allowed[sourceCapability].has(targetCapability),
+        `${sourcePath} (${sourceCapability}) statically imports ${targetPath} (${targetCapability})`,
+      );
+    }
+  }
+});
 
 test('every required release file has exactly one closed-world capability class', () => {
   assert.deepEqual(CAPABILITY_CLASSES, ['release_only', 'runtime_shared', 'claude', 'codex']);

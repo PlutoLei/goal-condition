@@ -1,35 +1,21 @@
 // Thin CLI dispatcher. Runtime attempt lifecycles live under scripts/lib/runners/.
 import { execFile as execFileCallback } from 'node:child_process';
-import { realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { arch, platform } from 'node:os';
+import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
-import { readClaudeCapabilityState } from './lib/claude-capability.mjs';
-import {
-  compileClaudeCertificationContract, runClaudeCertification,
-} from './lib/claude-certification.mjs';
-import { canonicalJson, contractHash, readContract, renderContractDiagnostic } from './lib/contract.mjs';
+import { contractHash, readContract, renderContractDiagnostic } from './lib/contract.mjs';
 import {
   canonicalPath, compileResumeDiagnostic, DIAGNOSTICS_SHAPE, RESUMABLE_CODES, stateDirFor,
 } from './lib/runner-common.mjs';
-import {
-  prepareClaude, runClaudeAttempt, runClaudeReadback,
-} from './lib/runners/claude.mjs';
-import {
-  prepareCodexProbesOnly, runCodexClose, runCodexFinalize, runCodexLaunch, runCodexResume,
-} from './lib/runners/codex.mjs';
 import { inspectRuntimeSource } from './lib/runtime-surfaces.mjs';
 
 const execFile = promisify(execFileCallback);
 
-// Preserve the historical library surface while ownership follows the implementation module.
-export * from './lib/runner-common.mjs';
-export * from './lib/claude-capability.mjs';
-export * from './lib/claude-certification.mjs';
-export * from './lib/runners/claude.mjs';
-export * from './lib/runners/codex.mjs';
+const EXECUTION_SOURCE_ROOT = realpathSync(resolve(dirname(fileURLToPath(import.meta.url)), '..'));
 
 const COMMANDS = {
   prepare: {
@@ -67,11 +53,10 @@ const COMMANDS = {
     allowed: [
       '--source', '--target', '--state-root', '--auth-mode', '--auth-context-id',
       '--sentinel-sha256', '--max-turns', '--expected-manifest-digest', '--contract', '--confirmed-hash',
-      '--capability-state',
     ],
     required: [
       '--source', '--target', '--state-root', '--auth-mode', '--auth-context-id',
-      '--sentinel-sha256', '--max-turns', '--contract', '--confirmed-hash', '--capability-state',
+      '--sentinel-sha256', '--max-turns', '--contract', '--confirmed-hash',
     ],
   },
 };
@@ -86,7 +71,7 @@ function usage() {
     '  node scripts/launch.mjs close --state DIR',
     '  node scripts/launch.mjs readback --state DIR',
     '  node scripts/launch.mjs certify-claude-prepare --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --out CONTRACT [--expected-manifest-digest DIGEST]',
-    '  node scripts/launch.mjs certify-claude-run --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --contract CONTRACT --confirmed-hash DIGEST --capability-state FILE [--expected-manifest-digest DIGEST]',
+    '  node scripts/launch.mjs certify-claude-run --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --contract CONTRACT --confirmed-hash DIGEST [--expected-manifest-digest DIGEST]',
     '',
     'readback 是 claude 线的只读观测（transcript 活性、prompt 归因），恒 exit 0：available:false',
     '表示观测不可用，不代表 run 出事；它的结论不进任何证据通道，处置留给人工。',
@@ -136,6 +121,7 @@ async function runPrepareCommand(values) {
   const hash = contractHash(contract);
   const stateDir = stateDirFor({ stateRoot: values['--state-root'], controller: values['--controller'] ?? 'default', contractHash: hash });
   if (contract.runtime === 'claude') {
+    const { prepareClaude } = await import('./lib/runners/claude.mjs');
     const result = await prepareClaude({ contract, contractPath, stateDir });
     process.stdout.write(`${JSON.stringify({
       runtime: 'claude', stateDir, contractHash: hash, settingsPath: result.settingsPath, hookScriptPath: result.hookScriptPath,
@@ -143,6 +129,7 @@ async function runPrepareCommand(values) {
     return;
   }
   if (contract.runtime === 'codex') {
+    const { prepareCodexProbesOnly } = await import('./lib/runners/codex.mjs');
     const result = await prepareCodexProbesOnly({ stateDir });
     process.stdout.write(`${JSON.stringify({ runtime: 'codex', stateDir: result.stateDir, contractHash: hash })}\n`);
     return;
@@ -151,23 +138,48 @@ async function runPrepareCommand(values) {
 }
 
 function inspectClaudeCertificationSource(values) {
-  return inspectRuntimeSource({
-    root: values['--source'],
+  const declaredSourceRoot = realpathSync(resolve(values['--source']));
+  if (declaredSourceRoot !== EXECUTION_SOURCE_ROOT) {
+    throw new Error(
+      'RUNTIME_SOURCE_EXECUTION_MISMATCH: --source must be the exact release or checkout executing launch.mjs',
+    );
+  }
+  const identity = inspectRuntimeSource({
+    root: declaredSourceRoot,
     runtime: 'claude',
     expectedManifestDigest: values['--expected-manifest-digest'],
   });
+  if (identity.source.root_realpath !== EXECUTION_SOURCE_ROOT) {
+    throw new Error(
+      'RUNTIME_SOURCE_EXECUTION_MISMATCH: --source must be the exact release or checkout executing launch.mjs',
+    );
+  }
+  return identity;
 }
 
-function compileClaudeCertificationFromValues(values, identity) {
+async function compileClaudeCertificationFromValues(values, identity) {
+  const { compileClaudeCertificationContract } = await import('./lib/claude-certification.mjs');
   return compileClaudeCertificationContract({
     source: identity.source,
-    targetRoot: values['--target'],
-    stateRoot: values['--state-root'],
+    runtimeSurfaceDigest: identity.runtimeSurfaceDigest,
+    targetRoot: physicalCertificationDirectory(values['--target'], '--target'),
+    stateRoot: physicalCertificationDirectory(values['--state-root'], '--state-root'),
     authMode: values['--auth-mode'],
     authContextId: values['--auth-context-id'],
     sentinelSha256: values['--sentinel-sha256'],
     maxTurns: parsePositiveInteger(values['--max-turns'], '--max-turns'),
   });
+}
+
+function physicalCertificationDirectory(pathname, flag) {
+  try {
+    const canonical = realpathSync(pathname);
+    const stat = lstatSync(canonical);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('not physical');
+    return canonical;
+  } catch {
+    throw new Error(`${flag} must resolve to an existing physical directory`);
+  }
 }
 
 function parsePositiveInteger(raw, flag) {
@@ -192,6 +204,7 @@ async function currentClaudeCapabilityContext(values) {
   const required = ['--source', '--auth-mode', '--auth-context-id', '--capability-state'];
   if (required.some((flag) => typeof values[flag] !== 'string' || values[flag].length === 0)) return undefined;
   const identity = inspectClaudeCertificationSource(values);
+  const { readClaudeCapabilityState } = await import('./lib/claude-capability.mjs');
   const stateRead = await readClaudeCapabilityState(values['--capability-state']);
   return {
     state: stateRead.ok ? stateRead.state : undefined,
@@ -203,25 +216,25 @@ async function currentClaudeCapabilityContext(values) {
 
 async function runClaudeCertificationPrepareCommand(values) {
   const identity = inspectClaudeCertificationSource(values);
-  const compiled = compileClaudeCertificationFromValues(values, identity);
+  const compiled = await compileClaudeCertificationFromValues(values, identity);
   await writeFile(values['--out'], compiled.canonicalBytes, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
   process.stdout.write(`${compiled.preview}\n`);
 }
 
 async function runClaudeCertificationRunCommand(values) {
   const identity = inspectClaudeCertificationSource(values);
-  const compiled = compileClaudeCertificationFromValues(values, identity);
-  const supplied = await readContract(values['--contract']);
-  if (contractHash(supplied) !== compiled.hash || canonicalJson(supplied) !== compiled.canonicalBytes) {
+  const compiled = await compileClaudeCertificationFromValues(values, identity);
+  const suppliedBytes = await readFile(values['--contract'], 'utf8');
+  if (suppliedBytes !== compiled.canonicalBytes || contractHash(compiled.artifact) !== compiled.hash) {
     throw new Error('CLAUDE_CERTIFICATION_PROFILE_INVALID: contract file is not the current fixed canary');
   }
+  const { runClaudeCertification } = await import('./lib/claude-certification.mjs');
   const result = await runClaudeCertification({
     compiled,
     confirmedHash: values['--confirmed-hash'],
     source: identity.source,
     runtimeSurfaceDigest: identity.runtimeSurfaceDigest,
     environment: await currentClaudeEnvironment(values),
-    capabilityStatePath: values['--capability-state'],
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (result.outcome !== 'certified') process.exitCode = 3;
@@ -259,6 +272,7 @@ async function runAttemptCommand(command, values) {
   };
 
   if (contract.runtime === 'codex') {
+    const { runCodexLaunch, runCodexResume } = await import('./lib/runners/codex.mjs');
     emit(command === 'launch'
       ? await runCodexLaunch({
         contract, stateDir, binding, prompt,
@@ -273,6 +287,7 @@ async function runAttemptCommand(command, values) {
   if (raiseTokenBudget !== undefined) {
     throw new Error('--raise-token-budget only applies to the codex runtime');
   }
+  const { runClaudeAttempt } = await import('./lib/runners/claude.mjs');
   emit(await runClaudeAttempt({
     contract, stateDir, binding, prompt, kind: command, diagnosticText,
     capabilityContext: await currentClaudeCapabilityContext(values),
@@ -283,6 +298,7 @@ async function runAttemptCommand(command, values) {
 // 只是给编排器的粗信号。但「归因不成立」此前与「归因成立」同为 exit 0——与 launch/resume 改置 3
 // 之后的语义不一致，读退出码的编排器在这一格上仍然 fail-open。归因不成立即 exit 3，四格对齐。
 async function runFinalizeCommand(values) {
+  const { runCodexFinalize } = await import('./lib/runners/codex.mjs');
   const binding = await readBindingFile(values['--binding-file']);
   const result = await runCodexFinalize({ stateDir: values['--state'], binding });
   process.stdout.write(`${JSON.stringify(result)}\n`);
@@ -290,6 +306,7 @@ async function runFinalizeCommand(values) {
 }
 
 async function runCloseCommand(values) {
+  const { runCodexClose } = await import('./lib/runners/codex.mjs');
   const result = await runCodexClose({ stateDir: values['--state'] });
   process.stdout.write(`${JSON.stringify(result)}\n`);
   if (result.cleanupComplete !== true) process.exitCode = 3;
@@ -328,6 +345,7 @@ async function runCli() {
     if (parsed.command === 'readback') {
       // 观测工具恒 exit 0：available:false 是「看不到」不是「出事了」，把它标成非零会诱导编排器
       // 把观测缺席当成 run 故障处理。
+      const { runClaudeReadback } = await import('./lib/runners/claude.mjs');
       process.stdout.write(`${JSON.stringify(await runClaudeReadback({ stateDir: parsed.values['--state'] }))}\n`);
       return;
     }

@@ -45,22 +45,28 @@ Codex runner 不读取这份 Claude state。认证身份只保存 `claude_ai` / 
 
 Candidate 只能通过 `certify-claude-prepare` / `certify-claude-run` 进入执行面。prepare 接受当前
 source、disposable target/state、`claude_ai|api_key`、opaque auth context ID 和 sentinel SHA-256，生成
-唯一固定 contract；operator 还必须显式提供 `--max-turns`，Controller 不猜预算。contract 以 mode `0600`
-落盘并打印完整 preview 与当前 hash；它不 launch。target root、state root
-或 sentinel 任一变化都会改变 canonical contract bytes/hash。run 重新验证 Git checkout 或 external
-manifest v2 source identity，重新编译并逐字核对 contract，且必须收到刚展示的 exact hash；stale hash 与
+唯一 fixed certification artifact；operator 还必须显式提供 `--max-turns`，Controller 不猜预算。artifact
+以 mode `0600` 落盘，闭世界包含 source realpath + commit/manifest、runtime surface digest、auth mode/context、
+disposable roots、sentinel、预算与固定 run contract，并打印完整 preview 与当前 hash；它不 launch。任一字段
+变化都会改变 canonical artifact bytes/hash。`--source` 必须与实际执行 `launch.mjs` 的 release/checkout 根
+完全相同，不能用 A 的 identity 给 B 的代码发 receipt。run 重新验证 Git checkout 或 external
+manifest v2 source identity，重新编译并逐字核对 artifact，且必须收到刚展示的 exact hash；stale hash 与
 任意 contract drift 都在 baseline capture、control lane 与 adapter lane 之前失败。
 
 disposable target 由 operator/controller 预置为 clean Git root：`sentinel.input` 已提交且 bytes 匹配确认的
-SHA-256，`.claude/settings.json` 已提交并对该 input 配置 ambient Read deny，`sentinel.output` 不存在。control
-lane 允许 ambient project settings 生效并必须真实观察到 Read denial；adapter lane 仍走标准
+SHA-256，`.claude/settings.json` 已提交并对该 input 配置 ambient Read deny，`sentinel.output` 不存在。Controller
+在 baseline 前重核 output 缺失，避免预存正确 bytes 冒充本轮写入。control lane 允许 ambient project
+settings 生效，并必须在结构化 denial 中精确核到 `Read(sentinel.input)`；其他 tool/path denial 不算。adapter lane 仍走标准
 `prepareClaude`、flag settings、`--setting-sources ""`、claim/attempt/result 流程，只是固定认证入口可以在
-Candidate 下调用。随后 Controller 独立验证 output hash、hook attendance、postflight 与 baseline compare。
+Candidate 下调用。随后 Controller 独立验证 output hash、本轮 hook-run 增量、postflight 与 baseline compare；
+历史 hook log 行不得继承为当前证据。
 
 receipt 仅在五项 `ambient-deny-control`、`isolated-adapter-candidate`、`sentinel-output`、
 `flag-settings-hook`、`baseline-preserved` 全绿时原子发布；只保存 canonical evidence aggregate/result/report
 hash，不保存 prompt、transcript、sentinel/settings bytes 或身份信息。API 429、subscription/session limit、
-网络和 provider failure 一律报告 `blocked`，不覆盖旧 receipt，也不伪装成 `candidate_rejected`。
+网络和 provider failure（包括非零进程返回的结构化 provider envelope）一律报告 `blocked`，不覆盖旧 receipt，
+也不伪装成 `candidate_rejected`。发布路径不接受 run 阶段自由参数，只能由已确认、与 source/target 物理隔离
+的 state root 派生为 `runtime-certifications/claude.json`。
 
 ## 启动姿态与 Stop hook
 

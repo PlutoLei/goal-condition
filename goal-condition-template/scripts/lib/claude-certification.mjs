@@ -1,12 +1,10 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { lstat, readFile } from 'node:fs/promises';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
-import {
-  canonicalJson, contractHash, renderPreview, validateContract,
-} from './contract.mjs';
+import { canonicalJson, validateContract } from './contract.mjs';
 import {
   CLAUDE_CANARY_CONDITIONS, publishClaudeCapabilityState, validateClaudeCapabilityState,
 } from './claude-capability.mjs';
@@ -19,8 +17,10 @@ const execFile = promisify(execFileCallback);
 const HEX64 = /^[0-9a-f]{64}$/;
 const AUTH_MODES = Object.freeze(['claude_ai', 'api_key']);
 const PROFILE_FIELDS = Object.freeze([
-  'auth_context_id', 'auth_mode', 'max_turns', 'sentinel_sha256', 'source', 'state_root', 'target_root',
+  'auth_context_id', 'auth_mode', 'max_turns', 'runtime_surface_digest', 'sentinel_sha256',
+  'source', 'state_root', 'target_root',
 ]);
+const ARTIFACT_FIELDS = Object.freeze(['contract', 'profile', 'schema_version']);
 
 export class ClaudeCertificationError extends Error {
   constructor(code, message, details = {}) {
@@ -43,6 +43,11 @@ function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function overlaps(left, right) {
+  const delta = relative(resolve(left), resolve(right));
+  return delta === '' || (delta !== '..' && !delta.startsWith(`..${sep}`) && !delta.startsWith(sep));
+}
+
 function sourceValid(source) {
   if (source?.kind === 'git_checkout') {
     return exactFields(source, ['commit', 'kind', 'root_realpath'])
@@ -62,12 +67,18 @@ function profileValid(profile) {
     && sourceValid(profile.source)
     && isAbsolute(profile.target_root)
     && isAbsolute(profile.state_root)
-    && profile.target_root !== profile.state_root
+    && !overlaps(profile.target_root, profile.state_root)
+    && !overlaps(profile.state_root, profile.target_root)
+    && !overlaps(profile.source.root_realpath, profile.state_root)
+    && !overlaps(profile.state_root, profile.source.root_realpath)
+    && !overlaps(profile.source.root_realpath, profile.target_root)
+    && !overlaps(profile.target_root, profile.source.root_realpath)
     && AUTH_MODES.includes(profile.auth_mode)
     && /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/.test(profile.auth_context_id)
     && Number.isInteger(profile.max_turns)
     && profile.max_turns >= 1
     && profile.max_turns <= 200
+    && HEX64.test(profile.runtime_surface_digest)
     && HEX64.test(profile.sentinel_sha256);
 }
 
@@ -132,10 +143,11 @@ function deepFreeze(value) {
 }
 
 export function compileClaudeCertificationContract({
-  source, targetRoot, stateRoot, authMode, authContextId, sentinelSha256, maxTurns,
+  source, runtimeSurfaceDigest, targetRoot, stateRoot, authMode, authContextId, sentinelSha256, maxTurns,
 }) {
   const profile = {
     source,
+    runtime_surface_digest: runtimeSurfaceDigest,
     target_root: targetRoot,
     state_root: stateRoot,
     auth_mode: authMode,
@@ -158,8 +170,10 @@ export function compileClaudeCertificationContract({
       { diagnostics },
     );
   }
-  const canonicalBytes = canonicalJson(contract);
-  const hash = contractHash(contract);
+  const artifact = { schema_version: 1, profile, contract };
+  const contractBytes = canonicalJson(contract);
+  const canonicalBytes = canonicalJson(artifact);
+  const hash = sha256(Buffer.from(canonicalBytes, 'utf8'));
   const preview = [
     'CLAUDE RUNTIME CERTIFICATION CANARY',
     '',
@@ -167,17 +181,21 @@ export function compileClaudeCertificationContract({
     `Auth mode: ${authMode}`,
     'auth_context_id is operator-managed, opaque, and must rotate when the principal or administrative policy context changes.',
     '',
-    renderPreview(contract),
+    'Authoritative canonical JSON:',
+    canonicalBytes.trimEnd(),
     '',
     `SHA-256: ${hash}`,
     '',
     'This command only compiles and previews. Running requires this exact current hash.',
   ].join('\n');
-  return deepFreeze({ profile, contract, canonicalBytes, hash, preview });
+  return deepFreeze({ artifact, profile, contract, contractBytes, canonicalBytes, hash, preview });
 }
 
 export function assertFixedClaudeCertificationProfile(compiled) {
-  if (!exactFields(compiled, ['canonicalBytes', 'contract', 'hash', 'preview', 'profile'])
+  if (!exactFields(compiled, [
+    'artifact', 'canonicalBytes', 'contract', 'contractBytes', 'hash', 'preview', 'profile',
+  ])
+    || !exactFields(compiled.artifact, ARTIFACT_FIELDS)
     || !profileValid(compiled.profile)) {
     throw new ClaudeCertificationError(
       'CLAUDE_CERTIFICATION_PROFILE_INVALID', 'certification input is not the fixed compiled profile',
@@ -185,6 +203,7 @@ export function assertFixedClaudeCertificationProfile(compiled) {
   }
   const expected = compileClaudeCertificationContract({
     source: compiled.profile.source,
+    runtimeSurfaceDigest: compiled.profile.runtime_surface_digest,
     targetRoot: compiled.profile.target_root,
     stateRoot: compiled.profile.state_root,
     authMode: compiled.profile.auth_mode,
@@ -193,8 +212,10 @@ export function assertFixedClaudeCertificationProfile(compiled) {
     maxTurns: compiled.profile.max_turns,
   });
   if (compiled.canonicalBytes !== expected.canonicalBytes
+    || compiled.contractBytes !== expected.contractBytes
     || compiled.hash !== expected.hash
-    || canonicalJson(compiled.contract) !== expected.canonicalBytes) {
+    || canonicalJson(compiled.artifact) !== expected.canonicalBytes
+    || canonicalJson(compiled.contract) !== expected.contractBytes) {
     throw new ClaudeCertificationError(
       'CLAUDE_CERTIFICATION_PROFILE_INVALID',
       'compiled contract bytes or hash differ from the fixed profile',
@@ -258,10 +279,15 @@ export function classifyClaudeCanaryBlocker(result) {
   const code = String(result?.code ?? result?.error?.code ?? '');
   const message = String(result?.message ?? result?.error?.message ?? '');
   const reasons = Array.isArray(result?.reasons) ? result.reasons.join(' ') : '';
-  if (result?.status === 429
+  const apiStatus = Number(result?.api_error_status ?? result?.status);
+  const structured = (() => {
+    try { return canonicalJson(result); } catch { return ''; }
+  })();
+  if (apiStatus === 429
+    || apiStatus >= 500
     || result?.provider_error === true
     || /(?:rate.?limit|quota|subscription|session.?limit|provider|overloaded|network|timeout|ECONN|ENET|EAI_AGAIN)/i
-      .test(`${code} ${message} ${reasons}`)) return 'blocked';
+      .test(`${code} ${message} ${reasons} ${structured}`)) return 'blocked';
   if (result?.outcome === 'candidate_rejected') return 'candidate_rejected';
   return result instanceof Error ? 'controller_error' : 'candidate_rejected';
 }
@@ -278,26 +304,46 @@ async function defaultControlLane({ compiled }) {
       '-p', prompt, '--output-format', 'json', '--permission-mode', 'acceptEdits', '--max-turns', '1',
     ], { cwd: compiled.profile.target_root, maxBuffer: 4 * 1024 * 1024 });
     const report = JSON.parse(stdout);
-    return { denied: Array.isArray(report?.permission_denials) && report.permission_denials.length > 0, report };
+    const interpreted = interpretClaudeControlReport(report, compiled);
+    if (interpreted.outcome === 'blocked') throw report;
+    return { denied: interpreted.denied, report };
   } catch (error) {
     if (typeof error?.stdout === 'string') {
       try {
         const report = JSON.parse(error.stdout);
+        const interpreted = interpretClaudeControlReport(report, compiled);
+        if (interpreted.outcome === 'blocked') throw report;
         if (Array.isArray(report?.permission_denials)) {
-          return { denied: report.permission_denials.length > 0, report };
+          return { denied: interpreted.denied, report };
         }
-      } catch { /* classify the original provider/process failure below */ }
+      } catch (structured) {
+        if (classifyClaudeCanaryBlocker(structured) === 'blocked') throw structured;
+      }
     }
     throw error;
   }
 }
 
+export function exactSentinelReadDenial(report, compiled) {
+  const expected = resolve(compiled.profile.target_root, 'sentinel.input');
+  return Array.isArray(report?.permission_denials)
+    && report.permission_denials.some((denial) => denial?.tool_name === 'Read'
+      && typeof denial?.tool_input?.file_path === 'string'
+      && resolve(compiled.profile.target_root, denial.tool_input.file_path) === expected);
+}
+
+export function interpretClaudeControlReport(report, compiled) {
+  if (classifyClaudeCanaryBlocker(report) === 'blocked') return { outcome: 'blocked' };
+  return { outcome: 'observed', denied: exactSentinelReadDenial(report, compiled) };
+}
+
 async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
   const { prepareClaude, runClaudeCertificationAttempt } = await import('./runners/claude.mjs');
+  const runtimeContractHash = sha256(Buffer.from(compiled.contractBytes, 'utf8'));
   const stateDir = stateDirFor({
     stateRoot: compiled.profile.state_root,
     controller: 'claude-certification',
-    contractHash: compiled.hash,
+    contractHash: runtimeContractHash,
   });
   await prepareClaude({
     contract: compiled.contract,
@@ -308,7 +354,7 @@ async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
     compiled,
     contract: compiled.contract,
     stateDir,
-    binding: { contractHash: compiled.hash, baselineDigest, runId },
+    binding: { contractHash: runtimeContractHash, baselineDigest, runId },
     prompt: compiled.contract.objective,
     kind: 'launch',
   });
@@ -321,6 +367,16 @@ async function defaultVerifySentinel({ compiled }) {
     return { ok: observed === compiled.profile.sentinel_sha256, observed_sha256: observed };
   } catch {
     return { ok: false, observed_sha256: null };
+  }
+}
+
+async function defaultAssertSentinelAbsent({ compiled }) {
+  try {
+    await lstat(join(compiled.profile.target_root, 'sentinel.output'));
+    return { ok: false };
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { ok: true };
+    throw error;
   }
 }
 
@@ -349,10 +405,14 @@ export async function runClaudeCertification({
   source,
   runtimeSurfaceDigest,
   environment,
-  capabilityStatePath,
   dependencies = {},
 }) {
   const fixed = assertFixedClaudeCertificationProfile(compiled);
+  const capabilityStatePath = join(
+    fixed.profile.state_root,
+    'runtime-certifications',
+    'claude.json',
+  );
   if (confirmedHash !== fixed.hash) {
     throw new ClaudeCertificationError(
       'CLAUDE_CERTIFICATION_CONFIRMATION_MISMATCH',
@@ -360,6 +420,7 @@ export async function runClaudeCertification({
     );
   }
   if (canonicalJson(source) !== canonicalJson(fixed.profile.source)
+    || runtimeSurfaceDigest !== fixed.profile.runtime_surface_digest
     || environment?.auth_mode !== fixed.profile.auth_mode
     || environment?.auth_context_id !== fixed.profile.auth_context_id
     || !HEX64.test(runtimeSurfaceDigest ?? '')) {
@@ -370,6 +431,7 @@ export async function runClaudeCertification({
   }
 
   const captureBaselineImpl = dependencies.captureBaseline ?? defaultCaptureBaseline;
+  const assertSentinelAbsent = dependencies.assertSentinelAbsent ?? defaultAssertSentinelAbsent;
   const runControlLane = dependencies.runControlLane ?? defaultControlLane;
   const runAdapterLane = dependencies.runAdapterLane ?? defaultAdapterLane;
   const verifySentinel = dependencies.verifySentinel ?? defaultVerifySentinel;
@@ -378,6 +440,13 @@ export async function runClaudeCertification({
   const now = dependencies.now ?? (() => new Date().toISOString());
   const makeRunId = dependencies.runId ?? (() => randomUUID());
 
+  const sentinelInitial = await assertSentinelAbsent({ compiled: fixed });
+  if (sentinelInitial?.ok !== true) {
+    return {
+      outcome: 'candidate_rejected', published: false,
+      reasons: ['sentinel-output already existed before the certification attempt'],
+    };
+  }
   const baseline = await captureBaselineImpl({ contract: fixed.contract, compiled: fixed });
   if (!HEX64.test(baseline?.digest ?? '')) {
     throw new ClaudeCertificationError(
@@ -425,9 +494,9 @@ export async function runClaudeCertification({
       && adapter.candidate?.terminal_reason === 'completed'
       && Array.isArray(adapter.candidate?.permission_denials)
       && adapter.candidate.permission_denials.length === 0,
-    'sentinel-output': sentinel?.ok === true
+    'sentinel-output': sentinelInitial.ok === true && sentinel?.ok === true
       && sentinel.observed_sha256 === fixed.profile.sentinel_sha256,
-    'flag-settings-hook': adapter.hookExpected === true && adapter.hookRuns >= 1,
+    'flag-settings-hook': adapter.hookExpected === true && adapter.hookRunsDelta >= 1,
     'baseline-preserved': baselineReport?.ok === true,
   };
   const evidence = {
@@ -441,7 +510,7 @@ export async function runClaudeCertification({
     'flag-settings-hook': {
       ok: conditions['flag-settings-hook'],
       hook_expected: adapter.hookExpected === true,
-      hook_runs: Number.isInteger(adapter.hookRuns) ? adapter.hookRuns : null,
+      hook_runs_delta: Number.isInteger(adapter.hookRunsDelta) ? adapter.hookRunsDelta : null,
     },
     'baseline-preserved': {
       ok: conditions['baseline-preserved'],

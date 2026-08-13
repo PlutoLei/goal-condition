@@ -53,7 +53,6 @@ test('parseArgs accepts each command with exactly its required flags', () => {
     'certify-claude-run', '--source', '/source', '--target', '/target', '--state-root', '/state',
     '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
     '--max-turns', '5', '--contract', 'canary.json', '--confirmed-hash', 'b'.repeat(64),
-    '--capability-state', 'claude.json',
   ]).command, 'certify-claude-run');
 });
 
@@ -68,6 +67,10 @@ test('parseArgs rejects unknown commands, unknown/duplicate/valueless flags, and
     ['close', '--state', '/s', '--state', '/other'],                // 重复 flag
     ['close', '--state'],                                           // flag 无值
     ['close', '--state', '/s', '--binding-file'],                   // 末尾 flag 无值
+    ['certify-claude-run', '--source', '/source', '--target', '/target', '--state-root', '/state',
+      '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
+      '--max-turns', '5', '--contract', 'canary.json', '--confirmed-hash', 'b'.repeat(64),
+      '--capability-state', '/target/.claude/settings.json'],
   ]) {
     assert.throws(() => parseArgs(argv), /Usage:/, JSON.stringify(argv));
   }
@@ -118,6 +121,28 @@ async function runLaunchCliVia(scriptPath, args) {
     return { code: error.code, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
   }
 }
+
+test('Claude certification source must be the exact runtime root executing the command', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-foreign-runtime-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const foreignRepo = join(root, 'foreign');
+  const repositoryRoot = dirname(dirname(dirname(launchPath)));
+  await execFile('git', ['clone', '--quiet', '--no-hardlinks', repositoryRoot, foreignRepo]);
+  const executionRoot = await mkdtemp(join(stateTestRoot, 'foreign-source-'));
+  const result = await runLaunchCliVia(launchPath, [
+    'certify-claude-prepare',
+    '--source', join(foreignRepo, 'goal-condition-template'),
+    '--target', join(executionRoot, 'target'),
+    '--state-root', join(executionRoot, 'state'),
+    '--auth-mode', 'claude_ai',
+    '--auth-context-id', 'cert-primary',
+    '--sentinel-sha256', 'a'.repeat(64),
+    '--max-turns', '5',
+    '--out', join(executionRoot, 'canary.json'),
+  ]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /RUNTIME_SOURCE_EXECUTION_MISMATCH/);
+});
 
 async function runLaunchCli(args) {
   return runLaunchCliVia(launchPath, args);

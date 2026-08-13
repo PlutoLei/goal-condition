@@ -5,6 +5,8 @@ import {
   buildClaudeCertificationReceipt,
   classifyClaudeCanaryBlocker,
   compileClaudeCertificationContract,
+  exactSentinelReadDenial,
+  interpretClaudeControlReport,
   runClaudeCertification,
 } from '../scripts/lib/claude-certification.mjs';
 import { CLAUDE_CANARY_CONDITIONS } from '../scripts/lib/claude-capability.mjs';
@@ -23,6 +25,7 @@ const baselineDigest = '3'.repeat(64);
 function compile(overrides = {}) {
   return compileClaudeCertificationContract({
     source,
+    runtimeSurfaceDigest,
     targetRoot: '/opt/controller/canary-target-a',
     stateRoot: '/opt/controller/canary-state-a',
     authMode: environment.auth_mode,
@@ -56,7 +59,7 @@ function receiptEvidence(overrides = {}) {
 
 test('fixed compiler binds every disposable path and sentinel into canonical bytes/hash and full preview', () => {
   const first = compile();
-  assert.deepEqual(JSON.parse(first.canonicalBytes), first.contract);
+  assert.deepEqual(JSON.parse(first.canonicalBytes), first.artifact);
   assert.ok(first.preview.includes(first.canonicalBytes));
   assert.ok(first.preview.includes(`SHA-256: ${first.hash}`));
   assert.ok(first.preview.includes('auth_context_id is operator-managed'));
@@ -65,6 +68,11 @@ test('fixed compiler binds every disposable path and sentinel into canonical byt
     compile({ targetRoot: '/opt/controller/canary-target-b' }),
     compile({ stateRoot: '/opt/controller/canary-state-b' }),
     compile({ sentinelSha256: '9'.repeat(64) }),
+    compile({ source: { ...source, root_realpath: '/opt/controller/source-b' } }),
+    compile({ source: { ...source, commit: 'b'.repeat(40) } }),
+    compile({ runtimeSurfaceDigest: '8'.repeat(64) }),
+    compile({ authMode: 'api_key' }),
+    compile({ authContextId: 'cert-secondary' }),
   ]) {
     assert.notEqual(changed.canonicalBytes, first.canonicalBytes);
     assert.notEqual(changed.hash, first.hash);
@@ -121,6 +129,42 @@ test('quota, subscription, session, network, and provider failures classify bloc
   ]) assert.equal(classifyClaudeCanaryBlocker(result), 'blocked');
   assert.equal(classifyClaudeCanaryBlocker({ outcome: 'candidate_rejected' }), 'candidate_rejected');
   assert.equal(classifyClaudeCanaryBlocker(new TypeError('controller bug')), 'controller_error');
+  assert.equal(interpretClaudeControlReport({
+    api_error_status: 429, permission_denials: [], errors: ['rate limit'],
+  }, compile()).outcome, 'blocked');
+});
+
+test('ambient control is green only for a Read denial on the exact sentinel input', () => {
+  const compiled = compile();
+  const exact = {
+    permission_denials: [{
+      tool_name: 'Read', tool_input: { file_path: '/opt/controller/canary-target-a/sentinel.input' },
+    }],
+  };
+  assert.equal(exactSentinelReadDenial(exact, compiled), true);
+  for (const report of [
+    { permission_denials: [{ tool_name: 'Bash', tool_input: { command: 'cat sentinel.input' } }] },
+    { permission_denials: [{ tool_name: 'Read', tool_input: { file_path: '/opt/controller/other' } }] },
+    { permission_denials: [{ tool_name: 'Read', tool_input: {} }] },
+  ]) assert.equal(exactSentinelReadDenial(report, compiled), false);
+});
+
+test('pre-existing sentinel output rejects before baseline or executor work', async () => {
+  const compiled = compile();
+  let baselineCalls = 0;
+  let executorCalls = 0;
+  const result = await runClaudeCertification({
+    compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+    dependencies: {
+      assertSentinelAbsent: async () => ({ ok: false }),
+      captureBaseline: async () => { baselineCalls += 1; },
+      runControlLane: async () => { executorCalls += 1; },
+      runAdapterLane: async () => { executorCalls += 1; },
+    },
+  });
+  assert.equal(result.outcome, 'candidate_rejected');
+  assert.equal(baselineCalls, 0);
+  assert.equal(executorCalls, 0);
 });
 
 test('blocked provider result preserves an existing receipt and is never candidate_rejected', async () => {
@@ -149,6 +193,7 @@ test('blocked provider result preserves an existing receipt and is never candida
 test('all-green fake lanes publish one Certified state bound to five evidence hashes', async () => {
   const compiled = compile();
   let published;
+  let publishedPath;
   const result = await runClaudeCertification({
     compiled,
     confirmedHash: compiled.hash,
@@ -163,21 +208,33 @@ test('all-green fake lanes publish one Certified state bound to five evidence ha
         candidate: { subtype: 'success', is_error: false, terminal_reason: 'completed', permission_denials: [] },
         attemptNumber: 1,
         hookExpected: true,
-        hookRuns: 1,
+        hookRunsDelta: 1,
         sessionId: '11111111-1111-4111-8111-111111111111',
       }),
       verifySentinel: async () => ({ ok: true, observed_sha256: sentinelSha256 }),
       verifyBaseline: async () => ({ ok: true, violations: [] }),
-      publishState: async (_path, state) => { published = state; },
+      publishState: async (path, state) => { publishedPath = path; published = state; },
       now: () => '2026-08-13T08:00:00.000Z',
       runId: () => 'cert-run-1',
     },
-    capabilityStatePath: '/opt/controller/runtime-certifications/claude.json',
   });
   assert.equal(result.outcome, 'certified');
   assert.equal(result.published, true);
   assert.equal(published.mode, 'certified');
+  assert.equal(publishedPath, '/opt/controller/canary-state-a/runtime-certifications/claude.json');
   assert.deepEqual(published.canary_receipt.conditions, allGreenConditions());
+});
+
+test('certification state root cannot overlap the source or disposable target', () => {
+  for (const stateRoot of [
+    '/opt/controller/source/state',
+    '/opt/controller/canary-target-a/state',
+  ]) {
+    assert.throws(
+      () => compile({ stateRoot }),
+      (error) => error.code === 'CLAUDE_CERTIFICATION_PROFILE_INVALID',
+    );
+  }
 });
 
 test('each canary condition can independently reject without publishing machine state', async () => {
@@ -186,7 +243,7 @@ test('each canary condition can independently reject without publishing machine 
     outcome: 'candidate',
     candidate: { subtype: 'success', is_error: false, terminal_reason: 'completed', permission_denials: [] },
     hookExpected: true,
-    hookRuns: 1,
+    hookRunsDelta: 1,
     sessionId: '11111111-1111-4111-8111-111111111111',
   };
   const cases = [
@@ -195,7 +252,7 @@ test('each canary condition can independently reject without publishing machine 
       ...greenAdapter, candidate: { ...greenAdapter.candidate, permission_denials: ['Write'] },
     }) },
     { verifySentinel: async () => ({ ok: false, observed_sha256: '9'.repeat(64) }) },
-    { runAdapterLane: async () => ({ ...greenAdapter, hookRuns: 0 }) },
+    { runAdapterLane: async () => ({ ...greenAdapter, hookRuns: 99, hookRunsDelta: 0 }) },
     { verifyBaseline: async () => ({ ok: false, violations: [{ code: 'UNAUTHORIZED_MUTATION' }] }) },
   ];
   for (const override of cases) {
@@ -206,7 +263,6 @@ test('each canary condition can independently reject without publishing machine 
       source,
       runtimeSurfaceDigest,
       environment,
-      capabilityStatePath: '/opt/controller/runtime-certifications/claude.json',
       dependencies: {
         captureBaseline: async () => ({ snapshot: { baseline: true }, digest: baselineDigest }),
         runControlLane: async () => ({ denied: true }),
