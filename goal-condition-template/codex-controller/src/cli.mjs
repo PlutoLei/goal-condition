@@ -45,7 +45,10 @@ import { evaluateRevision } from './policy.mjs';
 import { assertCreationRequestId, createControllerId } from './identity.mjs';
 import { projectAttempt, projectBaselineManifest } from './projector.mjs';
 import { reconcileLaunch } from './recovery.mjs';
-import { currentControllerReleaseDigest } from './release.mjs';
+import {
+  currentControllerReleaseDigest,
+  currentControllerReleaseIdentity,
+} from './release.mjs';
 import { migrateV1Contract } from './migration.mjs';
 import {
   assertLiveRollout,
@@ -65,6 +68,9 @@ import { verifyConditions } from './verification.mjs';
 
 const execFile = promisify(execFileCallback);
 const CONTROLLER_RELEASE_DIGEST = currentControllerReleaseDigest();
+const CONTROLLER_RUNTIME_SURFACE_DIGEST = currentControllerReleaseIdentity({
+  expectedManifestDigest: process.env.GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST,
+}).runtimeSurfaceDigest;
 
 const COMMANDS = Object.freeze({
   init: { required: ['state-root', 'input'], optional: ['capture-baseline'] },
@@ -97,7 +103,10 @@ function cliError(code) {
 }
 
 function assertCurrentLiveRollout(stateRoot) {
-  return assertLiveRollout(stateRoot, { releaseManifestDigest: CONTROLLER_RELEASE_DIGEST });
+  return assertLiveRollout(stateRoot, {
+    releaseManifestDigest: CONTROLLER_RELEASE_DIGEST,
+    runtimeSurfaceDigest: CONTROLLER_RUNTIME_SURFACE_DIGEST,
+  });
 }
 
 function assertCurrentAttemptRelease(attempt) {
@@ -1078,6 +1087,7 @@ async function mode(flags) {
   const path = join(flags['state-root'], 'rollout.json');
   const currentState = ensureRolloutState(path, {
     releaseManifestDigest: CONTROLLER_RELEASE_DIGEST,
+    runtimeSurfaceDigest: CONTROLLER_RUNTIME_SURFACE_DIGEST,
   });
   const current = currentState.mode;
   if (input.action === 'get') {
@@ -1089,6 +1099,7 @@ async function mode(flags) {
       command: 'mode',
       mode: current,
       release_manifest_digest: CONTROLLER_RELEASE_DIGEST,
+      runtime_surface_digest: CONTROLLER_RUNTIME_SURFACE_DIGEST,
       canary_session_id: currentState.canary_receipt?.session_id ?? null,
       live_execution: false,
     };
@@ -1104,6 +1115,7 @@ async function mode(flags) {
     canaryReceipt = await withStore(flags['state-root'], (store) =>
       certifyRolloutCanary(store.exportSession(input.canary_session_id), {
         releaseManifestDigest: CONTROLLER_RELEASE_DIGEST,
+        runtimeSurfaceDigest: CONTROLLER_RUNTIME_SURFACE_DIGEST,
       }));
   } else if (input.canary_session_id !== null) {
     throw cliError('ROLLOUT_CANARY_UNEXPECTED');
@@ -1115,6 +1127,7 @@ async function mode(flags) {
     changedAt: input.changed_at,
     canaryReceipt,
     releaseManifestDigest: CONTROLLER_RELEASE_DIGEST,
+    runtimeSurfaceDigest: CONTROLLER_RUNTIME_SURFACE_DIGEST,
   });
   return {
     ok: true,
@@ -1122,6 +1135,7 @@ async function mode(flags) {
     previous: current,
     mode: next,
     release_manifest_digest: CONTROLLER_RELEASE_DIGEST,
+    runtime_surface_digest: CONTROLLER_RUNTIME_SURFACE_DIGEST,
     canary_session_id: input.next === 'enabled' ? canaryReceipt?.session_id ?? null : null,
     live_execution: false,
   };

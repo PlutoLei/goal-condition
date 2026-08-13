@@ -29,7 +29,7 @@ Attempt projector 生成私有 immutable `AttemptManifest`：原生 Codex object
 
 GoalSession v2 controller 通过 `capabilities`、`migrate-v1`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层只持久化新的不可变 Attempt 并回传 run ID，后续 `launch` 才执行；它不复用已经被拒绝的 candidate，也不修改共享 schema。
 
-普通命令不传 `--state-root`：controller 依次选择显式 flag、`GOAL_CONDITION_CODEX_STATE_ROOT`、`$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。无效的已选输入 fail closed；显式 override 创建独立 deployment namespace，必须独立 rollout，不能继承默认 store 的 release gate 或 canary receipt。解析后仍由物理路径、祖先 symlink、临时目录与 target-root isolation 门禁决定是否可用。
+普通命令不传 `--state-root`：controller 依次选择显式 flag、`GOAL_CONDITION_CODEX_STATE_ROOT`、`$XDG_STATE_HOME/goal-condition/codex-v2`、`<home>/.local/state/goal-condition/codex-v2`。无效的已选输入 fail closed；显式 override 创建独立 deployment namespace，必须独立 rollout，不能继承默认 store 的 release gate 或 canary receipt。schema-v5 rollout 同时记录当前整包 manifest 与 Codex runtime-surface identity：只有 release-only/Claude 文件变化时可保留 Codex receipt，Codex/shared surface 变化会清除 receipt 并降为 `canary`；schema-v4 live state 也必须重新 canary。解析后仍由物理路径、祖先 symlink、临时目录与 target-root isolation 门禁决定是否可用。
 
 deployment namespace 扩大到机器级后，identity ownership 同步上收：`session_id` 与 `run_id` 由 controller 生成 128-bit 随机值并通过 `init`/`migrate-v1`、`prepare`/`resume` 回传。调用方提供 128-bit `request_id`/`nonce` 作为幂等恢复键；resource、creation receipt、intent/lease 在同一事务提交，相同 key 的不同请求 fail closed。调用方只能传播回传的机器级主键；`attempt_id` 仍只需在所属 Session 内稳定唯一。旧持久化 ID 保持可读，不反向伪造成 controller-issued receipt。
 

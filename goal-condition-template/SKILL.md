@@ -28,7 +28,7 @@ Claude: Compile shared run contract → Validate → Preview → Confirm(contrac
 
 `runtime="codex"` 永远读取 [GoalSession v2 操作协议](references/codex-goal-session-v2.md) 与 [Codex adapter](references/adapters/codex.md)。controller 缺失、版本不兼容或 gate 未开放时 fail closed，并给出安装、升级或迁移下一步；不得回退到 Codex v1。
 
-V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live；`canary` 只运行显式选择的 V2 canary；`enabled` 是正常 Codex 路由。`canary→enabled` 必须绑定当前安装 manifest digest、controller-owned Certified live canary receipt；换 release 后旧 receipt 失效。旧 rollout state 只做一次单向转换，不恢复旧执行协议。
+V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live；`canary` 只运行显式选择的 V2 canary；`enabled` 是正常 Codex 路由。`canary→enabled` 必须绑定当前安装 manifest digest、Codex runtime-surface digest 与 controller-owned Certified live canary receipt。整包只有 Claude/release-only 文件变化时保留 Codex 认证并刷新当前 release 身份；Codex 或 shared runtime surface 变化时自动降为 `canary`。旧 rollout state 只做一次单向转换；schema-v4 的任何 live 状态都降为 schema-v5 `canary`，不继承旧 receipt。
 
 普通命令省略 `--state-root`，共享机器级 controller store：显式 flag > `GOAL_CONDITION_CODEX_STATE_ROOT` > `$XDG_STATE_HOME/goal-condition/codex-v2` > `<home>/.local/state/goal-condition/codex-v2`。无效的高优先级输入 fail closed，不向低优先级回退；显式 override 是独立 deployment namespace，必须独立 rollout。
 

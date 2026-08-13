@@ -14,7 +14,7 @@ Controller state 与 runtime state 必须在所有 target root 和系统临时�
 
 ## 1. Rollout 与能力
 
-先用 `mode get` 读取 `disabled | canary | enabled`；输入固定为 `{"action":"get","next":null,"changed_at":null,"canary_session_id":null}`。缺失状态等于 `disabled`。controller 在 `prepare/launch/resume/verify/finalize` 现场重读 gate：`disabled` 机械阻断 live，`canary` 只供显式 V2 canary，`enabled` 是正常路由；任何状态都不得回退到 Codex v1。`disabled→canary` 绑定当前 controller release digest；`canary→enabled` 还必须给出同一 store 中、同一 release 完成动态 Revision 与完整 native receipt/Evidence 的 Certified Session ID。release digest 不匹配时 fail closed。旧 schema-v3 state 只转换一次：`shadow→disabled`、`opt-in→canary`、`default|legacy-freeze→enabled`；新写入只使用 schema-v4 和新词汇。
+先用 `mode get` 读取 `disabled | canary | enabled`；输入固定为 `{"action":"get","next":null,"changed_at":null,"canary_session_id":null}`。缺失状态等于 `disabled`。controller 在 `prepare/launch/resume/verify/finalize` 现场重读 gate：`disabled` 机械阻断 live，`canary` 只供显式 V2 canary，`enabled` 是正常路由；任何状态都不得回退到 Codex v1。schema-v5 state 分开保存当前整包 `release_manifest_digest` 与 `runtime_surface_digest`；`disabled→canary` 绑定两者，`canary→enabled` 还必须给出同一 store 中、在该 Codex runtime surface 上完成动态 Revision 与完整 native receipt/Evidence 的 Certified Session ID。receipt 保留认证发生时的精确 release manifest 供审计，但认证有效性以 Codex runtime surface 为键：只有 Claude/release-only 文件变化时，controller 原子刷新当前 release 身份并保留认证；Codex 或 shared runtime surface 变化时清除 receipt、降为 `canary`。旧 schema-v3 live state 与 schema-v4 的任何 live state 都只迁移为 schema-v5 `canary`，不得猜测或继承 runtime 认证；`shadow`/`disabled` 保持禁用。
 
 `capabilities` 输入包含闭世界 `probes` 与 `hard_prohibitions`。Authority 中的 Hard Prohibition 不是自然语言，而是 `workspace-write-boundary | network-deny | controller-state-isolation` 之一；prepare claim 必须满足 `rule===capability`，不能由调用方把任意规则映射到一个绿能力：
 
