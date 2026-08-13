@@ -84,6 +84,13 @@ test('execution_permissions is a closed-world Claude-only authorization surface'
   assert.ok(validateContract(hostileTarget)
     .some((x) => x.code === 'PERMISSION_SPECIFIER_UNREPRESENTABLE' && x.path === 'target_roots[0]'));
 
+  // postflight 不进权限 DSL（V5'）：verifier 可执行路径含括号/空格是合法 contract——hook 用
+  // execFileSync 跑它，不经 claude 权限。validator 若还投影 argv[0] 就是 false-red。
+  const parenVerifier = structuredClone(valid);
+  parenVerifier.runtime = 'claude';
+  parenVerifier.postflight[0].argv = ['/Applications/App (1).app/bin/check', 'a b.txt'];
+  assert.deepEqual(validateContract(parenVerifier), []);
+
   assert.ok(Object.hasOwn(schema.properties, 'execution_permissions'));
   assert.equal(schema.$defs.executionPermissions.additionalProperties, false);
   assert.ok(schema.allOf.some((entry) => entry.if?.required?.includes('execution_permissions')
@@ -131,6 +138,24 @@ test('schema constrains execution_permissions specifiers like the validator, not
   assert.ok((readRootDef.pattern ?? '').startsWith('^/'), 'additional_read_roots must require absolute paths');
   // 非临时性与路径规范化 JSON Schema 表达不了，仍由 validator 独有承担——schema 只缩小最危险的
   // gap（括号注入、相对路径），不假装完全覆盖。
+});
+
+test('permissionSafeString anchors at absolute end, not $ (V8\')', () => {
+  // 实证（2026-08-13）：ECMA-262 无 m flag 的 $ 只匹配绝对结尾，'git add\n' 在 JS/ajv 下本来就拒；
+  // 但 schema 是公开发布物，Python/PCRE 系消费者的 $ 默认还匹配「尾部行终止符之前」——同一份
+  // pattern 在那边把 'git add\n' 判 valid，而 validator（value !== value.trim()）随后拒。漂移落在
+  // DSL 注入的分隔字符上。(?![\s\S]) 在两种方言里都是绝对结尾，消除歧义。
+  const pattern = schema.$defs.permissionSafeString.pattern;
+  assert.ok(!pattern.includes('$'), 'must not rely on $ anchors: PCRE/Python consumers accept a trailing line terminator');
+  assert.ok(pattern.includes('(?![\\s\\S])'), 'must assert absolute end-of-input explicitly');
+  // 行为在 JS 语义下回归确认：正常值过、尾行终止符拒（validator 口径）。
+  const re = new RegExp(pattern, 'u');
+  for (const value of ['git add', 'a', 'npm run build']) {
+    assert.ok(re.test(value), `${JSON.stringify(value)} must stay valid`);
+  }
+  for (const value of ['git add\n', 'a\n', 'ab\r', ' git add', 'git add ']) {
+    assert.ok(!re.test(value), `${JSON.stringify(value)} must be rejected`);
+  }
 });
 
 test('content-bound context entries reject temporary paths and duplicate IDs', () => {

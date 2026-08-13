@@ -156,20 +156,13 @@ export function buildSettings({
   additionalReadRoots = contract.execution_permissions?.additional_read_roots ?? [],
 }) {
   const execution = contract.execution_permissions ?? {};
-  // postflight verifier 编译成**精确命令**（整条 argv join），不是 argv[0] 通配：argv[0]→Bash(git:*)
-  // 会把整个 git 家族 wildcard 授权出去（git diff 顺带授权 git push），bash→Bash(bash:*) 更是任意
-  // shell（V5，Codex 独有 P1）。执行体要跑 verifier 只需精确那一条；要更宽授权由作者显式 bash_prefixes
-  // 声明（那才带 :* 前缀语义）。
-  // verifier 命令含权限 DSL 无法表示的字符（括号等，如 `node -e 'process.exit(0)'`）时跳过：不
-  // 静默扩权、也不炸——hook 仍用 execFileSync 跑它（不经 claude permission），执行体主动自检该条
-  // 会被 deny（fail-closed 可续）。要授权由作者显式 bash_prefixes 声明。preview 里 allow 缺该条可见。
-  const inferredBashCommands = (contract.postflight ?? [])
-    .map((entry) => entry?.argv)
-    .filter((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0))
-    .map((argv) => argv.join(' '))
-    .filter((command) => permissionSpecifierProblem(command) === null);
+  // postflight verifier **不进** Bash allow-list（V5'）：argv 是 execFile 语义、Bash specifier 是
+  // shell 字符串语义，两者之间没有可靠编码——argv[0] 通配把整个可执行家族授权出去（git diff 顺带
+  // 授权 git push），argv.join(' ') 既 over-auth（['printf','%s','a; touch x'] 的 join 在 shell 里是
+  // 两条命令）又 under-match（['git','diff','a b.txt'] 的 join 与真实 tokenize 永不匹配，规则静默
+  // 死掉还让作者以为已授权）。verifier 的执行不依赖这条通道：hook 用 execFileSync 跑它（不经
+  // claude permission）；执行体要自己跑 verifier 由作者显式 bash_prefixes 声明（:* 前缀语义）。
   for (const value of [
-    ...inferredBashCommands,
     ...(execution.bash_prefixes ?? []),
     ...(execution.webfetch_domains ?? []),
     ...(execution.skills ?? []),
@@ -178,7 +171,6 @@ export function buildSettings({
     ...targetRoots,
   ]) assertPermissionSpecifier(value);
   const allow = [
-    ...unique(inferredBashCommands).map((command) => permissionRule('Bash', command)),
     ...unique(execution.bash_prefixes ?? []).map((prefix) => permissionRule('Bash', `${prefix}:*`)),
     ...(execution.webfetch_domains ?? []).map((domain) => permissionRule('WebFetch', `domain:${domain}`)),
     ...(execution.skills ?? []).map((skill) => permissionRule('Skill', skill)),
@@ -306,8 +298,9 @@ export function assertLaunchable(contract, probes) {
   const hook = probes?.hookScript;
   const permissions = probes?.settings?.permissions ?? {};
   const deny = permissions.deny ?? [];
+  // postflight argv 不进权限 DSL（V5'），因此这里没有它的投影——含括号/空格的 verifier 路径
+  // 不该 false-red 一次本可正常起飞的 launch。
   const permissionInputs = [
-    ...(contract?.postflight ?? []).map((entry) => entry?.argv?.[0]),
     ...(contract?.execution_permissions?.bash_prefixes ?? []),
     ...(contract?.execution_permissions?.webfetch_domains ?? []),
     ...(contract?.execution_permissions?.skills ?? []),
@@ -351,16 +344,9 @@ export function assertLaunchable(contract, probes) {
   }
   // allow/additionalDirectories 与 deny 一样属于 buildSettings 的消费面。这里独立重算期望形状，
   // 防的是生成器回归（生产路径的 settings 是现场重写，磁盘比对本身抓不到“稳定地产错”）。
-  // 与 buildSettings 逐字镜像（同一投影，防生成器稳定地产错）：postflight → 精确命令、显式
-  // bash_prefixes → :* 前缀。两侧用同一 argv 谓词（Array + 每元素非空字符串），消掉 argv[0] filter
-  // 的 length>0 分叉（V9，B+C 收敛的 latent trap）。
-  const expectedInferredBash = (contract?.postflight ?? [])
-    .map((entry) => entry?.argv)
-    .filter((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0))
-    .map((argv) => argv.join(' '))
-    .filter((command) => permissionSpecifierProblem(command) === null);
+  // 与 buildSettings 逐字镜像：显式 bash_prefixes → :* 前缀；postflight 不进 allow（V5'），
+  // 镜像里同样没有它——两侧再无 argv 投影可分叉。
   const expectedAllow = [
-    ...unique(expectedInferredBash).map((command) => `Bash(${command})`),
     ...unique(contract?.execution_permissions?.bash_prefixes ?? []).map((prefix) => `Bash(${prefix}:*)`),
     ...(contract?.execution_permissions?.webfetch_domains ?? [])
       .map((domain) => `WebFetch(domain:${domain})`),
@@ -381,6 +367,18 @@ export function assertLaunchable(contract, probes) {
   }
   if ((probes?.targetRoots ?? []).some((root) => typeof hook?.path === 'string' && hook.path.startsWith(`${root}/`))) {
     reasons.push('hook script must live outside every target root');
+  }
+  // additional_read_roots 是授权给执行体的读面（进 settings.additionalDirectories）。指到 stateDir
+  // 的祖先/本身/内部或 hook 脚本，执行体（与控制器同 uid，文件 0600 挡不住同 uid 读）就能读
+  // hook-env.json——requires_env 凭证明文。全仓没有任何 Read deny 拦这条路（deny 只有 Edit），
+  // 唯一的闸在这里（V6'，fail-closed）。上一条只查 targetRoots，读根曾是漏检的对称缺口。
+  const coversEitherWay = (root, target) => typeof root === 'string' && typeof target === 'string'
+    && (root === target || target.startsWith(`${root}/`) || root.startsWith(`${target}/`));
+  for (const root of probes?.additionalReadRoots ?? []) {
+    if (coversEitherWay(root, probes?.stateDir) || coversEitherWay(root, hook?.path)) {
+      reasons.push('an additional read root overlaps the controller state directory or the hook script; '
+        + 'credentials and controller evidence must stay outside every authorized read root');
+    }
   }
   // execution_permissions 编译的是自动授权，deny 保护的是 controller 与 Claude 项目配置；两者都
   // 没有把任意业务 constraint 编译成可验证的 OS enforcement。因此 enforcement:"physical" 仍一律

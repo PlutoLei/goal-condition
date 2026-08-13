@@ -44,7 +44,7 @@
     "nonEmptyString": {"type": "string", "minLength": 1},
     "pathList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
     "stringList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
-    "permissionSafeString": {"type": "string", "minLength": 1, "pattern": "^[^()\\r\\n\\s][^()\\r\\n]*[^()\\r\\n\\s]$|^[^()\\r\\n\\s]$"},
+    "permissionSafeString": {"type": "string", "minLength": 1, "pattern": "^[^()\\r\\n\\s][^()\\r\\n]*[^()\\r\\n\\s](?![\\s\\S])|^[^()\\r\\n\\s](?![\\s\\S])"},
     "absoluteReadRoot": {"type": "string", "minLength": 1, "pattern": "^/"},
     "id": {"type": "string", "minLength": 1},
     "contextSource": {

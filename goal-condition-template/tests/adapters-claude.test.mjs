@@ -221,8 +221,7 @@ test('buildSettings compiles contract permissions and protects controller and pr
   assert.equal(settings.hooks.Stop[0].hooks[0].type, 'command');
   assert.match(settings.hooks.Stop[0].hooks[0].command, /^node '\/state\/dir\/stop-hook\.mjs'$/);
   assert.deepEqual(settings.permissions.allow, [
-    'Bash(npm test)', 'Bash(test -f out.txt)',            // postflight → 精确命令（V5），不再 Bash(npm:*)
-    'Bash(git add:*)', 'Bash(npm:*)',                     // 显式 bash_prefixes → :* 前缀
+    'Bash(git add:*)', 'Bash(npm:*)',                     // 显式 bash_prefixes → :* 前缀；postflight 不进 allow（V5'）
     'WebFetch(domain:cloud.langfuse.com)', 'Skill(langfuse)',
   ]);
   assert.deepEqual(settings.permissions.additionalDirectories, ['/work/other-real', '/reference/real']);
@@ -251,25 +250,41 @@ test('assertLaunchable rejects target roots that ship project settings with a pe
   assert.deepEqual(assertLaunchable(hookContract, { ...goodProbes, projectSettingsWithPermissions: [] }), { ok: true, reasons: [] });
 });
 
-test('postflight verifiers compile to exact Bash commands, not wildcard executables (V5)', () => {
-  // argv[0]→Bash(argv[0]:*) 把整个可执行家族 wildcard 授权出去：postflight ['git','diff'] 会顺带
-  // 授权 git push，['bash','-lc',...] 授权任意 shell。verifier 是精确命令，只该授权那一条。
+test('postflight verifiers never enter the Bash allow-list (V5\')', () => {
+  // 第一波修法（argv.join(' ') 精确命令）双向坏死：['printf','%s','a; touch x'] join 出的
+  // Bash(printf %s a; touch x) 在 shell 语义下授权了第二条命令（over-auth）；['git','diff','a b.txt']
+  // join 出的规则与真实 tokenize（'a b.txt' 是一个参数）永不匹配（dead rule）。病根是 argv
+  // （execFile 语义）与 Bash specifier（shell 字符串语义）之间没有可靠编码——整条自动推导通道移除。
+  // verifier 的执行不受影响：hook 用 execFileSync 跑它，不经 claude 权限；执行体要自己跑 verifier
+  // 由作者显式 bash_prefixes 声明。
   const contract = {
     ...hookContract,
-    postflight: [{ id: 'pf', type: 'command', cwd: '/work/root', argv: ['git', 'diff', '--exit-code'] }],
-    execution_permissions: undefined,
+    postflight: [
+      { id: 'pf', type: 'command', cwd: '/work/root', argv: ['git', 'diff', '--exit-code'] },
+      { id: 'pf2', type: 'command', cwd: '/work/root', argv: ['printf', '%s', 'a; touch /tmp/x'] },
+    ],
+    execution_permissions: { bash_prefixes: ['npm run'] },
   };
   const settings = buildSettings({
     contract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
   });
-  assert.ok(!settings.permissions.allow.includes('Bash(git:*)'), 'must not wildcard the whole git family');
-  assert.ok(settings.permissions.allow.includes('Bash(git diff --exit-code)'), 'authorizes exactly the declared verifier command');
-  // 显式 bash_prefixes 仍是前缀授权（作者明知在声明前缀）
-  const withPrefix = buildSettings({
-    contract: { ...contract, execution_permissions: { bash_prefixes: ['npm run'] } },
-    hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+  // 显式 bash_prefixes 仍是前缀授权（作者明知在声明前缀）；postflight 一条都不出现。
+  assert.deepEqual(settings.permissions.allow, ['Bash(npm run:*)']);
+});
+
+test('unrepresentable postflight argv never blocks or enters the launch gate (V5\')', () => {
+  // postflight 不再投影进权限 DSL，含括号/空格的 verifier 可执行路径既不该让 buildSettings 抛、
+  // 也不该让 assertLaunchable false-red（第一波曾遗留 argv[0] 投影在 permissionInputs 里）。
+  const contract = {
+    ...hookContract,
+    postflight: [{ id: 'pf', type: 'command', cwd: '/work/root', argv: ['/Applications/App (1).app/bin/check', 'a b.txt'] }],
+  };
+  const settings = buildSettings({
+    contract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
   });
-  assert.ok(withPrefix.permissions.allow.includes('Bash(npm run:*)'), 'explicit prefixes keep :* semantics');
+  assert.deepEqual(settings.permissions.allow, []);
+  const probes = { ...goodProbes, settings };
+  assert.deepEqual(assertLaunchable(contract, probes), { ok: true, reasons: [] });
 });
 
 test('buildSettings shell-escapes hostile paths with POSIX single quotes', () => {
@@ -383,6 +398,37 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
     assert.equal(verdict.ok, false);
     assert.ok(verdict.reasons.length > 0);
   }
+});
+
+test('additional read roots must not cover controller state or the hook script (V6\')', () => {
+  // additional_read_roots 进 settings.additionalDirectories，是授权给执行体的读面。指到 stateDir
+  // 的祖先/本身/内部或 hook 脚本，执行体（与控制器同 uid，0600 挡不住）就能读 hook-env.json——
+  // requires_env 凭证明文。全仓没有任何 Read deny 拦这条路，唯一的闸在 launch 前置判定。
+  const cases = [
+    ['/state', 'an ancestor of the state dir'],
+    ['/state/dir', 'the state dir itself'],
+    ['/state/dir/attempts', 'a directory inside the state dir'],
+    ['/state/dir/stop-hook.mjs', 'the hook script itself'],
+  ];
+  for (const [root, label] of cases) {
+    const settings = buildSettings({
+      contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+      targetRoots: ['/work/root'], additionalReadRoots: [root],
+    });
+    const verdict = assertLaunchable(hookContract, {
+      ...goodProbes, settings, additionalReadRoots: [root],
+    });
+    assert.equal(verdict.ok, false, `${label} must be rejected`);
+    assert.ok(verdict.reasons.some((reason) => reason.includes('read root')), label);
+  }
+  // 与 controller state 无关的读根照常放行。
+  const harmless = buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: ['/work/root'], additionalReadRoots: ['/reference/data'],
+  });
+  assert.deepEqual(assertLaunchable(hookContract, {
+    ...goodProbes, settings: harmless, additionalReadRoots: ['/reference/data'],
+  }), { ok: true, reasons: [] });
 });
 
 test('assertLaunchable independently rejects a direct-call permission DSL bypass', () => {

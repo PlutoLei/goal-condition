@@ -469,18 +469,8 @@ export function validateContract(value) {
   validateBudget(diagnostics, value.budget);
   validatePreflight(diagnostics, value.preflight, entryIds);
   validatePostflight(diagnostics, value.postflight, entryIds);
-  if (value.runtime === 'claude' && Array.isArray(value.postflight)) {
-    value.postflight.forEach((entry, index) => {
-      const executable = entry?.argv?.[0];
-      if (typeof executable === 'string' && permissionSpecifierProblem(executable) !== null) {
-        diagnostics.push(diagnostic(
-          'PERMISSION_SPECIFIER_UNREPRESENTABLE', `postflight[${index}].argv[0]`, executable,
-          'executable name representable as one Claude Bash permission prefix',
-          'use a stable executable path without permission-rule delimiters',
-        ));
-      }
-    });
-  }
+  // postflight 不投影进 Claude 权限 DSL（V5'）：verifier 由 hook 用 execFileSync 执行，不经
+  // claude 权限，argv 含 DSL 分隔符是合法 contract——这里不再做 argv[0] 表示性校验。
   return diagnostics;
 }
 

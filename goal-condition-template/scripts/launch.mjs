@@ -70,7 +70,11 @@ function canonicalPath(pathname) {
   }
 }
 
-const CLAUDE_POINTER_KEYS = Object.freeze(['cwd', 'promptSha256', 'sessionId', 'transcriptPath']);
+// targetRoots/additionalReadRoots 是 launch 时刻的全量 canonical 授权面（V2'）：cwd 只覆盖
+// target_roots[0]，第二 target root 或 read root 被 symlink 重定向时 resume 必须能对出漂移。
+const CLAUDE_POINTER_KEYS = Object.freeze([
+  'additionalReadRoots', 'cwd', 'promptSha256', 'sessionId', 'targetRoots', 'transcriptPath',
+]);
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 // Controller claims are read through a descriptor with O_NOFOLLOW and must be private regular files.
@@ -103,6 +107,11 @@ export async function readControllerJsonNoFollow(pathname, nofollow = constants.
   }
 }
 
+function isAbsolutePathList(value) {
+  return Array.isArray(value)
+    && value.every((entry) => typeof entry === 'string' && isAbsolute(entry));
+}
+
 function isClaudePointer(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(CLAUDE_POINTER_KEYS)) return false;
@@ -110,6 +119,8 @@ function isClaudePointer(value) {
   if (typeof value.cwd !== 'string' || !isAbsolute(value.cwd)) return false;
   if (!HEX64.test(value.promptSha256)) return false;
   if (typeof value.transcriptPath !== 'string' || !isAbsolute(value.transcriptPath)) return false;
+  if (!isAbsolutePathList(value.targetRoots) || value.targetRoots.length === 0) return false;
+  if (!isAbsolutePathList(value.additionalReadRoots)) return false;
   return true;
 }
 
@@ -119,23 +130,56 @@ async function observeTargetIdentity(pathname) {
   return { dev: st.dev, ino: st.ino };
 }
 
+// settings 文件几十 KB 就顶天了；cap 挡的是 symlink→/dev/zero 这类「读到死」的形态，不是精确预算。
+const PROJECT_SETTINGS_SIZE_CAP = 128 * 1024;
+
+// target root 内容是攻击者可控面，这里的读必须守 readControllerJsonNoFollow 同款描述符纪律：
+// O_NOFOLLOW（symlink 即拒）+ O_NONBLOCK（FIFO 的 open 不再等 writer 挂死）+ fstat regular file
+// + size cap。与 controller claim 的差别在语义：那边「读不了」= 无效 claim，这边「读不了」=
+// 保守 flag——无法证明它不含 permissions（fail-closed）。
+async function readProjectSettingsText(pathname) {
+  if (typeof constants.O_NOFOLLOW !== 'number') {
+    // 平台无 O_NOFOLLOW（如 Windows）：存在但无法安全 no-follow 读 → 保守 flag；不存在照常跳过。
+    if (!existsSync(pathname)) return { missing: true };
+    return { unreadable: true };
+  }
+  let handle;
+  try {
+    handle = await open(pathname, constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0));
+  } catch (error) {
+    // ENOENT 是唯一的「没有这个文件」形态；ELOOP（symlink 被 O_NOFOLLOW 拒）、EACCES 等都是
+    // 「有东西但读不了」，保守 flag。
+    if (error?.code === 'ENOENT') return { missing: true };
+    return { unreadable: true };
+  }
+  try {
+    const st = await handle.stat();
+    if (!st.isFile() || st.size > PROJECT_SETTINGS_SIZE_CAP) return { unreadable: true };
+    return { text: await handle.readFile('utf8') };
+  } catch {
+    return { unreadable: true };
+  } finally {
+    await handle.close();
+  }
+}
+
 // Claude runtime union 掉 target root 内预存的 .claude/settings*.json 的 permissions 段——spike 实证
 // 预存 allow 真会生效，使 effective 授权面超出 controller 编译的 allow-list（V4）。现场采集含
-// permissions 段（或解析不出）的预存 settings 交 assertLaunchable 落红。只设 model/hooks 的无害配置
-// 不含 permissions、不进清单。解析失败保守入列（无法证明它不含 permissions，fail-closed）。
+// permissions 段（或读不安全/解析不出）的预存 settings 交 assertLaunchable 落红。只设 model/hooks
+// 的无害配置不含 permissions、不进清单。
 async function scanProjectSettingsWithPermissions(targetRoots) {
   const flagged = [];
   for (const root of targetRoots) {
     for (const file of ['settings.json', 'settings.local.json']) {
       const pathname = join(root, '.claude', file);
-      let text;
-      try {
-        text = await readFile(pathname, 'utf8');
-      } catch {
+      const read = await readProjectSettingsText(pathname);
+      if (read.missing) continue;
+      if (read.text === undefined) {
+        flagged.push(pathname);
         continue;
       }
       try {
-        const parsed = JSON.parse(text);
+        const parsed = JSON.parse(read.text);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'permissions' in parsed) {
           flagged.push(pathname);
         }
@@ -425,7 +469,10 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
     settings = buildSettings({
       contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
     });
-  } catch {
+  } catch (error) {
+    // 只罩 assertPermissionSpecifier 的 TypeError 路径。其余 throw 是真 bug，包成权限诊断会把
+    // 操作员引去改一个没毛病的 contract（V7'）——原样 rethrow。
+    if (!(error instanceof TypeError)) throw error;
     throw new ContractArtifactError({
       code: 'PERMISSION_SPECIFIER_UNREPRESENTABLE',
       path: 'target_roots/execution_permissions',
@@ -649,6 +696,16 @@ export async function runClaudeAttempt({
         reasons: ['target root canonical path changed since launch; refusing to resume the session in a different directory'],
       });
     }
+    // cwd 只覆盖 target_roots[0]。其余 target roots 与 additional read roots 同样进 settings 的
+    // 授权面（additionalDirectories），launch 后被 symlink 重定向时 cwd 检查是盲的（V2'）——
+    // pointer 记的全量 launch-time canonical roots 与此刻重算值必须逐字相等。
+    if (JSON.stringify(prior.value.targetRoots) !== JSON.stringify(targetRoots)
+      || JSON.stringify(prior.value.additionalReadRoots) !== JSON.stringify(additionalReadRoots)) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['a target or additional read root canonical path changed since launch; refusing to resume with a drifted authorization surface'],
+      });
+    }
     ({ sessionId } = prior.value);
     spec = resumeSpec({
       sessionId, settingsPath, diagnosticText, cwd, budget: contract.budget,
@@ -671,6 +728,8 @@ export async function runClaudeAttempt({
         cwd,
         promptSha256: createHash('sha256').update(prompt, 'utf8').digest('hex'),
         transcriptPath: claudeTranscriptPath({ cwd, sessionId }),
+        targetRoots,
+        additionalReadRoots,
       }, null, 2), { flag: 'wx', mode: 0o600 });
     } catch {
       return finish({
@@ -679,6 +738,14 @@ export async function runClaudeAttempt({
       });
     }
   }
+
+  // spawn 前的最后闸失败时释放本次 claim：launch 刚写的 pointer 指向一个从未 spawn 的 session，
+  // 留着它会把下一次 launch 拒成 already-claimed、把 resume 指向不存在的会话——正常 retry 路径
+  // 被毒化（PR2-3）。只在 launch 释放（resume 的 pointer 属于真实存在的旧会话，identity 红是
+  // 环境问题，坐标必须保留）；attempt 号不回收——O_EXCL 计数只进不退是并发裁决的保守方向。
+  const releaseUnspawnedClaim = async () => {
+    if (kind === 'launch') await rm(threadPath, { force: true });
+  };
 
   // The permission rules and cwd are bound to the same canonical roots. Recheck device/inode after
   // every async claim step and immediately before spawn so replacing a canonical directory cannot
@@ -697,15 +764,29 @@ export async function runClaudeAttempt({
     };
     if (!await rebound(targetRoots, targetRootIdentities)
       || !await rebound(additionalReadRoots, additionalReadRootIdentities)) {
+      await releaseUnspawnedClaim();
       return finish({
         outcome: 'terminal_report',
         reasons: ['canonical root identity changed before dispatch; refusing to spawn Claude'],
       });
     }
   } catch {
+    await releaseUnspawnedClaim();
     return finish({
       outcome: 'terminal_report',
       reasons: ['canonical root identity changed before dispatch; refusing to spawn Claude'],
+    });
+  }
+
+  // 早扫（进 assertLaunchable 的那次）挡的是占号前的形态，便宜且不烧配额；但 claim 与
+  // beforeDispatch 都是 async 步骤，之后才种进 target root 的 permissioned settings 不改目录
+  // inode（identity 复核照常通过），却仍会被 Claude runtime union 进 effective 权限
+  // （V4-TOCTOU）。与 identity recheck 同构：spawn 前最后一刻复扫一次。
+  if ((await scanProjectSettingsWithPermissions(targetRoots)).length > 0) {
+    await releaseUnspawnedClaim();
+    return finish({
+      outcome: 'terminal_report',
+      reasons: ['a project settings file with a permissions block appeared inside a target root after the launch gate; refusing to spawn Claude'],
     });
   }
 
@@ -2271,9 +2352,19 @@ async function runCli() {
     }
     await runAttemptCommand(parsed.command, parsed.values);
   } catch (error) {
-    process.stderr.write(`${error.message}\n`);
+    process.stderr.write(`${renderCliError(error)}\n`);
     process.exitCode = 1;
   }
+}
+
+// ContractArtifactError 的 message 只有 code+path；observed/expected/next 若只在字段里，launch CLI
+// 的操作员永远看不到（validate-contract.mjs 渲染、这边不渲染，V7'）。两边同一格式，单点在此。
+export function renderCliError(error) {
+  if (error?.code && error?.path && error?.expected && error?.next) {
+    return `${error.code} ${error.path} observed=${JSON.stringify(error.observed)} `
+      + `expected=${JSON.stringify(error.expected)} next=${JSON.stringify(error.next)}`;
+  }
+  return error?.message ?? String(error);
 }
 
 // Node 默认对模块做 realpath 解析，而 process.argv[1] 保留调用者敲入的字面路径。只比字面路径时，
