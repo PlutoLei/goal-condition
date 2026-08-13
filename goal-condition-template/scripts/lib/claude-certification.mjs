@@ -293,7 +293,7 @@ export function classifyClaudeCanaryBlocker(result) {
 }
 
 async function defaultCaptureBaseline({ contract }) {
-  const snapshot = await captureSnapshot(contract);
+  const snapshot = await captureSnapshot(contract, { phase: 'capture' });
   return { snapshot, digest: snapshotDigest(snapshot) };
 }
 
@@ -381,7 +381,10 @@ async function defaultAssertSentinelAbsent({ compiled }) {
 }
 
 async function defaultVerifyBaseline({ compiled, baseline, baselineDigest: expectedBaselineDigest }) {
-  const current = await captureSnapshot(compiled.contract);
+  const baselineGitHeads = Object.fromEntries(baseline.entries
+    .filter((entry) => entry.type === 'git')
+    .map((entry) => [entry.id, entry.head]));
+  const current = await captureSnapshot(compiled.contract, { baselineGitHeads, phase: 'verify' });
   const comparison = compareSnapshot(compiled.contract, baseline, current, { expectedBaselineDigest });
   const postflight = [];
   for (const entry of compiled.contract.postflight) {

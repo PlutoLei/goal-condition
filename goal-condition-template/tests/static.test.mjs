@@ -446,6 +446,26 @@ test('Codex adapter scopes blocked to a healthy tool surface and drops the dispr
   assert.match(adapter, /并叠加下文的单调序列号/);
 });
 
+test('every captureSnapshot call site declares its phase explicitly', () => {
+  // 真实教训（2026-08-13）：claude-certification 的 defaultCaptureBaseline / defaultVerifyBaseline
+  // 裸调 captureSnapshot(contract)，而 phase 是 fail-closed 必填——离线测试全部注入 fake capture，
+  // 真实 certify-claude-run 因此在 HEAD 上永远 Snapshot preflight failed。离线 fake 盖不住的
+  // 调用形状约束，用静态断言钉死：每个 await captureSnapshot( 调用窗口内必须出现 phase:。
+  const sourceFiles = coreCandidateFiles(join(templateRoot, 'scripts'))
+    .filter((name) => name.endsWith('.mjs'))
+    .map((name) => join(templateRoot, 'scripts', name));
+  let callSites = 0;
+  for (const pathname of sourceFiles) {
+    const source = read(pathname);
+    for (const match of source.matchAll(/await captureSnapshot\(/g)) {
+      callSites += 1;
+      const window = source.slice(match.index, match.index + 240);
+      assert.ok(window.includes('phase:'), `captureSnapshot call without explicit phase in ${pathname}`);
+    }
+  }
+  assert.ok(callSites >= 4, `expected to find the known captureSnapshot call sites, found ${callSites}`);
+});
+
 test('boundary-design emits platform-neutral run-contract vocabulary', () => {
   const boundarySkill = read(boundarySkillPath);
   for (const term of [
