@@ -247,8 +247,11 @@ test('public docs expose the external release trust root and complete required c
     'schema/run-contract.schema.json',
     'scripts/validate-contract.mjs', 'scripts/snapshot.mjs', 'scripts/install.mjs',
     'scripts/lib/contract.mjs', 'scripts/lib/snapshot.mjs',
-    'scripts/lib/installer.mjs', 'scripts/lib/workflow.mjs',
+    'scripts/lib/installer.mjs', 'scripts/lib/runner-common.mjs',
+    'scripts/lib/runtime-surfaces.mjs', 'scripts/lib/workflow.mjs',
     'scripts/launch.mjs', 'scripts/lib/adapters/claude.mjs', 'scripts/lib/adapters/codex.mjs',
+    'scripts/lib/claude-permissions.mjs', 'scripts/lib/runners/claude.mjs',
+    'scripts/lib/runners/codex.mjs',
     'codex-controller/src/migration.mjs', 'codex-controller/src/attempt.mjs',
     'codex-controller/src/capabilities.mjs', 'codex-controller/src/execution.mjs',
     'codex-controller/src/recovery.mjs', 'codex-controller/src/release.mjs',
@@ -295,6 +298,22 @@ test('every shipped CLI usage names a path that ships in the release', () => {
       );
     }
   }
+});
+
+test('launcher is a thin dispatcher and runtime attempt lifecycles stay runtime-owned', () => {
+  const launcher = read(join(templateRoot, 'scripts', 'launch.mjs'));
+  const common = read(join(templateRoot, 'scripts', 'lib', 'runner-common.mjs'));
+  const claude = read(join(templateRoot, 'scripts', 'lib', 'runners', 'claude.mjs'));
+  const codex = read(join(templateRoot, 'scripts', 'lib', 'runners', 'codex.mjs'));
+
+  assert.match(launcher, /from '.\/lib\/runners\/claude\.mjs'/);
+  assert.match(launcher, /from '.\/lib\/runners\/codex\.mjs'/);
+  assert.doesNotMatch(launcher, /function (?:prepareClaude|runClaudeAttempt|runCodexLaunch|runCodexResume)\b/);
+  assert.doesNotMatch(common, /adapters\/(?:claude|codex)\.mjs/);
+  assert.match(claude, /export async function runClaudeAttempt\b/);
+  assert.doesNotMatch(claude, /runCodex(?:Launch|Resume|Finalize|Close)/);
+  assert.match(codex, /export async function runCodexLaunch\b/);
+  assert.doesNotMatch(codex, /runClaude(?:Attempt|Readback)/);
 });
 
 test('core and run-contract docs bind launch to canonical artifact bytes and complete preview', () => {

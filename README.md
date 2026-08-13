@@ -136,11 +136,15 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `scripts/lib/contract.mjs`
 - `scripts/lib/snapshot.mjs`
 - `scripts/lib/installer.mjs`
+- `scripts/lib/runner-common.mjs`
 - `scripts/lib/runtime-surfaces.mjs`
 - `scripts/lib/workflow.mjs`
 - `scripts/launch.mjs`
 - `scripts/lib/adapters/claude.mjs`
 - `scripts/lib/adapters/codex.mjs`
+- `scripts/lib/claude-permissions.mjs`
+- `scripts/lib/runners/claude.mjs`
+- `scripts/lib/runners/codex.mjs`
 - `codex-controller/package.json`
 - `codex-controller/schema/goal-session-v2.schema.json`
 - `codex-controller/schema/revision-operation-v1.schema.json`

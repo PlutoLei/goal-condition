@@ -46,12 +46,15 @@ const capabilityEntries = [
   ['scripts/lib/contract.mjs', 'runtime_shared'],
   ['scripts/lib/snapshot.mjs', 'runtime_shared'],
   ['scripts/lib/installer.mjs', 'release_only'],
+  ['scripts/lib/runner-common.mjs', 'runtime_shared'],
   ['scripts/lib/runtime-surfaces.mjs', 'runtime_shared'],
   ['scripts/lib/workflow.mjs', 'runtime_shared'],
   ['scripts/launch.mjs', 'runtime_shared'],
   ['scripts/lib/adapters/claude.mjs', 'claude'],
   ['scripts/lib/adapters/codex.mjs', 'codex'],
   ['scripts/lib/claude-permissions.mjs', 'claude'],
+  ['scripts/lib/runners/claude.mjs', 'claude'],
+  ['scripts/lib/runners/codex.mjs', 'codex'],
 ];
 
 export const CORE_FILE_CAPABILITIES = Object.freeze(Object.fromEntries(capabilityEntries));
