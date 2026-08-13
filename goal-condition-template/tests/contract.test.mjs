@@ -78,11 +78,11 @@ test('execution_permissions is a closed-world Claude-only authorization surface'
   const codex = validateContract({ ...valid, runtime: 'codex', execution_permissions });
   assert.ok(codex.some((x) => x.code === 'CLAUDE_EXECUTION_PERMISSIONS_ONLY'));
 
-  const hostileTarget = structuredClone(valid);
-  hostileTarget.runtime = 'claude';
-  hostileTarget.target_roots[0] = '/opt/work) Bash(evil';
-  assert.ok(validateContract(hostileTarget)
-    .some((x) => x.code === 'PERMISSION_SPECIFIER_UNREPRESENTABLE' && x.path === 'target_roots[0]'));
+  // target_roots 只进入 cwd/additionalDirectories，不再插值到 Edit(...) DSL；路径里的括号合法。
+  const parenTarget = structuredClone(valid);
+  parenTarget.runtime = 'claude';
+  parenTarget.target_roots[0] = '/Applications/App (1).app/work';
+  assert.deepEqual(validateContract(parenTarget), []);
 
   // postflight 不进权限 DSL（V5'）：verifier 可执行路径含括号/空格是合法 contract——hook 用
   // execFileSync 跑它，不经 claude 权限。validator 若还投影 argv[0] 就是 false-red。

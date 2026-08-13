@@ -9,9 +9,11 @@ export function permissionSpecifierProblem(value) {
   return null;
 }
 
+export class PermissionSpecifierError extends TypeError {}
+
 export function assertPermissionSpecifier(value) {
   const problem = permissionSpecifierProblem(value);
-  if (problem !== null) throw new TypeError(`Claude permission specifier ${problem}`);
+  if (problem !== null) throw new PermissionSpecifierError(`Claude permission specifier ${problem}`);
   return value;
 }
 

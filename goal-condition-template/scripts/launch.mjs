@@ -7,7 +7,7 @@ import {
   constants,
 } from 'node:fs';
 import {
-  appendFile, chmod, lstat, mkdir, open, readdir, readFile, rm, stat, writeFile,
+  appendFile, chmod, link, lstat, mkdir, open, readdir, readFile, rm, stat, writeFile,
 } from 'node:fs/promises';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
@@ -25,7 +25,10 @@ import {
   bindControllerTurnText, CODEX_SANDBOX_MODE, GoalRpcClient, normalizeTerminal as normalizeCodexTerminal,
   noteworthyNotification, resumeRpcOps, TURN_BOUNDARY_METHODS, verifyFinalizeAttribution,
 } from './lib/adapters/codex.mjs';
-import { contractHash, readContract, ContractArtifactError } from './lib/contract.mjs';
+import {
+  contractHash, readContract, ContractArtifactError, renderContractDiagnostic,
+} from './lib/contract.mjs';
+import { PermissionSpecifierError } from './lib/claude-permissions.mjs';
 import { runtimeTerminalState } from './lib/workflow.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -73,6 +76,10 @@ function canonicalPath(pathname) {
 // targetRoots/additionalReadRoots 是 launch 时刻的全量 canonical 授权面（V2'）：cwd 只覆盖
 // target_roots[0]，第二 target root 或 read root 被 symlink 重定向时 resume 必须能对出漂移。
 const CLAUDE_POINTER_KEYS = Object.freeze([
+  'additionalReadRootIdentities', 'additionalReadRoots', 'cwd', 'promptSha256', 'schemaVersion',
+  'sessionId', 'targetRootIdentities', 'targetRoots', 'transcriptPath',
+]);
+const LEGACY_CLAUDE_POINTER_KEYS = Object.freeze([
   'additionalReadRoots', 'cwd', 'promptSha256', 'sessionId', 'targetRoots', 'transcriptPath',
 ]);
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -107,114 +114,87 @@ export async function readControllerJsonNoFollow(pathname, nofollow = constants.
   }
 }
 
+// Never stream bytes into the public claim path. A failed write there would require unlinking a mutable pathname,
+// which can delete a foreign replacement created after our descriptor was closed. Instead, fully write and fsync a
+// unique same-directory inode, publish it with an atomic no-replace hard link, then remove only the private name.
+// The final path is therefore either absent, foreign and untouched, or a complete single-link regular file.
+export async function writeControllerJsonExclusive(pathname, value, {
+  writeImpl = async (handle, bytes) => handle.writeFile(bytes, 'utf8'),
+} = {}) {
+  const privatePath = join(dirname(pathname), `.${basename(pathname)}.${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await open(privatePath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+    const st = await handle.stat({ bigint: true });
+    if (!st.isFile() || st.nlink !== 1n) throw new Error('exclusive controller claim is not a single-link regular file');
+    await writeImpl(handle, JSON.stringify(value, null, 2));
+    await handle.sync();
+    await link(privatePath, pathname);
+    await rm(privatePath);
+    return { dev: st.dev.toString(), ino: st.ino.toString() };
+  } catch (error) {
+    if (handle) {
+      try { await handle.close(); } catch { /* preserve the original write failure */ }
+      handle = undefined;
+    }
+    // privatePath is an unguessable Controller-owned name. Never remove pathname here: a failed link means that
+    // name may belong to another process, and a failed write may have allowed a test/fault injector to create it.
+    try { await rm(privatePath, { force: true }); } catch { /* preserve the original publication failure */ }
+    throw error;
+  } finally {
+    if (handle) await handle.close();
+  }
+}
+
+async function removeOwnedControllerFile(pathname, ownership) {
+  const st = await lstat(pathname, { bigint: true });
+  if (!st.isFile() || st.nlink !== 1n
+    || st.dev.toString() !== ownership?.dev || st.ino.toString() !== ownership?.ino) {
+    throw new Error('controller claim ownership changed before rollback');
+  }
+  await rm(pathname);
+}
+
 function isAbsolutePathList(value) {
   return Array.isArray(value)
     && value.every((entry) => typeof entry === 'string' && isAbsolute(entry));
 }
 
+function isRootIdentityList(value) {
+  return Array.isArray(value) && value.every((identity) => identity !== null
+    && typeof identity === 'object'
+    && !Array.isArray(identity)
+    && JSON.stringify(Object.keys(identity).sort()) === JSON.stringify(['dev', 'ino'])
+    && /^(?:0|[1-9]\d*)$/.test(identity.dev)
+    && /^(?:0|[1-9]\d*)$/.test(identity.ino));
+}
+
 function isClaudePointer(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(CLAUDE_POINTER_KEYS)) return false;
+  if (value.schemaVersion !== 2) return false;
   if (!UUID_V4.test(value.sessionId)) return false;
   if (typeof value.cwd !== 'string' || !isAbsolute(value.cwd)) return false;
   if (!HEX64.test(value.promptSha256)) return false;
   if (typeof value.transcriptPath !== 'string' || !isAbsolute(value.transcriptPath)) return false;
   if (!isAbsolutePathList(value.targetRoots) || value.targetRoots.length === 0) return false;
   if (!isAbsolutePathList(value.additionalReadRoots)) return false;
+  if (!isRootIdentityList(value.targetRootIdentities)
+    || value.targetRootIdentities.length !== value.targetRoots.length) return false;
+  if (!isRootIdentityList(value.additionalReadRootIdentities)
+    || value.additionalReadRootIdentities.length !== value.additionalReadRoots.length) return false;
   return true;
 }
 
+function isLegacyClaudePointer(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && JSON.stringify(Object.keys(value).sort()) === JSON.stringify(LEGACY_CLAUDE_POINTER_KEYS);
+}
+
 async function observeTargetIdentity(pathname) {
-  const st = await stat(pathname);
+  const st = await stat(pathname, { bigint: true });
   if (!st.isDirectory()) throw new Error('target root is not a directory');
-  return { dev: st.dev, ino: st.ino };
-}
-
-// settings 文件几十 KB 就顶天了；cap 挡的是 symlink→/dev/zero 这类「读到死」的形态，不是精确预算。
-const PROJECT_SETTINGS_SIZE_CAP = 128 * 1024;
-
-// target root 内容是攻击者可控面，这里的读必须守 readControllerJsonNoFollow 同款描述符纪律：
-// O_NOFOLLOW（symlink 即拒）+ O_NONBLOCK（FIFO 的 open 不再等 writer 挂死）+ fstat regular file
-// + size cap。与 controller claim 的差别在语义：那边「读不了」= 无效 claim，这边「读不了」=
-// 保守 flag——无法证明它不含 permissions（fail-closed）。
-async function readProjectSettingsText(pathname) {
-  if (typeof constants.O_NOFOLLOW !== 'number') {
-    // 平台无 O_NOFOLLOW（如 Windows）：存在但无法安全 no-follow 读 → 保守 flag；不存在照常跳过。
-    if (!existsSync(pathname)) return { missing: true };
-    return { unreadable: true };
-  }
-  let handle;
-  try {
-    handle = await open(pathname, constants.O_RDONLY | constants.O_NOFOLLOW | (constants.O_NONBLOCK ?? 0));
-  } catch (error) {
-    // ENOENT 是唯一的「没有这个文件」形态；ELOOP（symlink 被 O_NOFOLLOW 拒）、EACCES 等都是
-    // 「有东西但读不了」，保守 flag。
-    if (error?.code === 'ENOENT') return { missing: true };
-    return { unreadable: true };
-  }
-  try {
-    const st = await handle.stat();
-    if (!st.isFile() || st.size > PROJECT_SETTINGS_SIZE_CAP) return { unreadable: true };
-    return { text: await handle.readFile('utf8') };
-  } catch {
-    return { unreadable: true };
-  } finally {
-    await handle.close();
-  }
-}
-
-// settings.local.json 自 CLI 2.1.211 起从 enclosing git root 加载（官方文档明文；2.1.229 deny 探针
-// 双向实证：git root 的 local.json 对子目录 cwd 生效，settings.json 只看 cwd、不向上）。.git 条目
-// 按存在性判定（目录=普通 repo、文件=worktree/submodule）；与 git rev-parse 的边缘差异（GIT_DIR
-// 覆写、bare repo）按保守方向接受——这里只决定「多扫哪个目录」，不决定放行。
-function findEnclosingGitRoot(pathname) {
-  let dir = pathname;
-  for (;;) {
-    if (existsSync(join(dir, '.git'))) return dir;
-    const parent = dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-}
-
-// Claude runtime union 掉预存 .claude/settings*.json 的 permissions 段——spike 实证预存 allow 真会
-// 生效，使 effective 授权面超出 controller 编译的 allow-list（V4）。扫描范围精确跟随加载面：每个
-// target root 自身的 settings.json/settings.local.json，加 enclosing git root（若在 root 之外）的
-// settings.local.json（CR-5——target root 是仓库子目录时加载面越出 target root；git root 的
-// settings.json 实测不加载，扫它会把「祖先仓库带无关 project settings」的合法形态永久判红）。
-// 含 permissions 段（或读不安全/解析不出）的文件交 assertLaunchable 落红；只设 model/hooks 的
-// 无害配置不含 permissions、不进清单。
-async function scanProjectSettingsWithPermissions(targetRoots) {
-  const flagged = [];
-  const checked = new Set();
-  const check = async (pathname) => {
-    if (checked.has(pathname)) return;
-    checked.add(pathname);
-    const read = await readProjectSettingsText(pathname);
-    if (read.missing) return;
-    if (read.text === undefined) {
-      flagged.push(pathname);
-      return;
-    }
-    try {
-      const parsed = JSON.parse(read.text);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'permissions' in parsed) {
-        flagged.push(pathname);
-      }
-    } catch {
-      flagged.push(pathname);
-    }
-  };
-  for (const root of targetRoots) {
-    for (const file of ['settings.json', 'settings.local.json']) {
-      await check(join(root, '.claude', file));
-    }
-    const gitRoot = findEnclosingGitRoot(root);
-    if (gitRoot !== null && gitRoot !== root) {
-      await check(join(gitRoot, '.claude', 'settings.local.json'));
-    }
-  }
-  return flagged;
+  return { dev: st.dev.toString(), ino: st.ino.toString() };
 }
 
 export function stateDirFor({ stateRoot, controller = 'default', contractHash }) {
@@ -267,9 +247,9 @@ export async function assertAttemptBudgetLeft(stateDir) {
 // 崩溃恢复状态机。超过 1 首发 + MAX_AUTO_RESUMES 续跑即 fail-closed 拒绝（attempt 超限 fault
 // injection 靠这条 throw）。
 //
-// 调用点必须落在所有前置闸之后（claude.md 的计数口径是「真实跑过的轮次」）——占位是
-// 不可撤销的：prepare 与 close 都不清 attempts/，配额一旦烧完，这份 contract 在这个 state
-// 目录上就永久起不来。诊断因此按本仓的 observed/expected/next 三件套写，next 给出真实出路。
+// 调用点必须落在所有前置闸之后（claude.md 的计数口径是「真实跑过的轮次」）。默认占位是
+// durable 的；Claude 线只在 state 级独占 lease 内允许 pre-dispatch rollback，此时不会有更高编号
+// 并发出现。真实 dispatch 之后仍不可撤销，prepare 与 close 都不清 attempts/。
 export async function nextAttempt(stateDir) {
   const current = await maxExistingAttempt(stateDir);
   const next = current + 1;
@@ -288,6 +268,34 @@ export async function nextAttempt(stateDir) {
       + '(lease.json in the state dir) and retry, or start a fresh run under a different --controller name');
   }
   return next;
+}
+
+const CLAUDE_ATTEMPT_LEASE = 'claude-attempt.lock';
+
+async function claimClaudeAttemptLease(stateDir) {
+  const pathname = join(stateDir, CLAUDE_ATTEMPT_LEASE);
+  const token = randomUUID();
+  try {
+    const ownership = await writeControllerJsonExclusive(pathname, {
+      schemaVersion: 1, token, pid: process.pid, startedAt: Date.now(),
+    });
+    return { pathname, token, ownership };
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    throw new AttemptClaimError('CLAUDE_ATTEMPT_IN_PROGRESS entry=claude-attempt.lock field=lease '
+      + 'observed=another controller holds the per-state Claude attempt lease '
+      + 'expected=at most one launch or resume may reserve and dispatch against a state directory '
+      + 'next=wait for the live attempt to finish; if its controller crashed, reconcile the claimed session '
+      + 'before explicitly removing the stale lease or start under a fresh --controller name');
+  }
+}
+
+async function releaseClaudeAttemptLease(lease) {
+  const current = await readControllerJsonNoFollow(lease.pathname);
+  if (!current.ok || current.value?.schemaVersion !== 1 || current.value?.token !== lease.token) {
+    throw new Error('Claude attempt lease ownership changed; refusing to remove a foreign lease');
+  }
+  await removeOwnedControllerFile(lease.pathname, lease.ownership);
 }
 
 // §6 表。fail-closed 方向：未知 code 归 terminal，不自动续跑。
@@ -421,6 +429,12 @@ export async function hookRunCount(stateDir) {
 
 // 默认采集器：真实 execFile('claude', ['--version']) + lstat + sha256。测试通过 prepareClaude
 // 的 collect 参数注入 stub，不真调 claude 二进制。
+export function helpAdvertisesLongOption(helpText, option) {
+  if (typeof helpText !== 'string' || typeof option !== 'string' || !/^--[a-z0-9-]+$/.test(option)) return false;
+  const escaped = option.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[\\s,])${escaped}(?=[\\s=,]|$)`, 'm').test(helpText);
+}
+
 async function defaultCollect({ hookScriptPath }) {
   const { stdout } = await execFile('claude', ['--version']);
   const match = stdout.match(/(\d+\.\d+\.\d+)/);
@@ -438,7 +452,8 @@ async function defaultCollect({ hookScriptPath }) {
   return {
     claudeVersionRaw: stdout,
     claudeVersion: match ? match[1] : null,
-    claudeSessionIdFlag: /--session-id\b/.test(helpStdout),
+    claudeSessionIdFlag: helpAdvertisesLongOption(helpStdout, '--session-id'),
+    claudeSettingSourcesFlag: helpAdvertisesLongOption(helpStdout, '--setting-sources'),
     hookMode: (st.mode & 0o7777).toString(8).padStart(4, '0'),
     hookSha256: createHash('sha256').update(bytes).digest('hex'),
   };
@@ -498,7 +513,7 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
   } catch (error) {
     // 只罩 assertPermissionSpecifier 的 TypeError 路径。其余 throw 是真 bug，包成权限诊断会把
     // 操作员引去改一个没毛病的 contract（V7'）——原样 rethrow。
-    if (!(error instanceof TypeError)) throw error;
+    if (!(error instanceof PermissionSpecifierError)) throw error;
     throw new ContractArtifactError({
       code: 'PERMISSION_SPECIFIER_UNREPRESENTABLE',
       path: 'target_roots/execution_permissions',
@@ -519,6 +534,7 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
     claudeVersion: collected.claudeVersion,
     claudeHelpCommand: ['claude', '--help'],
     claudeSessionIdFlag: collected.claudeSessionIdFlag === true,
+    claudeSettingSourcesFlag: collected.claudeSettingSourcesFlag === true,
     settings,
     hookScript: {
       path: hookScriptPath, exists: true, mode: collected.hookMode, sha256: collected.hookSha256,
@@ -577,8 +593,9 @@ export async function runClaudeAttempt({
   contract, stateDir, prompt, kind, diagnosticText, binding, execFileImpl = execFile,
   beforeDispatch = async () => {},
 }) {
-  // attempt 号只在所有前置闸全绿、真要 spawn 执行器时才占（第二次冒烟 N-2）：占位不可撤销，
-  // 而前置闸拒绝的原因经常在 contract 之外（binding 笔误、claude 版本掉出 allowlist、hook 文件
+  // attempt 号只在所有前置闸全绿、真要 spawn 执行器时才占（第二次冒烟 N-2）：真实 dispatch
+  // 之后不可撤销；pre-dispatch rollback 只能在下面的 Claude 独占 lease 内进行。前置闸拒绝的原因
+  // 经常在 contract 之外（binding 笔误、claude 版本掉出 allowlist、hook 文件
   // 模式被改），改正它们不会换 contract hash，也就不会换 state 目录。占在闸前意味着三次笔误就把
   // 这份 contract 在这个 state 目录上永久锁死。它也与 claude.md 的计数口径冲突——那里定义的是
   // 「一次逻辑 run = 1 首发 + 最多 2 次续跑」，约束的是真实跑过的轮次。
@@ -633,13 +650,21 @@ export async function runClaudeAttempt({
     settings = buildSettings({
       contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
     });
-  } catch {
+  } catch (error) {
+    if (!(error instanceof PermissionSpecifierError)) throw error;
     return finish({
       outcome: 'terminal_report',
       reasons: ['Claude permission settings contain an invalid permission specifier and cannot be compiled'],
     });
   }
   const settingsPath = join(realStateDir, 'settings.json');
+  // The lease begins before the first shared-state mutation of an attempt. If it started at attempt reservation,
+  // a losing concurrent resume could still replace settings.json underneath the active executor before being
+  // rejected. Holding it through settings publication, validation, reservation, dispatch, and result persistence
+  // makes the whole attempt a single-writer transaction.
+  const attemptLease = await claimClaudeAttemptLease(stateDir);
+  let pointerOwnership = null;
+  try {
   // hook 脚本走的是「读磁盘 bytes → 与现场重算的 sha256 比对」，settings.json 此前没有同等待遇：
   // 判定的是上一行这个内存对象，交给 claude 的却是磁盘上的 settingsPath（re-review I1b 实测：把
   // 磁盘那份的 deny 改成 [] 即可带着空 deny 合法起飞）。这里不加第二道比对，而是每次 attempt 用
@@ -653,6 +678,7 @@ export async function runClaudeAttempt({
     // 的 probes.json 里读。显式 === true 归一：旧 state 目录（探测引入前 prepare 的）缺这个字段
     // 时判 false → 前置闸红 → 重跑 prepare 即可，不烧配额。
     claudeSessionIdFlag: storedProbes.claudeSessionIdFlag === true,
+    claudeSettingSourcesFlag: storedProbes.claudeSettingSourcesFlag === true,
     contractHash: contractHash(contract),
     // confirmedHash 现在来自主会话的 runBinding 本体（不再是 stateDir 末段——那条检查已经
     // 上移成独立的三方交叉判定），与此刻现场重算的 contractHash 对比，抓的是「prepare 之后
@@ -662,7 +688,6 @@ export async function runClaudeAttempt({
     baselineDigestStored: typeof binding?.baselineDigest === 'string' && HEX64.test(binding.baselineDigest),
     targetRoots,
     additionalReadRoots,
-    projectSettingsWithPermissions: await scanProjectSettingsWithPermissions(targetRoots),
     stateDir: realStateDir,
     settings,
     expectedHookSha256,
@@ -689,7 +714,10 @@ export async function runClaudeAttempt({
         outcome: 'terminal_report',
         reasons: [prior.ok && isClaudePointer(prior.value)
           ? 'this run already claimed a claude session; use resume or readback instead of launching again'
-          : 'thread.json exists but is invalid; recover it explicitly instead of launching a second session'],
+          : prior.ok && isLegacyClaudePointer(prior.value)
+            ? 'thread.json uses a legacy pointer schema without root identities; reconcile/read back the old '
+              + 'session with its original adapter, then start a fresh controller state instead of re-running prepare'
+            : 'thread.json exists but is invalid; recover it explicitly instead of launching a second session'],
       });
     }
     // claim-before-dispatch（借 codex GoalSession v2 的 LaunchIntent 语义）：会话身份由控制器
@@ -705,6 +733,13 @@ export async function runClaudeAttempt({
       return finish({
         outcome: 'terminal_report',
         reasons: ['no thread.json in state dir: cannot resume without a prior session id'],
+      });
+    }
+    if (prior.ok && isLegacyClaudePointer(prior.value)) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['thread.json uses a legacy pointer schema without root identities; reconcile/read back the old '
+          + 'session with its original adapter, then start a fresh controller state instead of re-running prepare'],
       });
     }
     if (!prior.ok || !isClaudePointer(prior.value)) {
@@ -732,6 +767,14 @@ export async function runClaudeAttempt({
         reasons: ['a target or additional read root canonical path changed since launch; refusing to resume with a drifted authorization surface'],
       });
     }
+    if (JSON.stringify(prior.value.targetRootIdentities) !== JSON.stringify(targetRootIdentities)
+      || JSON.stringify(prior.value.additionalReadRootIdentities)
+        !== JSON.stringify(additionalReadRootIdentities)) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['a target or additional read root identity changed since launch; refusing to resume in a replaced directory'],
+      });
+    }
     ({ sessionId } = prior.value);
     spec = resumeSpec({
       sessionId, settingsPath, diagnosticText, cwd, budget: contract.budget,
@@ -740,46 +783,56 @@ export async function runClaudeAttempt({
     throw new Error(`unsupported kind: ${kind}`);
   }
 
-  // 前置闸全绿、argv 已组好，下一行就是真正的 spawn——占号的时刻在这里，不在函数开头。
-  attemptNumber = await nextAttempt(stateDir);
+    // 前置闸全绿、argv 已组好后才预占 attempt。若后续 claim/rebind 在调用 execFileImpl 前失败，
+    // lease 保证没有更高 attempt 并发出现，因此可以安全回收本次最高 slot。
+    attemptNumber = await nextAttempt(stateDir);
 
-  if (kind === 'launch') {
-    // 指针先落盘再 spawn：无论终局形态如何（成功、error_max_turns、进程崩溃、stdout 不可解析），
-    // resume 都有指针可用。promptSha256/transcriptPath 只供 readback 归因与观测（fail-open 通道），
-    // resume 只消费 sessionId。spawn 未成功而指针已在的形态是 fail-closed 的：resume 会对不存在
-    // 的会话报错、落终局报告，不会伪装成候选。
-    try {
-      await writeFile(threadPath, JSON.stringify({
-        sessionId,
-        cwd,
-        promptSha256: createHash('sha256').update(prompt, 'utf8').digest('hex'),
-        transcriptPath: claudeTranscriptPath({ cwd, sessionId }),
-        targetRoots,
-        additionalReadRoots,
-      }, null, 2), { flag: 'wx', mode: 0o600 });
-    } catch {
-      return finish({
-        outcome: 'terminal_report',
-        reasons: ['thread.json was claimed concurrently or is invalid; refusing to dispatch a second session'],
-      });
+    const releaseUndispatched = async () => {
+      // pointer 先清、attempt 后清：若 owned-pointer rollback 失败，就保守保留已占 slot，避免把一个
+      // 带残留 claim 的状态伪装成「零 dispatch、可重试」。同一 lease 排除了守约 controller 的替换。
+      if (kind === 'launch' && pointerOwnership !== null) {
+        await removeOwnedControllerFile(threadPath, pointerOwnership);
+        pointerOwnership = null;
+      }
+      const reservedAttempt = attemptNumber;
+      if (reservedAttempt !== null) {
+        await rm(join(stateDir, 'attempts', String(reservedAttempt)), { force: true });
+        attemptNumber = null;
+      }
+    };
+
+    if (kind === 'launch') {
+      // 指针先落盘再 spawn：无论终局形态如何（成功、error_max_turns、进程崩溃、stdout 不可解析），
+      // resume 都有指针可用。私有 inode 完整写入、fsync 后用 hard-link no-replace 发布，失败不会
+      // 留下半截 JSON，也不会为了回滚去 unlink 一个可能已被后来者占用的公共路径。
+      try {
+        pointerOwnership = await writeControllerJsonExclusive(threadPath, {
+          schemaVersion: 2,
+          sessionId,
+          cwd,
+          promptSha256: createHash('sha256').update(prompt, 'utf8').digest('hex'),
+          transcriptPath: claudeTranscriptPath({ cwd, sessionId }),
+          targetRoots,
+          additionalReadRoots,
+          targetRootIdentities,
+          additionalReadRootIdentities,
+        });
+      } catch {
+        await releaseUndispatched();
+        return finish({
+          outcome: 'terminal_report',
+          reasons: ['thread.json was claimed concurrently or could not be published transactionally; refusing to dispatch a second session'],
+        });
+      }
     }
-  }
-
-  // spawn 前的最后闸失败时释放本次 claim：launch 刚写的 pointer 指向一个从未 spawn 的 session，
-  // 留着它会把下一次 launch 拒成 already-claimed、把 resume 指向不存在的会话——正常 retry 路径
-  // 被毒化（PR2-3）。只在 launch 释放（resume 的 pointer 属于真实存在的旧会话，identity 红是
-  // 环境问题，坐标必须保留）；attempt 号不回收——O_EXCL 计数只进不退是并发裁决的保守方向。
-  const releaseUnspawnedClaim = async () => {
-    if (kind === 'launch') await rm(threadPath, { force: true });
-  };
 
   // The permission rules and cwd are bound to the same canonical roots. Recheck device/inode after
   // every async claim step and immediately before spawn so replacing a canonical directory cannot
-  // redirect execution into a repository whose project settings were never denied.
-  await beforeDispatch({
-    cwd, targetRoots: [...targetRoots], additionalReadRoots: [...additionalReadRoots],
-  });
+  // redirect execution into a repository outside the authorization surface bound above.
   try {
+    await beforeDispatch({
+      cwd, targetRoots: [...targetRoots], additionalReadRoots: [...additionalReadRoots],
+    });
     const rebound = async (roots, identities) => {
       for (let index = 0; index < roots.length; index += 1) {
         const current = await observeTargetIdentity(roots[index]);
@@ -790,29 +843,17 @@ export async function runClaudeAttempt({
     };
     if (!await rebound(targetRoots, targetRootIdentities)
       || !await rebound(additionalReadRoots, additionalReadRootIdentities)) {
-      await releaseUnspawnedClaim();
+      await releaseUndispatched();
       return finish({
         outcome: 'terminal_report',
         reasons: ['canonical root identity changed before dispatch; refusing to spawn Claude'],
       });
     }
   } catch {
-    await releaseUnspawnedClaim();
+    await releaseUndispatched();
     return finish({
       outcome: 'terminal_report',
-      reasons: ['canonical root identity changed before dispatch; refusing to spawn Claude'],
-    });
-  }
-
-  // 早扫（进 assertLaunchable 的那次）挡的是占号前的形态，便宜且不烧配额；但 claim 与
-  // beforeDispatch 都是 async 步骤，之后才种进 target root 的 permissioned settings 不改目录
-  // inode（identity 复核照常通过），却仍会被 Claude runtime union 进 effective 权限
-  // （V4-TOCTOU）。与 identity recheck 同构：spawn 前最后一刻复扫一次。
-  if ((await scanProjectSettingsWithPermissions(targetRoots)).length > 0) {
-    await releaseUnspawnedClaim();
-    return finish({
-      outcome: 'terminal_report',
-      reasons: ['a project settings file with a permissions block appeared inside a target root after the launch gate; refusing to spawn Claude'],
+      reasons: ['pre-dispatch verification failed before the executor was invoked; refusing to spawn Claude'],
     });
   }
 
@@ -868,6 +909,9 @@ export async function runClaudeAttempt({
     // 控制器累计对账 hookRuns 时只计 hookExpected=true 的候选 attempt。
     hookExpected: !normalized.budgetExhausted,
   });
+  } finally {
+    await releaseClaudeAttemptLease(attemptLease);
+  }
 }
 
 // claude 线只读观测通道（transcript readback）：不 spawn、不写盘、不把 transcript 字节放进
@@ -890,7 +934,10 @@ export async function runClaudeReadback({ stateDir }) {
   if (!isClaudePointer(pointer)) {
     return {
       available: false,
-      reasons: ['thread.json predates the pointer shape with transcriptPath: launch under the current adapter to enable readback'],
+      reasons: [isLegacyClaudePointer(pointer)
+        ? 'thread.json uses a legacy pointer schema; read it back with the original adapter, reconcile that '
+          + 'session, then start future work under a fresh controller state'
+        : 'thread.json has an unsupported pointer shape: launch under the current adapter to enable readback'],
     };
   }
   let st;
@@ -2386,11 +2433,7 @@ async function runCli() {
 // ContractArtifactError 的 message 只有 code+path；observed/expected/next 若只在字段里，launch CLI
 // 的操作员永远看不到（validate-contract.mjs 渲染、这边不渲染，V7'）。两边同一格式，单点在此。
 export function renderCliError(error) {
-  if (error?.code && error?.path && error?.expected && error?.next) {
-    return `${error.code} ${error.path} observed=${JSON.stringify(error.observed)} `
-      + `expected=${JSON.stringify(error.expected)} next=${JSON.stringify(error.next)}`;
-  }
-  return error?.message ?? String(error);
+  return renderContractDiagnostic(error);
 }
 
 // Node 默认对模块做 realpath 解析，而 process.argv[1] 保留调用者敲入的字面路径。只比字面路径时，

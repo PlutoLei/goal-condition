@@ -1,5 +1,5 @@
 import {
-  contractHash, readContract, renderPreview, validateContract,
+  contractHash, readContract, renderContractDiagnostic, renderPreview, validateContract,
 } from './lib/contract.mjs';
 
 const args = process.argv.slice(2);
@@ -15,7 +15,7 @@ if (!preview && !validateOnly) {
     const diagnostics = validateContract(contract);
     if (diagnostics.length > 0) {
       for (const item of diagnostics) {
-        console.error(`${item.code} ${item.path} observed=${JSON.stringify(item.observed)} expected=${JSON.stringify(item.expected)} next=${JSON.stringify(item.next)}`);
+        console.error(renderContractDiagnostic(item));
       }
       process.exitCode = 1;
     } else {
@@ -23,8 +23,9 @@ if (!preview && !validateOnly) {
       if (preview) console.log(renderPreview(contract));
     }
   } catch (error) {
-    if (error?.code && error?.path && error?.expected && error?.next) {
-      console.error(`${error.code} ${error.path} observed=${JSON.stringify(error.observed)} expected=${JSON.stringify(error.expected)} next=${JSON.stringify(error.next)}`);
+    if (error?.code !== undefined && error?.path !== undefined
+      && error?.expected !== undefined && error?.next !== undefined) {
+      console.error(renderContractDiagnostic(error));
     } else {
       console.error('CONTRACT_READ_FAILED contract observed="type=read_failure" expected="readable canonical JSON contract" next="supply a readable canonical JSON file"');
     }

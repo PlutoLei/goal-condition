@@ -1,6 +1,8 @@
 // Claude runtime adapter 纯函数。执行豁口在 scripts/launch.mjs；本文件不 spawn、不读写盘。
 
-import { join } from 'node:path';
+import {
+  isAbsolute, join, relative, sep,
+} from 'node:path';
 
 import {
   assertPermissionSpecifier, permissionRule, permissionSpecifierProblem,
@@ -168,7 +170,6 @@ export function buildSettings({
     ...(execution.skills ?? []),
     hookScriptPath,
     stateDir,
-    ...targetRoots,
   ]) assertPermissionSpecifier(value);
   const allow = [
     ...unique(execution.bash_prefixes ?? []).map((prefix) => permissionRule('Bash', `${prefix}:*`)),
@@ -180,10 +181,6 @@ export function buildSettings({
     ...canonicalTargets.slice(1),
     ...additionalReadRoots,
   ]);
-  const projectSettingsDeny = canonicalTargets.flatMap((root) => [
-    permissionRule('Edit', `/${join(root, '.claude', 'settings.json')}`),
-    permissionRule('Edit', `/${join(root, '.claude', 'settings.local.json')}`),
-  ]);
   return {
     hooks: { Stop: [{ hooks: [{ type: 'command', command: `node ${shellSingleQuote(hookScriptPath)}` }] }] },
     // S5 实测：Edit deny 对简单 Bash 重定向也有效（permission_denials 实录 tool_name:Bash），
@@ -194,7 +191,6 @@ export function buildSettings({
       deny: [
         permissionRule('Edit', `/${hookScriptPath}`),
         permissionRule('Edit', `/${stateDir}/**`),
-        ...projectSettingsDeny,
       ],
       additionalDirectories,
     },
@@ -220,6 +216,7 @@ export function launchSpec({ prompt, settingsPath, cwd, budget, sessionId }) {
   // （spike S-A 实测），预派不会静默串台。
   return {
     argv: ['claude', '-p', prompt, '--output-format', 'json', '--session-id', sessionId,
+      '--setting-sources', '',
       '--settings', settingsPath, '--permission-mode', 'acceptEdits',
       '--max-turns', String(effectiveMaxTurns(budget))],
     settingsPath, cwd, env_names: [],
@@ -231,6 +228,7 @@ export function resumeSpec({
 }) {
   return {
     argv: ['claude', '-p', diagnosticText, '--resume', sessionId, '--output-format', 'json',
+      '--setting-sources', '',
       '--settings', settingsPath, '--permission-mode', 'acceptEdits',
       '--max-turns', String(effectiveMaxTurns(budget))],
     settingsPath, cwd, env_names: [],
@@ -292,6 +290,10 @@ export function assertLaunchable(contract, probes) {
     reasons.push('claude --help does not advertise --session-id (or probes.json predates the '
       + 'capability probe): re-run prepare against a claude that supports controller-issued session ids');
   }
+  if (probes?.claudeSettingSourcesFlag !== true) {
+    reasons.push('claude --help does not advertise --setting-sources (or probes.json predates the capability '
+      + 'probe): re-run prepare against a claude that can exclude ambient project and user settings');
+  }
   if (settingsContainKey(probes?.settings, ['disableAllHooks', 'allowManagedHooksOnly'])) {
     reasons.push('settings must not disable or restrict hooks');
   }
@@ -306,7 +308,6 @@ export function assertLaunchable(contract, probes) {
     ...(contract?.execution_permissions?.skills ?? []),
     probes?.stateDir,
     hook?.path,
-    ...(probes?.targetRoots ?? []),
   ];
   if (permissionInputs.some((value) => permissionSpecifierProblem(value) !== null)) {
     reasons.push('a value entering the Claude permission specifier DSL is not representable');
@@ -324,23 +325,6 @@ export function assertLaunchable(contract, probes) {
   // 少了它 hook 脚本本身没被改、留痕却可以被抹掉。stateDir 缺失时拼不出规则，天然落红。
   if (!deny.includes(`Edit(/${probes?.stateDir}/**)`)) {
     reasons.push('settings must deny Edit on the whole controller state directory');
-  }
-  for (const root of probes?.targetRoots ?? []) {
-    for (const file of ['settings.json', 'settings.local.json']) {
-      const pathname = join(root, '.claude', file);
-      if (!deny.includes(`Edit(/${pathname})`)) {
-        reasons.push(`settings must deny Edit on ${pathname}`);
-      }
-    }
-  }
-  // Claude runtime union 掉 target root 内预存的 .claude/settings*.json 的 permissions 段，effective
-  // 授权面因此超出 controller 编译的 allow-list（spike 实证：预存 Bash(rm:*) 真生效）；deny 只护得住
-  // 「不被编辑」，护不住「被 union」。含 permissions 段的预存 settings 是唯一无法从 controller 侧中
-  // 和的 union 源，一律 fail-closed 拒绝（V4）。只设 model/hooks 的无害配置由采集器判定为不含
-  // permissions、不进这张清单。
-  for (const pathname of probes?.projectSettingsWithPermissions ?? []) {
-    reasons.push(`${pathname} ships a permissions block Claude would merge into the effective allow-list; `
-      + 'remove its permissions or use a target root without a project .claude settings file');
   }
   // allow/additionalDirectories 与 deny 一样属于 buildSettings 的消费面。这里独立重算期望形状，
   // 防的是生成器回归（生产路径的 settings 是现场重写，磁盘比对本身抓不到“稳定地产错”）。
@@ -365,19 +349,22 @@ export function assertLaunchable(contract, probes) {
     !== JSON.stringify(expectedAdditionalDirectories)) {
     reasons.push('settings additionalDirectories do not exactly match the canonical contract roots');
   }
-  if ((probes?.targetRoots ?? []).some((root) => typeof hook?.path === 'string' && hook.path.startsWith(`${root}/`))) {
-    reasons.push('hook script must live outside every target root');
-  }
-  // additional_read_roots 是授权给执行体的读面（进 settings.additionalDirectories）。指到 stateDir
-  // 的祖先/本身/内部或 hook 脚本，执行体（与控制器同 uid，文件 0600 挡不住同 uid 读）就能读
-  // hook-env.json——requires_env 凭证明文。全仓没有任何 Read deny 拦这条路（deny 只有 Edit），
-  // 唯一的闸在这里（V6'，fail-closed）。上一条只查 targetRoots，读根曾是漏检的对称缺口。
-  const coversEitherWay = (root, target) => typeof root === 'string' && typeof target === 'string'
-    && (root === target || target.startsWith(`${root}/`) || root.startsWith(`${target}/`));
-  for (const root of probes?.additionalReadRoots ?? []) {
-    if (coversEitherWay(root, probes?.stateDir) || coversEitherWay(root, hook?.path)) {
-      reasons.push('an additional read root overlaps the controller state directory or the hook script; '
-        + 'credentials and controller evidence must stay outside every authorized read root');
+  // target_roots 与 additional_read_roots 都是 Claude 可达面。任何一根与 controller state 互为
+  // 祖先（包括根目录 /）都会暴露 hook-env.json。用 path.relative 做 component-safe 包含判定，
+  // 避免字符串 `${root}/` 在 / 上退化成 //，也避免 /foo 与 /foobar 的前缀误判。
+  const containsPath = (parent, child) => {
+    if (typeof parent !== 'string' || typeof child !== 'string') return false;
+    const rel = relative(parent, child);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const authorizedRoots = [
+    ...(probes?.targetRoots ?? []),
+    ...(probes?.additionalReadRoots ?? []),
+  ];
+  for (const root of authorizedRoots) {
+    if (containsPath(root, probes?.stateDir) || containsPath(probes?.stateDir, root)) {
+      reasons.push('an authorized root overlaps the controller state directory; credentials and controller '
+        + 'evidence must stay outside every Claude-accessible root');
     }
   }
   // execution_permissions 编译的是自动授权，deny 保护的是 controller 与 Claude 项目配置；两者都

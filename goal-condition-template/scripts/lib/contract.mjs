@@ -52,6 +52,15 @@ export class ContractArtifactError extends Error {
   }
 }
 
+export function renderContractDiagnostic(error) {
+  if (error?.code !== undefined && error?.path !== undefined
+    && error?.expected !== undefined && error?.next !== undefined) {
+    return `${error.code} ${error.path} observed=${JSON.stringify(error.observed)} `
+      + `expected=${JSON.stringify(error.expected)} next=${JSON.stringify(error.next)}`;
+  }
+  return error?.message ?? String(error);
+}
+
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -450,17 +459,6 @@ export function validateContract(value) {
   const entryIds = new Set();
   validateContextSources(diagnostics, value.context_sources, entryIds);
   validatePathArray(diagnostics, value.target_roots, 'target_roots', { temporaryCode: 'TEMP_PATH', minItems: 1 });
-  if (value.runtime === 'claude' && Array.isArray(value.target_roots)) {
-    value.target_roots.forEach((entry, index) => {
-      if (typeof entry === 'string' && permissionSpecifierProblem(entry) !== null) {
-        diagnostics.push(diagnostic(
-          'PERMISSION_SPECIFIER_UNREPRESENTABLE', `target_roots[${index}]`, entry,
-          'target path representable inside one Claude Edit permission rule',
-          'use a target path without permission-rule delimiters',
-        ));
-      }
-    });
-  }
   validateCriteria(diagnostics, value.judgment_criteria, 'judgment_criteria', 'judgmentCriterion', entryIds);
   validateCriteria(diagnostics, value.success_criteria, 'success_criteria', 'successCriterion', entryIds);
   validateConstraints(diagnostics, value.constraints, entryIds);

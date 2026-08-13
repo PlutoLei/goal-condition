@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile as execFileCallback, execFileSync, spawn } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { existsSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
@@ -15,7 +15,8 @@ import { promisify } from 'node:util';
 import {
   MAX_AUTO_RESUMES, stateDirFor, initStateDir, nextAttempt, AttemptClaimError, classifyPostflightRed,
   compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, renderCliError, runClaudeAttempt,
-  runClaudeReadback, claudeTranscriptPath, readControllerJsonNoFollow,
+  runClaudeReadback, claudeTranscriptPath, readControllerJsonNoFollow, writeControllerJsonExclusive,
+  helpAdvertisesLongOption,
   prepareCodexProbesOnly, runCodexLaunch, runCodexReadback, runCodexResume, runCodexFinalize, runCodexClose,
   POLL_INTERVAL_MS, WALL_CLOCK_DEADLINE_MS, LEASE_TTL_MS, releaseOwnLease, releaseResidualLease,
   MAX_TURNS_PER_ATTEMPT, MAX_TOKENS_PER_ATTEMPT,
@@ -231,6 +232,7 @@ const stubCollect = async ({ hookScriptPath }) => {
     claudeVersionRaw: '2.1.223 (Claude Code)\n',
     claudeVersion: '2.1.223',
     claudeSessionIdFlag: true,
+    claudeSettingSourcesFlag: true,
     hookMode: (st.mode & 0o7777).toString(8).padStart(4, '0'),
     hookSha256: createHash('sha256').update(bytes).digest('hex'),
   };
@@ -312,14 +314,7 @@ test('prepareClaude compiles execution permissions with realpath-normalized root
     'Bash(git add:*)', 'WebFetch(domain:example.com)', 'Skill(review)',
   ]);
   assert.deepEqual(settings.permissions.additionalDirectories, [canonicalTargetReal, canonicalReferenceReal]);
-  for (const pathname of [
-    join(realpathSync(workDir), '.claude', 'settings.json'),
-    join(realpathSync(workDir), '.claude', 'settings.local.json'),
-    join(canonicalTargetReal, '.claude', 'settings.json'),
-    join(canonicalTargetReal, '.claude', 'settings.local.json'),
-  ]) {
-    assert.ok(settings.permissions.deny.includes(`Edit(/${pathname})`), pathname);
-  }
+  assert.deepEqual(settings.permissions.deny.filter((rule) => rule.includes('/.claude/settings')), []);
 });
 
 test('prepareClaude is reentrant on the same stateDir: a missing-env reject followed by a completed retry succeeds', async (t) => {
@@ -680,6 +675,29 @@ test('runClaudeAttempt fails closed on malformed launch and resume pointers with
   }
 });
 
+test('a legacy six-field Claude pointer gets an actionable migration diagnostic', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const target = realpathSync(contract.target_roots[0]);
+  await writeFile(join(stateDir, 'thread.json'), JSON.stringify({
+    sessionId: '11111111-1111-4111-8111-111111111111',
+    cwd: target,
+    promptSha256: 'a'.repeat(64),
+    transcriptPath: join(stateDir, 'legacy.jsonl'),
+    targetRoots: [target],
+    additionalReadRoots: [],
+  }));
+  const stub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume', execFileImpl: stub.impl,
+  });
+  assert.equal(result.outcome, 'terminal_report');
+  assert.equal(result.attemptNumber, null);
+  assert.ok(result.reasons.some((reason) => reason.includes('legacy pointer schema')));
+  assert.ok(result.reasons.some((reason) => reason.includes('fresh controller')));
+  assert.ok(result.reasons.every((reason) => !reason.includes('re-run prepare')));
+  assert.equal(stub.calls.length, 0);
+});
+
 test('runClaudeAttempt uses the canonical cwd even if the lexical target symlink is retargeted before dispatch', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'gc-canonical-cwd-'));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -704,9 +722,8 @@ test('runClaudeAttempt uses the canonical cwd even if the lexical target symlink
   assert.equal(result.outcome, 'candidate');
   const canonicalA = realpathSync(targetA);
   assert.equal(stub.calls[0].options.cwd, canonicalA);
-  const settings = JSON.parse(await readFile(join(setup.stateDir, 'settings.json'), 'utf8'));
-  assert.ok(settings.permissions.deny.includes(`Edit(/${join(canonicalA, '.claude', 'settings.json')})`));
-  assert.ok(!settings.permissions.deny.includes(`Edit(/${join(targetB, '.claude', 'settings.json')})`));
+  const sources = stub.calls[0].args.indexOf('--setting-sources');
+  assert.equal(stub.calls[0].args[sources + 1], '');
 });
 
 test('runClaudeAttempt rechecks canonical target identity immediately before dispatch', async (t) => {
@@ -733,10 +750,7 @@ test('runClaudeAttempt rechecks canonical target identity immediately before dis
   assert.equal(stub.calls.length, 0);
 });
 
-test('prepareClaude surfaces an unrepresentable permission specifier as a clean diagnostic (V7)', async (t) => {
-  // contract 层只校验 raw 字符串，但进权限 DSL 的是 realpath 后的值。realpath 含括号时 buildSettings
-  // 的 assertPermissionSpecifier 抛裸 TypeError，prepareClaude 未包 → 操作员拿到 exit-1 TypeError 而非
-  // 干净诊断（V7，DeepSeek 独有）。这里用字面含括号的 target root 触发同一条抛出路径。
+test('prepareClaude permits target roots with permission-DSL delimiters when they are not interpolated', async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'gc-v7-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const badTarget = join(root, 'has(paren)');
@@ -749,20 +763,18 @@ test('prepareClaude surfaces an unrepresentable permission specifier as a clean 
     else process.env.GC_LAUNCH_TEST_TOKEN = previousToken;
   });
   const contract = makeContract({ target_roots: [badTarget] });
-  await assert.rejects(
+  await assert.doesNotReject(
     () => prepareClaude({ contract, contractPath: '/x', stateDir, collect: stubCollect }),
-    (err) => err instanceof ContractArtifactError,
   );
 });
 
-test('prepareClaude only wraps representability TypeErrors; genuine buildSettings bugs surface raw (V7\')', async (t) => {
-  // catch{} 会把 buildSettings 的任何 throw 都标成 PERMISSION_SPECIFIER_UNREPRESENTABLE——
-  // 真 bug（TypeError 之外的一切）被误诊成权限 DSL 问题，操作员被引去改一个没毛病的 contract。
-  // 包装只该罩住 assertPermissionSpecifier 的 TypeError 路径，其余原样 rethrow。
+test('prepareClaude wraps only PermissionSpecifierError; genuine TypeErrors surface raw (V7\')', async (t) => {
+  // instanceof TypeError 仍会吞掉最常见的程序错误。只有 assertPermissionSpecifier 的专用错误类型
+  // 才能改写成 contract 诊断；普通 TypeError 必须保持身份原样上浮。
   const root = await mkdtemp(join(tmpdir(), 'gc-v7-rethrow-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const stateDir = stateDirFor({ stateRoot: root, contractHash: 'a'.repeat(64) });
-  const boom = new RangeError('genuine buildSettings bug');
+  const boom = new TypeError('genuine buildSettings bug');
   const contract = makeContract({
     postflight: [{ id: 'pf', type: 'command', cwd: workDir, argv: ['node', '-e', 'process.exit(0)'] }],
     execution_permissions: {
@@ -772,6 +784,25 @@ test('prepareClaude only wraps representability TypeErrors; genuine buildSetting
   });
   await assert.rejects(
     () => prepareClaude({ contract, contractPath: '/x', stateDir, collect: stubCollect }),
+    (error) => error === boom,
+  );
+});
+
+test('runClaudeAttempt does not misreport a programmer TypeError as a bad permission specifier', async (t) => {
+  const contract = makeContract();
+  const setup = await setupClaudeState(t, { contract });
+  const boom = new TypeError('genuine launch-time buildSettings bug');
+  const poisoned = {
+    ...contract,
+    execution_permissions: {
+      get webfetch_domains() { throw boom; },
+    },
+  };
+  await assert.rejects(
+    () => runClaudeAttempt({
+      ...setup, contract: poisoned, prompt: 'OBJECTIVE TEXT', kind: 'launch',
+      execFileImpl: stubEchoing(claudeResultFixture).impl,
+    }),
     (error) => error === boom,
   );
 });
@@ -809,6 +840,45 @@ test('readControllerJsonNoFollow keeps the missing signal when O_NOFOLLOW is una
   assert.equal(present.ok, false);
   assert.equal(present.missing, false);
   assert.ok(!('value' in present));
+});
+
+test('writeControllerJsonExclusive removes a partial file after an owned post-open write failure', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-exclusive-json-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pathname = join(root, 'thread.json');
+  await assert.rejects(
+    () => writeControllerJsonExclusive(pathname, { schemaVersion: 2 }, {
+      writeImpl: async (handle) => {
+        await handle.writeFile('{');
+        throw new Error('fault after exclusive open');
+      },
+    }),
+    /fault after exclusive open/,
+  );
+  assert.equal(existsSync(pathname), false, 'an owned partial pointer must not poison later launches');
+});
+
+test('failed controller JSON publication never deletes a foreign final-path replacement', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-exclusive-json-replace-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pathname = join(root, 'thread.json');
+  await assert.rejects(
+    () => writeControllerJsonExclusive(pathname, { schemaVersion: 2 }, {
+      writeImpl: async (handle) => {
+        await handle.writeFile('{');
+        await writeFile(pathname, 'foreign replacement', { flag: 'wx' });
+        throw new Error('fault after foreign replacement');
+      },
+    }),
+  );
+  assert.equal(await readFile(pathname, 'utf8'), 'foreign replacement');
+});
+
+test('help capability probes require the exact long option token', () => {
+  assert.equal(helpAdvertisesLongOption('  --setting-sources <sources>  select sources\n', '--setting-sources'), true);
+  assert.equal(helpAdvertisesLongOption('  --setting-sources=<sources>\n', '--setting-sources'), true);
+  assert.equal(helpAdvertisesLongOption('  --setting-sources-file <path>\n', '--setting-sources'), false);
+  assert.equal(helpAdvertisesLongOption('text mentions --setting-sources-compatible only\n', '--setting-sources'), false);
 });
 
 test('resume refuses when the target root canonical path changed since launch (V2)', async (t) => {
@@ -881,9 +951,36 @@ test('resume refuses when secondary target roots or read roots changed since lau
   assert.equal(resumeStub.calls.length, 0);
 });
 
-test('runClaudeAttempt refuses a target root that ships permissioned project settings (V4)', async (t) => {
-  // 端到端：现场采集必须真的读到 target root 内的 .claude/settings.local.json、认出 permissions 段、
-  // 交给闸落红并且一次都不 spawn。纯函数单测只证判定逻辑，采集接线要这条兜（V4）。
+test('resume refuses when a root is replaced at the same canonical path since launch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-resume-root-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  const oldTarget = join(root, 'target-old');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+
+  const launched = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stubEchoing(claudeResultFixture).impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+
+  const { rename } = await import('node:fs/promises');
+  await rename(target, oldTarget);
+  await mkdir(target); // canonical string unchanged, device/inode changed
+
+  const resumeStub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    ...setup, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: resumeStub.impl,
+  });
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('identity changed since launch')));
+  assert.equal(resumeStub.calls.length, 0);
+});
+
+test('runClaudeAttempt excludes ambient project settings and launches only with flag settings (V4)', async (t) => {
+  // 项目 settings 即使含扩权 permissions 也不再是加载源；argv 用 --setting-sources "" 关闭
+  // user/project/local，只保留 Controller 通过 --settings 提供的 flagSettings（以及不可关闭的 policy）。
   const root = await mkdtemp(join(tmpdir(), 'gc-v4-preexisting-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const target = join(root, 'target');
@@ -897,54 +994,11 @@ test('runClaudeAttempt refuses a target root that ships permissioned project set
     ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
   });
 
-  assert.equal(result.outcome, 'terminal_report');
-  assert.ok(result.reasons.some((reason) => reason.includes('permissions')));
-  assert.equal(stub.calls.length, 0);
-
-  // 无害的、不含 permissions 段的预存 settings（只设 model 之类）不拦。
-  await writeFile(join(target, '.claude', 'settings.local.json'), JSON.stringify({ model: 'claude-opus-4' }));
-  const ok = await runClaudeAttempt({
-    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stubEchoing(claudeResultFixture).impl,
-  });
-  assert.equal(ok.outcome, 'candidate');
-});
-
-test('unsafe project settings files are flagged fail-closed without content reads (V4-DoS)', async (t) => {
-  // scan 读的是 target root 内攻击者可控的内容：裸 readFile 撞上 FIFO 就在入口闸挂死（open
-  // O_RDONLY 等 writer），撞上 symlink→/dev/zero 就读到 OOM。安全读法 = O_NOFOLLOW|O_NONBLOCK
-  // + fstat regular file + size cap；打不开/形态不对/超限一律保守 flag——无法证明它不含
-  // permissions（fail-closed），与解析失败同一待遇。
-  const root = await mkdtemp(join(tmpdir(), 'gc-v4-dos-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const cases = [];
-  // ① symlink：即使指向无害真实文件也拒——no-follow 纪律下「安全地读它」无法成立。
-  const symlinkTarget = join(root, 'target-symlink');
-  await mkdir(join(symlinkTarget, '.claude'), { recursive: true });
-  await writeFile(join(root, 'innocent.json'), JSON.stringify({ model: 'claude-opus-4' }));
-  await symlink(join(root, 'innocent.json'), join(symlinkTarget, '.claude', 'settings.json'));
-  cases.push(['symlink', symlinkTarget]);
-  // ② FIFO：open O_RDONLY 在无 writer 时永久阻塞，是挂死整个 launch 的原语。
-  const fifoTarget = join(root, 'target-fifo');
-  await mkdir(join(fifoTarget, '.claude'), { recursive: true });
-  execFileSync('mkfifo', [join(fifoTarget, '.claude', 'settings.json')]);
-  cases.push(['fifo', fifoTarget]);
-  // ③ 超过 size cap 的 regular file：内容是无害 JSON 也拒，cap 挡的是「读到死」这一类。
-  const bigTarget = join(root, 'target-big');
-  await mkdir(join(bigTarget, '.claude'), { recursive: true });
-  await writeFile(join(bigTarget, '.claude', 'settings.json'),
-    JSON.stringify({ model: 'claude-opus-4', pad: 'a'.repeat(256 * 1024) }));
-  cases.push(['oversized', bigTarget]);
-
-  for (const [label, target] of cases) {
-    const contract = makeContract({ target_roots: [target] });
-    const setup = await setupClaudeState(t, { contract });
-    const stub = stubEchoing(claudeResultFixture);
-    const result = await runClaudeAttempt({
-      ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
-    });
-    assert.equal(result.outcome, 'terminal_report', `${label} must fail closed`);
-    assert.equal(stub.calls.length, 0, `${label} must never spawn`);
-  }
+  assert.equal(result.outcome, 'candidate');
+  assert.equal(stub.calls.length, 1);
+  const sources = stub.calls[0].args.indexOf('--setting-sources');
+  assert.ok(sources >= 0);
+  assert.equal(stub.calls[0].args[sources + 1], '');
 });
 
 test('runClaudeAttempt rechecks additional_read_roots identity before dispatch (V6)', async (t) => {
@@ -979,73 +1033,12 @@ test('runClaudeAttempt rechecks additional_read_roots identity before dispatch (
   assert.equal(stub.calls.length, 0);
 });
 
-test('a permissioned settings.local.json at the enclosing git root blocks a subdirectory target root (CR-5)', async (t) => {
-  // 官方文档 + 2.1.229 deny 探针实证：settings.local.json 自 2.1.211 起从 enclosing git root 加载
-  // （settings.json 则只看 cwd、不向上）。target root 是仓库子目录时，加载面越出 target root——
-  // 扫描必须跟着加载面走，否则 git root 的预存 permissions 是 V4 闸的绕过通道。
-  const root = await mkdtemp(join(tmpdir(), 'gc-cr5-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const repo = join(root, 'repo');
-  const target = join(repo, 'sub', 'target');
-  await mkdir(target, { recursive: true });
-  execFileSync('git', ['init', '-q', repo]);
-  await mkdir(join(repo, '.claude'), { recursive: true });
-  await writeFile(join(repo, '.claude', 'settings.local.json'),
-    JSON.stringify({ permissions: { allow: ['Bash(rm:*)'] } }));
-  const contract = makeContract({ target_roots: [target] });
-  const setup = await setupClaudeState(t, { contract });
-  const stub = stubEchoing(claudeResultFixture);
-
-  const result = await runClaudeAttempt({
-    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
-  });
-  assert.equal(result.outcome, 'terminal_report');
-  assert.ok(result.reasons.some((reason) => reason.includes('permissions')));
-  assert.equal(stub.calls.length, 0, 'must never spawn under an unscanned unioned allow surface');
-
-  // 对照：git root 的 settings.json（实测不向上加载）不拦——扫描范围精确对应加载面，
-  // 过度保守会把「祖先仓库带无关 project settings」的合法形态永久判红。
-  await rm(join(repo, '.claude', 'settings.local.json'));
-  await writeFile(join(repo, '.claude', 'settings.json'),
-    JSON.stringify({ permissions: { allow: ['Bash(rm:*)'] } }));
-  const ok = await runClaudeAttempt({
-    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stubEchoing(claudeResultFixture).impl,
-  });
-  assert.equal(ok.outcome, 'candidate');
-});
-
-test('a permissioned project settings file planted after the launch gate still blocks the spawn (V4-TOCTOU)', async (t) => {
-  // 早扫在 claim/beforeDispatch 之前跑：之后才种进 target root 的 permissioned settings 不改目录
-  // inode（identity 复核照常通过），却会被 Claude runtime union 进 effective 权限。与 identity
-  // recheck 同构，spawn 前最后一刻必须复扫一次。
-  const root = await mkdtemp(join(tmpdir(), 'gc-v4-toctou-'));
-  t.after(() => rm(root, { recursive: true, force: true }));
-  const target = join(root, 'target');
-  await mkdir(target);
-  const contract = makeContract({ target_roots: [target] });
-  const setup = await setupClaudeState(t, { contract });
-  const stub = stubEchoing(claudeResultFixture);
-
-  const result = await runClaudeAttempt({
-    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
-    beforeDispatch: async () => {
-      await mkdir(join(target, '.claude'), { recursive: true });
-      await writeFile(join(target, '.claude', 'settings.local.json'),
-        JSON.stringify({ permissions: { allow: ['Bash(*)'] } }));
-    },
-  });
-
-  assert.equal(result.outcome, 'terminal_report');
-  assert.ok(result.reasons.some((reason) => reason.includes('permissions')));
-  assert.equal(stub.calls.length, 0, 'the executor must never spawn against a permissioned target root');
-});
-
 test('a failed pre-spawn recheck releases the fresh pointer so retry launches are not poisoned (PR2-3)', async (t) => {
   // identity 复核必须贴着 spawn（挪到写 pointer 之前会重开 claim→spawn 的 TOCTOU 窗口），这个
   // 位置是 deliberate；但复核失败时没有 spawn 任何会话，pointer 指向一个从未存在的 session。
   // 留着它，下一次 launch 被「already claimed」拒、resume 指向不存在的会话——正常 retry 路径
-  // 被毒化。launch 的 spawn 前失败路径释放本次写的 pointer（attempt 号不回收：O_EXCL 计数只进
-  // 不退是并发裁决的保守方向，烧一个号换 fail-safe）。
+  // 被毒化。没有调用执行器的失败既要释放 pointer，也要释放本进程刚占的 attempt slot；配额定义的
+  // 是真实 dispatch，不是前置闸撞了几次。
   const root = await mkdtemp(join(tmpdir(), 'gc-pr23-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const target = join(root, 'target');
@@ -1067,6 +1060,7 @@ test('a failed pre-spawn recheck releases the fresh pointer so retry launches ar
   assert.ok(failed.reasons.some((reason) => reason.includes('identity changed')));
   assert.equal(stub.calls.length, 0);
   assert.ok(!existsSync(join(setup.stateDir, 'thread.json')), 'the unspawned pointer must be released');
+  assert.deepEqual(await readdir(join(setup.stateDir, 'attempts')), [], 'no dispatch means no spent attempt');
 
   // retry 不被毒化：换回稳定的 target root 后，同一 state dir 的下一次 launch 正常起飞。
   const retryStub = stubEchoing(claudeResultFixture);
@@ -1074,6 +1068,85 @@ test('a failed pre-spawn recheck releases the fresh pointer so retry launches ar
     ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: retryStub.impl,
   });
   assert.equal(retry.outcome, 'candidate');
+  assert.equal(retry.attemptNumber, 1);
+  assert.equal(retryStub.calls.length, 1);
+});
+
+test('three throwing beforeDispatch hooks spend no attempts and do not poison a later launch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-before-dispatch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  for (let round = 0; round < 3; round += 1) {
+    const result = await runClaudeAttempt({
+      ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+      beforeDispatch: async () => { throw new Error('pre-dispatch fixture failure'); },
+    });
+    assert.equal(result.outcome, 'terminal_report');
+    assert.equal(stub.calls.length, 0);
+    assert.equal(existsSync(join(setup.stateDir, 'thread.json')), false);
+    assert.deepEqual(await readdir(join(setup.stateDir, 'attempts')), []);
+  }
+
+  const launched = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+  assert.equal(launched.attemptNumber, 1);
+  assert.equal(stub.calls.length, 1);
+});
+
+test('a Claude attempt lease blocks a concurrent resume and preserves the retry budget', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const launchStub = stubEchoing(claudeResultFixture);
+  const launched = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: launchStub.impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+
+  let markEntered;
+  let releaseBarrier;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+  const firstResume = runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume',
+    execFileImpl: stubEchoing(claudeResultFixture).impl,
+    beforeDispatch: async () => {
+      markEntered();
+      await barrier;
+      throw new Error('fault before dispatch');
+    },
+  });
+  await entered;
+  const settingsPath = join(stateDir, 'settings.json');
+  const settingsBefore = await readFile(settingsPath, 'utf8');
+  const settingsInodeBefore = (await lstat(settingsPath)).ino;
+
+  await assert.rejects(
+    () => runClaudeAttempt({
+      contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume',
+      execFileImpl: stubEchoing(claudeResultFixture).impl,
+    }),
+    /CLAUDE_ATTEMPT_IN_PROGRESS/,
+  );
+  assert.equal(await readFile(settingsPath, 'utf8'), settingsBefore);
+  assert.equal((await lstat(settingsPath)).ino, settingsInodeBefore,
+    'a blocked concurrent invocation must not republish the active attempt settings');
+  releaseBarrier();
+  const failed = await firstResume;
+  assert.equal(failed.outcome, 'terminal_report');
+  assert.equal(failed.attemptNumber, null);
+
+  const retryStub = stubEchoing(claudeResultFixture);
+  const retried = await runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume', execFileImpl: retryStub.impl,
+  });
+  assert.equal(retried.outcome, 'candidate');
+  assert.equal(retried.attemptNumber, 2);
   assert.equal(retryStub.calls.length, 1);
 });
 
@@ -1167,8 +1240,10 @@ test('runClaudeReadback reports liveness and prompt attribution without leaking 
   const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
   const { stateDir } = await plantReadbackState({
     pointer: {
+      schemaVersion: 2,
       sessionId: READBACK_UUID_1, cwd: '/work/root', promptSha256,
       targetRoots: ['/work/root'], additionalReadRoots: [],
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
     },
     transcriptLines: [
       { type: 'queue-operation' },
@@ -1195,8 +1270,10 @@ test('runClaudeReadback reports liveness and prompt attribution without leaking 
 test('runClaudeReadback maps an arbitrary transcript type to a fixed privacy-safe enum', async () => {
   const { stateDir } = await plantReadbackState({
     pointer: {
+      schemaVersion: 2,
       sessionId: READBACK_UUID_1, cwd: '/work/root', promptSha256: 'a'.repeat(64),
       targetRoots: ['/work/root'], additionalReadRoots: [],
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
     },
     transcriptLines: [{ type: 'SECRET TYPE BYTES must not escape' }],
   });
@@ -1209,8 +1286,10 @@ test('runClaudeReadback maps an arbitrary transcript type to a fixed privacy-saf
 test('runClaudeReadback handles array-form user content and flags a mismatched prompt', async () => {
   const { stateDir } = await plantReadbackState({
     pointer: {
+      schemaVersion: 2,
       sessionId: READBACK_UUID_2, cwd: '/w', promptSha256: 'a'.repeat(64),
       targetRoots: ['/w'], additionalReadRoots: [],
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
     },
     transcriptLines: [{ type: 'user', message: { content: [{ type: 'text', text: 'something else' }] } }],
   });
@@ -1234,8 +1313,10 @@ test('runClaudeReadback fails open on every unavailable shape', async () => {
   // 指针形态齐全但 transcript 不在（slug 规则漂移或会话未起）。
   const gone = await plantReadbackState({
     pointer: {
+      schemaVersion: 2,
       sessionId: READBACK_UUID_3, cwd: '/w', promptSha256: 'a'.repeat(64),
       targetRoots: ['/w'], additionalReadRoots: [], transcriptPath: join(empty, 'nope.jsonl'),
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
     },
   });
   const goneReport = await runClaudeReadback({ stateDir: gone.stateDir });

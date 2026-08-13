@@ -200,7 +200,7 @@ test('buildStopHook maps user budget into embedded limits', () => {
   assert.match(noBudget.script, /maxWallMs = null/);
 });
 
-test('buildSettings compiles contract permissions and protects controller and project settings', () => {
+test('buildSettings compiles contract permissions and protects controller state', () => {
   const contract = {
     ...hookContract,
     target_roots: ['/work/root-link', '/work/other-link'],
@@ -227,27 +227,17 @@ test('buildSettings compiles contract permissions and protects controller and pr
   assert.deepEqual(settings.permissions.additionalDirectories, ['/work/other-real', '/reference/real']);
   assert.deepEqual(settings.permissions.deny, [
     'Edit(//state/dir/stop-hook.mjs)', 'Edit(//state/dir/**)',
-    'Edit(//work/root-real/.claude/settings.json)',
-    'Edit(//work/root-real/.claude/settings.local.json)',
-    'Edit(//work/other-real/.claude/settings.json)',
-    'Edit(//work/other-real/.claude/settings.local.json)',
   ]);
   assert.equal(JSON.stringify(settings).includes('disableAllHooks'), false);
 });
 
-test('assertLaunchable rejects target roots that ship project settings with a permissions block (V4)', () => {
-  // Claude runtime 会把 target root 内预存的 .claude/settings*.json union 进 effective 权限（spike
-  // 实证：预存 Bash(rm:*) 真的生效），controller 的「精确匹配 allow-list」因此是假保证。现场采集
-  // 到含 permissions 段的预存 settings 即 fail-closed 拒绝 launch（V4，code-review 独有 P1）。
-  const probes = {
+test('assertLaunchable does not depend on ambient project-settings inspection', () => {
+  // launchSpec 用 --setting-sources "" 从加载面移除 user/project/local；受控 --settings 仍作为
+  // flagSettings 加载。项目 settings 因而不是判定输入，也不需要竞态扫描器。
+  assert.deepEqual(assertLaunchable(hookContract, {
     ...goodProbes,
     projectSettingsWithPermissions: ['/work/root/.claude/settings.local.json'],
-  };
-  const verdict = assertLaunchable(hookContract, probes);
-  assert.equal(verdict.ok, false);
-  assert.ok(verdict.reasons.some((r) => r.includes('permissions') && r.includes('.claude')));
-  // 不含 permissions 段的无害预存 settings（空数组）不拦。
-  assert.deepEqual(assertLaunchable(hookContract, { ...goodProbes, projectSettingsWithPermissions: [] }), { ok: true, reasons: [] });
+  }), { ok: true, reasons: [] });
 });
 
 test('postflight verifiers never enter the Bash allow-list (V5\')', () => {
@@ -296,7 +286,6 @@ test('buildSettings rejects every unrepresentable value interpolated into permis
   const cases = [
     { hookScriptPath: '/state/bad)/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'] },
     { hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/bad)', targetRoots: ['/work/root'] },
-    { hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/bad) Bash(evil'] },
     {
       contract: { ...hookContract, execution_permissions: { bash_prefixes: ['safe) Bash(evil'] } },
       hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
@@ -311,6 +300,7 @@ const goodProbes = Object.freeze({
   contractHash: 'a'.repeat(64), confirmedHash: 'a'.repeat(64), baselineDigestStored: true,
   claudeVersion: '2.1.223',
   claudeSessionIdFlag: true,
+  claudeSettingSourcesFlag: true,
   settings: buildSettings({
     contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
     targetRoots: ['/work/root'],
@@ -340,6 +330,7 @@ test('launchSpec/resumeSpec are pure argv data with settings pinned', () => {
   });
   assert.deepEqual(spec.argv, ['claude', '-p', 'OBJECTIVE TEXT', '--output-format', 'json',
     '--session-id', 'sid-launch',
+    '--setting-sources', '',
     '--settings', '/state/dir/settings.json', '--permission-mode', 'acceptEdits',
     '--max-turns', String(DEFAULT_MAX_TURNS)]);
   const resume = resumeSpec({ sessionId: 'sid-1', settingsPath: '/state/dir/settings.json',
@@ -384,6 +375,7 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
     { ...goodProbes, baselineDigestStored: false },
     { ...goodProbes, claudeVersion: '2.1.222' },                      // 低于实测下限的旧版本
     { ...goodProbes, claudeSessionIdFlag: false },                    // --help 探测不到 --session-id
+    { ...goodProbes, claudeSettingSourcesFlag: false },               // 隔离环境 settings 的能力缺失
     (() => { const p = { ...goodProbes }; delete p.claudeSessionIdFlag; return p; })(),  // 旧 probes.json 缺探测值
     { ...goodProbes, settings: { ...goodProbes.settings, disableAllHooks: true } },
     { ...goodProbes, settings: { hooks: goodProbes.settings.hooks, permissions: { deny: [] } } },  // 缺 deny
@@ -400,15 +392,14 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
   }
 });
 
-test('additional read roots must not cover controller state or the hook script (V6\')', () => {
-  // additional_read_roots 进 settings.additionalDirectories，是授权给执行体的读面。指到 stateDir
-  // 的祖先/本身/内部或 hook 脚本，执行体（与控制器同 uid，0600 挡不住）就能读 hook-env.json——
-  // requires_env 凭证明文。全仓没有任何 Read deny 拦这条路，唯一的闸在 launch 前置判定。
+test('every authorized root must be disjoint from controller state (V6\')', () => {
+  // target_roots 与 additional_read_roots 都是执行体可达面。任一根与 stateDir 有包含关系，执行体
+  // （与控制器同 uid，0600 挡不住）就能读 hook-env.json。根目录 / 是最强反例，必须命中同一判据。
   const cases = [
+    ['/', 'the filesystem root'],
     ['/state', 'an ancestor of the state dir'],
     ['/state/dir', 'the state dir itself'],
     ['/state/dir/attempts', 'a directory inside the state dir'],
-    ['/state/dir/stop-hook.mjs', 'the hook script itself'],
   ];
   for (const [root, label] of cases) {
     const settings = buildSettings({
@@ -419,8 +410,18 @@ test('additional read roots must not cover controller state or the hook script (
       ...goodProbes, settings, additionalReadRoots: [root],
     });
     assert.equal(verdict.ok, false, `${label} must be rejected`);
-    assert.ok(verdict.reasons.some((reason) => reason.includes('read root')), label);
+    assert.ok(verdict.reasons.some((reason) => reason.includes('authorized root overlaps')), label);
   }
+  const targetInsideState = '/state/dir/work';
+  const targetSettings = buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: [targetInsideState], additionalReadRoots: [],
+  });
+  const targetVerdict = assertLaunchable(hookContract, {
+    ...goodProbes, settings: targetSettings, targetRoots: [targetInsideState], additionalReadRoots: [],
+  });
+  assert.equal(targetVerdict.ok, false);
+  assert.ok(targetVerdict.reasons.some((reason) => reason.includes('authorized root overlaps')));
   // 与 controller state 无关的读根照常放行。
   const harmless = buildSettings({
     contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
@@ -535,16 +536,6 @@ test('assertLaunchable also verifies the state-directory deny rule, not just the
   const noStateDir = { ...goodProbes };
   delete noStateDir.stateDir;
   assert.equal(assertLaunchable(hookContract, noStateDir).ok, false);
-});
-
-test('assertLaunchable verifies every generated project-settings deny', () => {
-  const settings = structuredClone(goodProbes.settings);
-  settings.permissions.deny = settings.permissions.deny
-    .filter((rule) => rule !== 'Edit(//work/root/.claude/settings.local.json)');
-  const verdict = assertLaunchable(hookContract, { ...goodProbes, settings });
-  assert.deepEqual(verdict.reasons, [
-    'settings must deny Edit on /work/root/.claude/settings.local.json',
-  ]);
 });
 
 // 终审 I3 修的是行为（此前 contract 声明任何 physical 约束都零核验放行），N1 修的是诊断：旧判据
