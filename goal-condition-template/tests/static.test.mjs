@@ -264,6 +264,27 @@ test('public docs expose the external release trust root and complete required c
   }
 });
 
+test('public docs separate release integrity from runtime certification end to end', () => {
+  const readme = read(join(repositoryRoot, 'README.md'));
+  const skill = read(skillPath);
+  const runContract = read(join(referencesRoot, 'run-contract.md'));
+  const claude = read(join(referencesRoot, 'adapters/claude.md'));
+  const codex = read(join(referencesRoot, 'adapters/codex.md'));
+  const protocol = read(join(referencesRoot, 'codex-goal-session-v2.md'));
+  const production = `${readme}\n${skill}\n${runContract}\n${claude}\n${codex}\n${protocol}`;
+  for (const term of [
+    'release integrity', 'runtime certification', 'stage', 'activate',
+    'Candidate', 'Certified', 'certify-claude-prepare', 'certify-claude-run',
+    '完整 preview', 'exact hash', 'Git checkout', 'external manifest v2',
+    'schema-v5', 'runtime_surface_digest', '实现、测试、review、Claude live certification',
+  ]) {
+    assert.ok(production.includes(term), `runtime certification docs are missing ${term}`);
+  }
+  assert.match(readme, /Codex runtime surface digest/);
+  assert.match(readme, /source checkout.*不能.*staged|checkout.*不能.*installed/s);
+  assert.doesNotMatch(readme, /receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary/);
+});
+
 test('every current release verify example requires the external manifest digest', () => {
   const markdownSources = [
     join(repositoryRoot, 'README.md'),

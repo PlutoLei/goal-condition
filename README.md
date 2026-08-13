@@ -85,13 +85,17 @@ Claude 与 Codex 共用底层 snapshot、launcher 安全能力，但不再共用
 
 Claude 使用 controller-owned `runBinding`、`preflightEvidence` 与 `postflightEvidence`。Codex V2 由独立 controller 绑定 Authorization、Design Revision、AttemptManifest、LaunchIntent、Evidence、turn receipt 与 runtime readback。候选不得伪造任一控制器证据；任何缺项、乱序、cross-binding、旁路、权限错误或 remaining work 都 fail closed。
 
+整包 `release integrity` 与供应商原生 `runtime certification` 是两份状态。manifest schema v2 的外部摘要证明整个 release 未漂移；Claude/Codex runtime surface digest 只决定相应运行时认证何时失效。代码完成也不等于已经投产：实现、测试、review、Claude live certification、push、merge、install、release 与 production effect 必须分别报告。
+
+Claude 普通 launch 只接受与当前 source、Claude runtime surface、CLI/OS/arch、auth mode 和 opaque auth context 精确匹配的 Certified state；缺失或漂移只得到 Candidate，并在任何 attempt、settings、pointer、lease 或进程副作用前阻断。唯一入口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 明确确认 exact hash → `certify-claude-run`。开发态 Git checkout receipt 绑定 checkout 的 realpath 与 commit，source checkout 认证不能转移给 staged 或 installed 的 external manifest v2 release；生产认证必须直接针对待激活的 staged release。
+
 ### Codex GoalSession v2
 
 Codex 只使用 GoalSession v2：用户只确认稳定 Goal 与 Maximum Authority，Boundary、Condition 与 content-bound Context 在授权内以 typed Design Revision 演化，每次 revision 产生新的 immutable Attempt。controller 不可用或 V2 gate 关闭时 fail closed，不回退到旧 Codex lifecycle。旧 contract 只能通过 `migrate-v1` 生成未确认 V2 Draft。Grill 只用于设计评审，不进入 runtime。Context path 必须在 Active Boundary 内；无 `write` Authority 的 Attempt 使用 `read-only` sandbox，获授 `write` 才使用 `workspace-write`。
 
 机器级 store 的 session/run 主键由 controller 生成；调用方用已知的 128-bit `request_id`/`nonce` 绑定创建请求，creation receipt 与 session，或与 LaunchIntent + lease，在同一事务提交。响应丢失后重发完全相同的输入会找回原 ID，同 key 改输入 fail closed。`resume` 只完成这次 durable prepare 并返回 run ID，显式 `launch` 才启动 runtime，避免 runtime 初始化失败吞掉唯一可寻址结果。
 
-LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；`canary→enabled` 的 receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary，不能复用旧版本绿证据。
+LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；schema-v5 同时记录当前整包 manifest 与 Codex runtime surface digest。只有 Claude/release-only 文件变化时刷新整包审计身份并保留 Codex 认证；Codex/shared runtime surface 变化时清 receipt、自动降为 `canary`。旧 schema-v4 live 状态也一律降为 schema-v5 `canary`，不能把整包摘要冒充运行时认证。
 
 ## 安装与私有 profile
 
