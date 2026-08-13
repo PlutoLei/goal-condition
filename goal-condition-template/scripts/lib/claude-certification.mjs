@@ -280,14 +280,15 @@ export function classifyClaudeCanaryBlocker(result) {
   const message = String(result?.message ?? result?.error?.message ?? '');
   const reasons = Array.isArray(result?.reasons) ? result.reasons.join(' ') : '';
   const apiStatus = Number(result?.api_error_status ?? result?.status);
-  const structured = (() => {
-    try { return canonicalJson(result); } catch { return ''; }
-  })();
+  // 词表只匹配错误载体字段的闭集（code/message/reasons/errors），不匹配整包序列化：
+  // 2.1.231 起健康 envelope 的 modelUsage 自带 "provider":"firstParty"，整包 grep 会把
+  // 每一份正常 control report 误判成 provider 阻塞（实测 2026-08-13，认证因此永远 blocked）。
+  const errorTexts = Array.isArray(result?.errors) ? result.errors.map(String).join(' ') : '';
   if (apiStatus === 429
     || apiStatus >= 500
     || result?.provider_error === true
     || /(?:rate.?limit|quota|subscription|session.?limit|provider|overloaded|network|timeout|ECONN|ENET|EAI_AGAIN)/i
-      .test(`${code} ${message} ${reasons} ${structured}`)) return 'blocked';
+      .test(`${code} ${message} ${reasons} ${errorTexts}`)) return 'blocked';
   if (result?.outcome === 'candidate_rejected') return 'candidate_rejected';
   return result instanceof Error ? 'controller_error' : 'candidate_rejected';
 }

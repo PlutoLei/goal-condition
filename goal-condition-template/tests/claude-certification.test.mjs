@@ -134,6 +134,25 @@ test('quota, subscription, session, network, and provider failures classify bloc
   }, compile()).outcome, 'blocked');
 });
 
+test('healthy envelope metadata never classifies blocked and exact denial is observed', () => {
+  // 实测 2026-08-13：2.1.231 健康 envelope 的 modelUsage 带 "provider":"firstParty"，
+  // 旧实现对整包序列化 grep 词表，每一份正常 control report 都被误判 blocked，认证永远起不来。
+  const compiled = compile();
+  const healthy = {
+    subtype: 'error_max_turns', is_error: true, terminal_reason: 'max_turns',
+    errors: ['Reached maximum number of turns (1)'],
+    modelUsage: { 'claude-fable-5': { inputTokens: 2, outputTokens: 420, provider: 'firstParty' } },
+    permission_denials: [{
+      tool_name: 'Read', tool_use_id: 'toolu_x',
+      tool_input: { file_path: `${compiled.profile.target_root}/sentinel.input` },
+    }],
+  };
+  assert.notEqual(classifyClaudeCanaryBlocker(healthy), 'blocked');
+  const interpreted = interpretClaudeControlReport(healthy, compiled);
+  assert.equal(interpreted.outcome, 'observed');
+  assert.equal(interpreted.denied, true);
+});
+
 test('ambient control is green only for a Read denial on the exact sentinel input', () => {
   const compiled = compile();
   const exact = {
