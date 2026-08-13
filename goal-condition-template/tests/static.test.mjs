@@ -277,6 +277,7 @@ test('public docs separate release integrity from runtime certification end to e
     'Candidate', 'Certified', 'certify-claude-prepare', 'certify-claude-run',
     '完整 preview', 'exact hash', 'Git checkout', 'external manifest v2',
     'schema-v5', 'runtime_surface_digest', '实现、测试、review、Claude live certification',
+    'GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST',
   ]) {
     assert.ok(production.includes(term), `runtime certification docs are missing ${term}`);
   }

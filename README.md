@@ -95,7 +95,7 @@ Codex 只使用 GoalSession v2：用户只确认稳定 Goal 与 Maximum Authorit
 
 机器级 store 的 session/run 主键由 controller 生成；调用方用已知的 128-bit `request_id`/`nonce` 绑定创建请求，creation receipt 与 session，或与 LaunchIntent + lease，在同一事务提交。响应丢失后重发完全相同的输入会找回原 ID，同 key 改输入 fail closed。`resume` 只完成这次 durable prepare 并返回 run ID，显式 `launch` 才启动 runtime，避免 runtime 初始化失败吞掉唯一可寻址结果。
 
-LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；schema-v5 同时记录当前整包 manifest 与 Codex runtime surface digest。只有 Claude/release-only 文件变化时刷新整包审计身份并保留 Codex 认证；Codex/shared runtime surface 变化时清 receipt、自动降为 `canary`。旧 schema-v4 live 状态也一律降为 schema-v5 `canary`，不能把整包摘要冒充运行时认证。
+LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；schema-v5 同时记录当前整包 manifest 与 Codex runtime surface digest。只有 Claude/release-only 文件变化时刷新整包审计身份并保留 Codex 认证；Codex/shared runtime surface 变化时清 receipt、自动降为 `canary`。旧 schema-v4 live 状态也一律降为 schema-v5 `canary`，不能把整包摘要冒充运行时认证。调用 installed controller 的 `mode` 或 live 命令时，编排器必须从 release 外保留的 trust root 设置 `GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST=<digest>`；缺失或不匹配只返回安全错误码，并在 rollout/state 写入前停止。Git checkout 模式则直接核 HEAD runtime material，不使用该值。
 
 ## 安装与私有 profile
 

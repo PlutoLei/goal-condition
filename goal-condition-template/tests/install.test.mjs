@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile as execFileCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile,
@@ -66,6 +66,23 @@ async function createSourceRepository(t) {
   await git(repo, ['commit', '-m', 'new worktree content']);
   const newCommit = (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim();
   return { root, repo, incompleteCommit, oldCommit, newCommit };
+}
+
+async function createCurrentSourceRepository(t) {
+  const root = await mkdtemp(join(tmpdir(), 'goal-current-installer-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = join(root, 'source');
+  await mkdir(repo);
+  await git(repo, ['init', '--initial-branch=main']);
+  await git(repo, ['config', 'user.name', 'Installer Test']);
+  await git(repo, ['config', 'user.email', 'installer-test@example.invalid']);
+  for (const relativePath of REQUIRED_CORE_FILES) {
+    const content = await readFile(join(new URL('..', import.meta.url).pathname, relativePath));
+    await writeSourceFile(repo, relativePath, content);
+  }
+  await git(repo, ['add', '.']);
+  await git(repo, ['commit', '-m', 'current release core']);
+  return { root, repo, commit: (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim() };
 }
 
 test('materializes an immutable release from the requested commit without profile leakage', async (t) => {
@@ -194,6 +211,43 @@ test('stage creates and verifies one immutable release without switching runtime
   })).ok, true);
   await assert.rejects(realpath(claudeLink), { code: 'ENOENT' });
   await assert.rejects(realpath(codexLink), { code: 'ENOENT' });
+});
+
+test('installed Codex controller requires external manifest trust inside the safe CLI error boundary', async (t) => {
+  const { root, repo, commit } = await createCurrentSourceRepository(t);
+  const profile = join(root, 'private-profile.md');
+  await writeFile(profile, '# private project anchors\n');
+  const { releaseDir, manifestDigest } = await stageRelease({
+    repo, ref: commit, profile, releaseRoot: join(root, 'releases'),
+  });
+  const stateRoot = await mkdtemp(join(process.cwd(), '.gc-installed-cli-'));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const input = join(stateRoot, 'mode.json');
+  await writeFile(input, `${JSON.stringify({
+    action: 'get', next: null, changed_at: null, canary_session_id: null,
+  })}\n`, { mode: 0o600 });
+  const cli = join(releaseDir, 'codex-controller', 'src', 'cli.mjs');
+  const untrustedEnv = { ...process.env };
+  delete untrustedEnv.GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST;
+  const missing = spawnSync(process.execPath, [
+    cli, 'mode', '--state-root', join(stateRoot, 'controller'), '--input', input,
+  ], { encoding: 'utf8', env: untrustedEnv });
+  assert.equal(missing.status, 1);
+  assert.equal(missing.stdout, '');
+  assert.deepEqual(JSON.parse(missing.stderr), {
+    ok: false, code: 'RELEASE_MANIFEST_DIGEST_REQUIRED',
+  });
+
+  const trusted = spawnSync(process.execPath, [
+    cli, 'mode', '--state-root', join(stateRoot, 'controller'), '--input', input,
+  ], {
+    encoding: 'utf8',
+    env: { ...untrustedEnv, GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST: manifestDigest },
+  });
+  assert.equal(trusted.status, 0, trusted.stderr);
+  const result = JSON.parse(trusted.stdout);
+  assert.equal(result.release_manifest_digest, manifestDigest);
+  assert.match(result.runtime_surface_digest, /^[0-9a-f]{64}$/);
 });
 
 test('activate requires the exact staged root and manifest digest before switching links', async (t) => {
