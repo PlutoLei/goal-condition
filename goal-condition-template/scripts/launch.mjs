@@ -12,7 +12,7 @@ import {
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import {
-  basename, isAbsolute, join,
+  basename, dirname, isAbsolute, join,
 } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -163,29 +163,55 @@ async function readProjectSettingsText(pathname) {
   }
 }
 
-// Claude runtime union 掉 target root 内预存的 .claude/settings*.json 的 permissions 段——spike 实证
-// 预存 allow 真会生效，使 effective 授权面超出 controller 编译的 allow-list（V4）。现场采集含
-// permissions 段（或读不安全/解析不出）的预存 settings 交 assertLaunchable 落红。只设 model/hooks
-// 的无害配置不含 permissions、不进清单。
+// settings.local.json 自 CLI 2.1.211 起从 enclosing git root 加载（官方文档明文；2.1.229 deny 探针
+// 双向实证：git root 的 local.json 对子目录 cwd 生效，settings.json 只看 cwd、不向上）。.git 条目
+// 按存在性判定（目录=普通 repo、文件=worktree/submodule）；与 git rev-parse 的边缘差异（GIT_DIR
+// 覆写、bare repo）按保守方向接受——这里只决定「多扫哪个目录」，不决定放行。
+function findEnclosingGitRoot(pathname) {
+  let dir = pathname;
+  for (;;) {
+    if (existsSync(join(dir, '.git'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+// Claude runtime union 掉预存 .claude/settings*.json 的 permissions 段——spike 实证预存 allow 真会
+// 生效，使 effective 授权面超出 controller 编译的 allow-list（V4）。扫描范围精确跟随加载面：每个
+// target root 自身的 settings.json/settings.local.json，加 enclosing git root（若在 root 之外）的
+// settings.local.json（CR-5——target root 是仓库子目录时加载面越出 target root；git root 的
+// settings.json 实测不加载，扫它会把「祖先仓库带无关 project settings」的合法形态永久判红）。
+// 含 permissions 段（或读不安全/解析不出）的文件交 assertLaunchable 落红；只设 model/hooks 的
+// 无害配置不含 permissions、不进清单。
 async function scanProjectSettingsWithPermissions(targetRoots) {
   const flagged = [];
+  const checked = new Set();
+  const check = async (pathname) => {
+    if (checked.has(pathname)) return;
+    checked.add(pathname);
+    const read = await readProjectSettingsText(pathname);
+    if (read.missing) return;
+    if (read.text === undefined) {
+      flagged.push(pathname);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(read.text);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'permissions' in parsed) {
+        flagged.push(pathname);
+      }
+    } catch {
+      flagged.push(pathname);
+    }
+  };
   for (const root of targetRoots) {
     for (const file of ['settings.json', 'settings.local.json']) {
-      const pathname = join(root, '.claude', file);
-      const read = await readProjectSettingsText(pathname);
-      if (read.missing) continue;
-      if (read.text === undefined) {
-        flagged.push(pathname);
-        continue;
-      }
-      try {
-        const parsed = JSON.parse(read.text);
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'permissions' in parsed) {
-          flagged.push(pathname);
-        }
-      } catch {
-        flagged.push(pathname);
-      }
+      await check(join(root, '.claude', file));
+    }
+    const gitRoot = findEnclosingGitRoot(root);
+    if (gitRoot !== null && gitRoot !== root) {
+      await check(join(gitRoot, '.claude', 'settings.local.json'));
     }
   }
   return flagged;

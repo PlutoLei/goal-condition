@@ -979,6 +979,41 @@ test('runClaudeAttempt rechecks additional_read_roots identity before dispatch (
   assert.equal(stub.calls.length, 0);
 });
 
+test('a permissioned settings.local.json at the enclosing git root blocks a subdirectory target root (CR-5)', async (t) => {
+  // 官方文档 + 2.1.229 deny 探针实证：settings.local.json 自 2.1.211 起从 enclosing git root 加载
+  // （settings.json 则只看 cwd、不向上）。target root 是仓库子目录时，加载面越出 target root——
+  // 扫描必须跟着加载面走，否则 git root 的预存 permissions 是 V4 闸的绕过通道。
+  const root = await mkdtemp(join(tmpdir(), 'gc-cr5-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = join(root, 'repo');
+  const target = join(repo, 'sub', 'target');
+  await mkdir(target, { recursive: true });
+  execFileSync('git', ['init', '-q', repo]);
+  await mkdir(join(repo, '.claude'), { recursive: true });
+  await writeFile(join(repo, '.claude', 'settings.local.json'),
+    JSON.stringify({ permissions: { allow: ['Bash(rm:*)'] } }));
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('permissions')));
+  assert.equal(stub.calls.length, 0, 'must never spawn under an unscanned unioned allow surface');
+
+  // 对照：git root 的 settings.json（实测不向上加载）不拦——扫描范围精确对应加载面，
+  // 过度保守会把「祖先仓库带无关 project settings」的合法形态永久判红。
+  await rm(join(repo, '.claude', 'settings.local.json'));
+  await writeFile(join(repo, '.claude', 'settings.json'),
+    JSON.stringify({ permissions: { allow: ['Bash(rm:*)'] } }));
+  const ok = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stubEchoing(claudeResultFixture).impl,
+  });
+  assert.equal(ok.outcome, 'candidate');
+});
+
 test('a permissioned project settings file planted after the launch gate still blocks the spawn (V4-TOCTOU)', async (t) => {
   // 早扫在 claim/beforeDispatch 之前跑：之后才种进 target root 的 permissioned settings 不改目录
   // inode（identity 复核照常通过），却会被 Claude runtime union 进 effective 权限。与 identity
