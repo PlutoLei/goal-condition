@@ -44,6 +44,8 @@
     "nonEmptyString": {"type": "string", "minLength": 1},
     "pathList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
     "stringList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
+    "permissionSafeString": {"type": "string", "minLength": 1, "pattern": "^[^()\\r\\n\\s][^()\\r\\n]*[^()\\r\\n\\s]$|^[^()\\r\\n\\s]$"},
+    "absoluteReadRoot": {"type": "string", "minLength": 1, "pattern": "^/"},
     "id": {"type": "string", "minLength": 1},
     "contextSource": {
       "type": "object",
@@ -119,10 +121,10 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "bash_prefixes": {"$ref": "#/$defs/stringList"},
-        "webfetch_domains": {"$ref": "#/$defs/stringList"},
-        "skills": {"$ref": "#/$defs/stringList"},
-        "additional_read_roots": {"$ref": "#/$defs/pathList"}
+        "bash_prefixes": {"type": "array", "items": {"$ref": "#/$defs/permissionSafeString"}},
+        "webfetch_domains": {"type": "array", "items": {"$ref": "#/$defs/permissionSafeString"}},
+        "skills": {"type": "array", "items": {"$ref": "#/$defs/permissionSafeString"}},
+        "additional_read_roots": {"type": "array", "items": {"$ref": "#/$defs/absoluteReadRoot"}}
       }
     },
     "budget": {

@@ -25,7 +25,7 @@ import {
   bindControllerTurnText, CODEX_SANDBOX_MODE, GoalRpcClient, normalizeTerminal as normalizeCodexTerminal,
   noteworthyNotification, resumeRpcOps, TURN_BOUNDARY_METHODS, verifyFinalizeAttribution,
 } from './lib/adapters/codex.mjs';
-import { contractHash, readContract } from './lib/contract.mjs';
+import { contractHash, readContract, ContractArtifactError } from './lib/contract.mjs';
 import { runtimeTerminalState } from './lib/workflow.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -76,13 +76,17 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 // Controller claims are read through a descriptor with O_NOFOLLOW and must be private regular files.
 // This avoids the lstat-then-read race and makes a symlink/hardlink an invalid claim, never an invitation
 // to replace or follow it.
-async function readControllerJsonNoFollow(pathname) {
-  if (typeof constants.O_NOFOLLOW !== 'number') {
+export async function readControllerJsonNoFollow(pathname, nofollow = constants.O_NOFOLLOW) {
+  if (typeof nofollow !== 'number') {
+    // 平台无 O_NOFOLLOW（如 Windows）：仍要区分「不存在」与「存在但无法安全 no-follow 读」，
+    // 否则首次 launch 把「无 thread.json」误报成「存在但损坏」，工具在该平台完全不可用且诊断误导
+    // 操作员去修一个并不存在的损坏文件（V3，两方收敛，latent）。
+    if (!existsSync(pathname)) return { ok: false, missing: true };
     return { ok: false, missing: false };
   }
   let handle;
   try {
-    handle = await open(pathname, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(pathname, constants.O_RDONLY | nofollow);
   } catch (error) {
     return { ok: false, missing: error?.code === 'ENOENT' };
   }
@@ -113,6 +117,34 @@ async function observeTargetIdentity(pathname) {
   const st = await stat(pathname);
   if (!st.isDirectory()) throw new Error('target root is not a directory');
   return { dev: st.dev, ino: st.ino };
+}
+
+// Claude runtime union 掉 target root 内预存的 .claude/settings*.json 的 permissions 段——spike 实证
+// 预存 allow 真会生效，使 effective 授权面超出 controller 编译的 allow-list（V4）。现场采集含
+// permissions 段（或解析不出）的预存 settings 交 assertLaunchable 落红。只设 model/hooks 的无害配置
+// 不含 permissions、不进清单。解析失败保守入列（无法证明它不含 permissions，fail-closed）。
+async function scanProjectSettingsWithPermissions(targetRoots) {
+  const flagged = [];
+  for (const root of targetRoots) {
+    for (const file of ['settings.json', 'settings.local.json']) {
+      const pathname = join(root, '.claude', file);
+      let text;
+      try {
+        text = await readFile(pathname, 'utf8');
+      } catch {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed) && 'permissions' in parsed) {
+          flagged.push(pathname);
+        }
+      } catch {
+        flagged.push(pathname);
+      }
+    }
+  }
+  return flagged;
 }
 
 export function stateDirFor({ stateRoot, controller = 'default', contractHash }) {
@@ -383,12 +415,25 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
   const hookEnvPath = join(realStateDir, 'hook-env.json');
   await writeReplacing(hookEnvPath, JSON.stringify(envValues), 0o600);
 
-  // 4. settings.json。
+  // 4. settings.json。contract 层只校验 raw 字符串，但进权限 DSL 的是 realpath 后的值——realpath
+  // 含括号/换行时 buildSettings 会抛 assertPermissionSpecifier 的 TypeError。包成干净 ContractArtifactError，
+  // 别让操作员拿到裸 TypeError（V7，DeepSeek 独有）。诊断只说形态，不回显具体路径值（隐私纪律）。
   const targetRoots = (contract.target_roots ?? []).map(canonicalPath);
   const additionalReadRoots = (contract.execution_permissions?.additional_read_roots ?? []).map(canonicalPath);
-  const settings = buildSettings({
-    contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
-  });
+  let settings;
+  try {
+    settings = buildSettings({
+      contract, hookScriptPath, stateDir: realStateDir, targetRoots, additionalReadRoots,
+    });
+  } catch {
+    throw new ContractArtifactError({
+      code: 'PERMISSION_SPECIFIER_UNREPRESENTABLE',
+      path: 'target_roots/execution_permissions',
+      observed: 'a canonicalized path or permission value cannot be represented in the Claude permission DSL',
+      expected: 'canonical paths and permission values free of parentheses, line breaks, and edge whitespace',
+      next: 'adjust the offending value; note the realpath (not just the literal) is what gets compiled',
+    });
+  }
   const settingsPath = join(realStateDir, 'settings.json');
   await writeReplacing(settingsPath, JSON.stringify(settings, null, 2), 0o600);
 
@@ -497,12 +542,17 @@ export async function runClaudeAttempt({
   const targetRoots = (contract.target_roots ?? []).map(canonicalPath);
   const additionalReadRoots = (contract.execution_permissions?.additional_read_roots ?? []).map(canonicalPath);
   let targetRootIdentities;
+  let additionalReadRootIdentities;
   try {
     targetRootIdentities = await Promise.all(targetRoots.map(observeTargetIdentity));
+    // additional_read_roots 进 settings.additionalDirectories，与 target root 一样是授权的目录面，
+    // 必须同等绑定 device/inode 并在 spawn 前复核（V6，Codex 独有 P1）——否则替换 read-root 目录
+    // 能把授权读路径重定向到无关数据，而不触发任何前置检查。
+    additionalReadRootIdentities = await Promise.all(additionalReadRoots.map(observeTargetIdentity));
   } catch {
     return finish({
       outcome: 'terminal_report',
-      reasons: ['a canonical target root is not a readable directory, so its launch identity cannot be bound'],
+      reasons: ['a canonical target or additional read root is not a readable directory, so its launch identity cannot be bound'],
     });
   }
   let settings;
@@ -539,6 +589,7 @@ export async function runClaudeAttempt({
     baselineDigestStored: typeof binding?.baselineDigest === 'string' && HEX64.test(binding.baselineDigest),
     targetRoots,
     additionalReadRoots,
+    projectSettingsWithPermissions: await scanProjectSettingsWithPermissions(targetRoots),
     stateDir: realStateDir,
     settings,
     expectedHookSha256,
@@ -589,6 +640,15 @@ export async function runClaudeAttempt({
         reasons: ['thread.json exists but is invalid; recover the controller-issued pointer before resume'],
       });
     }
+    // resume 绑 launch-time cwd：pointer.cwd 是首发时的 canonical target root，与此刻重算的 cwd
+    // 必须相等。symlink target root 在 launch 后被重定向时二者分叉——若仍用当前 cwd 续跑，会在新
+    // 目录里复活旧会话，且 settings/deny 面（当前根）与 spawn cwd 不一致（V2）。fail-closed 拒绝。
+    if (prior.value.cwd !== cwd) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['target root canonical path changed since launch; refusing to resume the session in a different directory'],
+      });
+    }
     ({ sessionId } = prior.value);
     spec = resumeSpec({
       sessionId, settingsPath, diagnosticText, cwd, budget: contract.budget,
@@ -623,22 +683,29 @@ export async function runClaudeAttempt({
   // The permission rules and cwd are bound to the same canonical roots. Recheck device/inode after
   // every async claim step and immediately before spawn so replacing a canonical directory cannot
   // redirect execution into a repository whose project settings were never denied.
-  await beforeDispatch({ cwd, targetRoots: [...targetRoots] });
+  await beforeDispatch({
+    cwd, targetRoots: [...targetRoots], additionalReadRoots: [...additionalReadRoots],
+  });
   try {
-    for (let index = 0; index < targetRoots.length; index += 1) {
-      const current = await observeTargetIdentity(targetRoots[index]);
-      const bound = targetRootIdentities[index];
-      if (current.dev !== bound.dev || current.ino !== bound.ino) {
-        return finish({
-          outcome: 'terminal_report',
-          reasons: ['canonical target root identity changed before dispatch; refusing to spawn Claude'],
-        });
+    const rebound = async (roots, identities) => {
+      for (let index = 0; index < roots.length; index += 1) {
+        const current = await observeTargetIdentity(roots[index]);
+        const bound = identities[index];
+        if (current.dev !== bound.dev || current.ino !== bound.ino) return false;
       }
+      return true;
+    };
+    if (!await rebound(targetRoots, targetRootIdentities)
+      || !await rebound(additionalReadRoots, additionalReadRootIdentities)) {
+      return finish({
+        outcome: 'terminal_report',
+        reasons: ['canonical root identity changed before dispatch; refusing to spawn Claude'],
+      });
     }
   } catch {
     return finish({
       outcome: 'terminal_report',
-      reasons: ['canonical target root identity changed before dispatch; refusing to spawn Claude'],
+      reasons: ['canonical root identity changed before dispatch; refusing to spawn Claude'],
     });
   }
 

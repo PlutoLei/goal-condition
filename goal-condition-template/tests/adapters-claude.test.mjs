@@ -221,7 +221,8 @@ test('buildSettings compiles contract permissions and protects controller and pr
   assert.equal(settings.hooks.Stop[0].hooks[0].type, 'command');
   assert.match(settings.hooks.Stop[0].hooks[0].command, /^node '\/state\/dir\/stop-hook\.mjs'$/);
   assert.deepEqual(settings.permissions.allow, [
-    'Bash(npm:*)', 'Bash(test:*)', 'Bash(git add:*)',
+    'Bash(npm test)', 'Bash(test -f out.txt)',            // postflight → 精确命令（V5），不再 Bash(npm:*)
+    'Bash(git add:*)', 'Bash(npm:*)',                     // 显式 bash_prefixes → :* 前缀
     'WebFetch(domain:cloud.langfuse.com)', 'Skill(langfuse)',
   ]);
   assert.deepEqual(settings.permissions.additionalDirectories, ['/work/other-real', '/reference/real']);
@@ -233,6 +234,42 @@ test('buildSettings compiles contract permissions and protects controller and pr
     'Edit(//work/other-real/.claude/settings.local.json)',
   ]);
   assert.equal(JSON.stringify(settings).includes('disableAllHooks'), false);
+});
+
+test('assertLaunchable rejects target roots that ship project settings with a permissions block (V4)', () => {
+  // Claude runtime 会把 target root 内预存的 .claude/settings*.json union 进 effective 权限（spike
+  // 实证：预存 Bash(rm:*) 真的生效），controller 的「精确匹配 allow-list」因此是假保证。现场采集
+  // 到含 permissions 段的预存 settings 即 fail-closed 拒绝 launch（V4，code-review 独有 P1）。
+  const probes = {
+    ...goodProbes,
+    projectSettingsWithPermissions: ['/work/root/.claude/settings.local.json'],
+  };
+  const verdict = assertLaunchable(hookContract, probes);
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.reasons.some((r) => r.includes('permissions') && r.includes('.claude')));
+  // 不含 permissions 段的无害预存 settings（空数组）不拦。
+  assert.deepEqual(assertLaunchable(hookContract, { ...goodProbes, projectSettingsWithPermissions: [] }), { ok: true, reasons: [] });
+});
+
+test('postflight verifiers compile to exact Bash commands, not wildcard executables (V5)', () => {
+  // argv[0]→Bash(argv[0]:*) 把整个可执行家族 wildcard 授权出去：postflight ['git','diff'] 会顺带
+  // 授权 git push，['bash','-lc',...] 授权任意 shell。verifier 是精确命令，只该授权那一条。
+  const contract = {
+    ...hookContract,
+    postflight: [{ id: 'pf', type: 'command', cwd: '/work/root', argv: ['git', 'diff', '--exit-code'] }],
+    execution_permissions: undefined,
+  };
+  const settings = buildSettings({
+    contract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+  });
+  assert.ok(!settings.permissions.allow.includes('Bash(git:*)'), 'must not wildcard the whole git family');
+  assert.ok(settings.permissions.allow.includes('Bash(git diff --exit-code)'), 'authorizes exactly the declared verifier command');
+  // 显式 bash_prefixes 仍是前缀授权（作者明知在声明前缀）
+  const withPrefix = buildSettings({
+    contract: { ...contract, execution_permissions: { bash_prefixes: ['npm run'] } },
+    hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+  });
+  assert.ok(withPrefix.permissions.allow.includes('Bash(npm run:*)'), 'explicit prefixes keep :* semantics');
 });
 
 test('buildSettings shell-escapes hostile paths with POSIX single quotes', () => {
@@ -267,6 +304,19 @@ const goodProbes = Object.freeze({
   expectedHookSha256: 'f'.repeat(64),
   targetRoots: ['/work/root'],
   stateDir: '/state/dir',
+});
+
+test('assertLaunchable dedups target roots the same way buildSettings does (V1)', () => {
+  // 重复/symlink 等价的 canonical target root（validateContract 不去重、不规范化，能过校验）：
+  // buildSettings 用 unique(T).slice(1)，assertLaunchable 曾用 T.slice(1) 再 unique，两者对
+  // 重复首根给出不同 additionalDirectories，合法 contract 每次 launch 都红、永久拒绝。
+  const roots = ['/work/root', '/work/root', '/work/extra'];
+  const settings = buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: roots,
+  });
+  const probes = { ...goodProbes, settings, targetRoots: roots };
+  assert.deepEqual(assertLaunchable(hookContract, probes), { ok: true, reasons: [] });
 });
 
 test('launchSpec/resumeSpec are pure argv data with settings pinned', () => {

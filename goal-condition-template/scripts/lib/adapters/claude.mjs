@@ -156,11 +156,20 @@ export function buildSettings({
   additionalReadRoots = contract.execution_permissions?.additional_read_roots ?? [],
 }) {
   const execution = contract.execution_permissions ?? {};
-  const inferredBashPrefixes = (contract.postflight ?? [])
-    .map((entry) => entry?.argv?.[0])
-    .filter((value) => typeof value === 'string' && value.length > 0);
+  // postflight verifier 编译成**精确命令**（整条 argv join），不是 argv[0] 通配：argv[0]→Bash(git:*)
+  // 会把整个 git 家族 wildcard 授权出去（git diff 顺带授权 git push），bash→Bash(bash:*) 更是任意
+  // shell（V5，Codex 独有 P1）。执行体要跑 verifier 只需精确那一条；要更宽授权由作者显式 bash_prefixes
+  // 声明（那才带 :* 前缀语义）。
+  // verifier 命令含权限 DSL 无法表示的字符（括号等，如 `node -e 'process.exit(0)'`）时跳过：不
+  // 静默扩权、也不炸——hook 仍用 execFileSync 跑它（不经 claude permission），执行体主动自检该条
+  // 会被 deny（fail-closed 可续）。要授权由作者显式 bash_prefixes 声明。preview 里 allow 缺该条可见。
+  const inferredBashCommands = (contract.postflight ?? [])
+    .map((entry) => entry?.argv)
+    .filter((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0))
+    .map((argv) => argv.join(' '))
+    .filter((command) => permissionSpecifierProblem(command) === null);
   for (const value of [
-    ...inferredBashPrefixes,
+    ...inferredBashCommands,
     ...(execution.bash_prefixes ?? []),
     ...(execution.webfetch_domains ?? []),
     ...(execution.skills ?? []),
@@ -169,8 +178,8 @@ export function buildSettings({
     ...targetRoots,
   ]) assertPermissionSpecifier(value);
   const allow = [
-    ...unique([...inferredBashPrefixes, ...(execution.bash_prefixes ?? [])])
-      .map((prefix) => permissionRule('Bash', `${prefix}:*`)),
+    ...unique(inferredBashCommands).map((command) => permissionRule('Bash', command)),
+    ...unique(execution.bash_prefixes ?? []).map((prefix) => permissionRule('Bash', `${prefix}:*`)),
     ...(execution.webfetch_domains ?? []).map((domain) => permissionRule('WebFetch', `domain:${domain}`)),
     ...(execution.skills ?? []).map((skill) => permissionRule('Skill', skill)),
   ];
@@ -331,13 +340,28 @@ export function assertLaunchable(contract, probes) {
       }
     }
   }
+  // Claude runtime union 掉 target root 内预存的 .claude/settings*.json 的 permissions 段，effective
+  // 授权面因此超出 controller 编译的 allow-list（spike 实证：预存 Bash(rm:*) 真生效）；deny 只护得住
+  // 「不被编辑」，护不住「被 union」。含 permissions 段的预存 settings 是唯一无法从 controller 侧中
+  // 和的 union 源，一律 fail-closed 拒绝（V4）。只设 model/hooks 的无害配置由采集器判定为不含
+  // permissions、不进这张清单。
+  for (const pathname of probes?.projectSettingsWithPermissions ?? []) {
+    reasons.push(`${pathname} ships a permissions block Claude would merge into the effective allow-list; `
+      + 'remove its permissions or use a target root without a project .claude settings file');
+  }
   // allow/additionalDirectories 与 deny 一样属于 buildSettings 的消费面。这里独立重算期望形状，
   // 防的是生成器回归（生产路径的 settings 是现场重写，磁盘比对本身抓不到“稳定地产错”）。
+  // 与 buildSettings 逐字镜像（同一投影，防生成器稳定地产错）：postflight → 精确命令、显式
+  // bash_prefixes → :* 前缀。两侧用同一 argv 谓词（Array + 每元素非空字符串），消掉 argv[0] filter
+  // 的 length>0 分叉（V9，B+C 收敛的 latent trap）。
+  const expectedInferredBash = (contract?.postflight ?? [])
+    .map((entry) => entry?.argv)
+    .filter((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0))
+    .map((argv) => argv.join(' '))
+    .filter((command) => permissionSpecifierProblem(command) === null);
   const expectedAllow = [
-    ...unique([
-      ...(contract?.postflight ?? []).map((entry) => entry?.argv?.[0]).filter((value) => typeof value === 'string'),
-      ...(contract?.execution_permissions?.bash_prefixes ?? []),
-    ]).map((prefix) => `Bash(${prefix}:*)`),
+    ...unique(expectedInferredBash).map((command) => `Bash(${command})`),
+    ...unique(contract?.execution_permissions?.bash_prefixes ?? []).map((prefix) => `Bash(${prefix}:*)`),
     ...(contract?.execution_permissions?.webfetch_domains ?? [])
       .map((domain) => `WebFetch(domain:${domain})`),
     ...(contract?.execution_permissions?.skills ?? []).map((skill) => `Skill(${skill})`),
@@ -345,8 +369,10 @@ export function assertLaunchable(contract, probes) {
   if (JSON.stringify(permissions.allow ?? null) !== JSON.stringify(expectedAllow)) {
     reasons.push('settings allow rules do not exactly match the confirmed contract');
   }
+  // unique 后再 slice，与 buildSettings 的 unique(targetRoots).slice(1) 逐字同序：unique(T).slice(1)
+  // ≠ unique(T.slice(1))，重复首根时两者分叉会把合法 contract 永久判红（V1，三方收敛）。
   const expectedAdditionalDirectories = unique([
-    ...(probes?.targetRoots ?? []).slice(1),
+    ...unique(probes?.targetRoots ?? []).slice(1),
     ...(probes?.additionalReadRoots ?? []),
   ]);
   if (JSON.stringify(permissions.additionalDirectories ?? null)

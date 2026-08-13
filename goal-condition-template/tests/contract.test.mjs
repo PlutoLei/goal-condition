@@ -118,6 +118,21 @@ test('a fractional max_turns is rejected at validation time, and only max_turns'
   assert.equal(schema.$defs.budget.properties.max_turns.type, 'integer');
 });
 
+test('schema constrains execution_permissions specifiers like the validator, not just non-empty strings (V8)', () => {
+  // 公开 schema 曾把三个字符串列声明成裸 nonEmptyString，比 validator 弱：validator 拒括号/换行
+  // （permission-DSL 注入面）与相对 additional_read_roots。installed schema 因此给出 validator 随后
+  // 会拒的假 valid（V8，DeepSeek 独有，与 budget 同款「schema 与 validator 口径一致」判据）。
+  const ep = schema.$defs.executionPermissions.properties;
+  for (const field of ['bash_prefixes', 'webfetch_domains', 'skills']) {
+    const def = schema.$defs[ep[field].items.$ref.split('/').pop()];
+    assert.match(def.pattern ?? '', /\(\)/, `${field} items must forbid permission-DSL delimiters`);
+  }
+  const readRootDef = schema.$defs[ep.additional_read_roots.items.$ref.split('/').pop()];
+  assert.ok((readRootDef.pattern ?? '').startsWith('^/'), 'additional_read_roots must require absolute paths');
+  // 非临时性与路径规范化 JSON Schema 表达不了，仍由 validator 独有承担——schema 只缩小最危险的
+  // gap（括号注入、相对路径），不假装完全覆盖。
+});
+
 test('content-bound context entries reject temporary paths and duplicate IDs', () => {
   const temporary = structuredClone(valid);
   temporary.context_sources[0].path = '/private/tmp/context.md';
