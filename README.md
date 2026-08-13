@@ -95,18 +95,26 @@ LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 ta
 
 ## 安装与私有 profile
 
-安装器从明确的 Git commit 物化共享核心，而不是复制目录。它把私有 profile 注入 release，并只切换命令中显式给出的 runtime link；因此可以同时切 Claude/Codex，也可以像本次 Codex-only rollout 一样只给 `--link codex=...`，Claude link 保持旧 release。profile 不应提交到这个公开仓。安装输出包含 `manifestDigest`，它是 release 外部（external）保留的信任根，不能从待验证 release 自己重建。本节两段命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`，两者指的是同一个文件，差别只在你站在哪一层。下面仅展示 Codex-only 参数形状，所有值都是占位符，示例不执行安装：
+安装器从明确的 Git commit 物化共享核心，而不是复制目录。`stage` 只生成并验证 immutable release，不切 runtime link；原生认证直接针对这个物理 release 执行。`activate` 必须重新提供 staged release 的外部 `manifestDigest`，验证 root/digest 后才原子切换显式给出的 runtime link。profile 不应提交到这个公开仓。manifest schema v2 在整包 digest 之外还保存 Claude/Codex 各自的 runtime surface digest；整包 digest 仍是 release integrity 的外部信任根。本节命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`。
 
 ```text
-node goal-condition-template/scripts/install.mjs install \
+node goal-condition-template/scripts/install.mjs stage \
   --repo <PUBLIC_REPOSITORY> \
   --ref <COMMIT_SHA> \
   --profile <PRIVATE_PROFILE_FILE> \
-  --release-root <RELEASE_DIRECTORY> \
+  --release-root <RELEASE_DIRECTORY>
+```
+
+保存 stage 输出的 `releaseDir` 与 `manifestDigest`。完成该 staged release 所需的 runtime 原生认证后，使用同一 root 和 digest 激活；下面只切 Codex link，Claude link 保持原状态：
+
+```text
+node goal-condition-template/scripts/install.mjs activate \
+  --release <STAGED_RELEASE_DIRECTORY> \
+  --expected-manifest-digest <TRUSTED_MANIFEST_DIGEST> \
   --link codex=<CODEX_SKILL_LINK>
 ```
 
-安装后保存输出的 `manifestDigest`。验证指定 release 时必须显式传回这个外部值；verifier 会先校验原始 manifest bytes，再核对 closed-world 文件 hashes、core 的 exact Git-derived mode、profile `0600`、manifest `0644`，以及 release root 和所有必需目录的 `0755`；四位八进制比较也会拒绝 setuid、setgid 与 sticky bits：
+`install` 仍作为 `stage` 后紧接 `activate` 的兼容命令存在，但它不提供两个阶段之间运行原生认证的窗口。验证指定 release 时必须显式传回外部 digest；verifier 会先校验原始 manifest bytes，再核对 closed-world 文件 hashes、core 的 exact Git-derived mode、profile `0600`、manifest `0644`，以及 release root 和所有必需目录的 `0755`；四位八进制比较也会拒绝 setuid、setgid 与 sticky bits：
 
 ```text
 node goal-condition-template/scripts/install.mjs verify \
@@ -128,6 +136,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `scripts/lib/contract.mjs`
 - `scripts/lib/snapshot.mjs`
 - `scripts/lib/installer.mjs`
+- `scripts/lib/runtime-surfaces.mjs`
 - `scripts/lib/workflow.mjs`
 - `scripts/launch.mjs`
 - `scripts/lib/adapters/claude.mjs`

@@ -393,6 +393,7 @@ async function writeRelease(releaseRoot, releaseDir, sourceFiles, profileContent
   await assertStableDirectory(releaseRootIdentity, 'RELEASE_ROOT_IDENTITY_CHANGED', 'release-stage');
   const temporary = join(releaseRoot, `.${manifest.commit}.installing-${process.pid}-${randomBytes(8).toString('hex')}`);
   await mkdir(temporary, { mode: 0o700 });
+  await chmod(temporary, 0o700);
   const temporaryIdentity = await ownedIdentity(temporary);
   const ownedFiles = [];
   const ownedDirectories = new Map();
@@ -974,80 +975,200 @@ async function switchLinks(
   return backups;
 }
 
-export async function installRelease(
-  { repo, ref, profile, releaseRoot, links, backupRoot } = {},
-  { faultInjector } = {},
-) {
-  validateArguments({ repo, ref, profile, releaseRoot, links, backupRoot });
+function validateFaultInjector(faultInjector) {
   if (faultInjector !== undefined && typeof faultInjector !== 'function') {
     throw new InstallerError('INSTALL_ARGUMENT_INVALID', 'faultInjector must be a function when supplied', { field: 'faultInjector' });
   }
+}
+
+function validateStageArguments({ repo, ref, profile, releaseRoot }) {
+  for (const [field, value] of Object.entries({ repo, ref, profile, releaseRoot })) {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new InstallerError('INSTALL_ARGUMENT_INVALID', `${field} must be a non-empty path or ref`, { field });
+    }
+  }
+}
+
+function validateActivateArguments({ releaseDir, expectedManifestDigest, links, backupRoot }) {
+  if (typeof releaseDir !== 'string' || releaseDir.length === 0) {
+    throw new InstallerError('INSTALL_ARGUMENT_INVALID', 'releaseDir must be a non-empty path', { field: 'releaseDir' });
+  }
+  if (!SHA256.test(expectedManifestDigest ?? '')) {
+    throw new InstallerError(
+      'INSTALL_ARGUMENT_INVALID',
+      'expectedManifestDigest must be a lowercase SHA-256 digest',
+      { field: 'expectedManifestDigest' },
+    );
+  }
+  if (links === null || typeof links !== 'object' || Array.isArray(links) || Object.keys(links).length === 0) {
+    throw new InstallerError('INSTALL_ARGUMENT_INVALID', 'links must map runtime names to paths', { field: 'links' });
+  }
+  for (const [name, target] of Object.entries(links)) {
+    if (!/^[A-Za-z0-9_-]+$/.test(name) || typeof target !== 'string' || target.length === 0) {
+      throw new InstallerError('INSTALL_ARGUMENT_INVALID', 'each link needs a safe name and non-empty path', { field: 'links', link: name });
+    }
+  }
+  if (backupRoot !== undefined && (typeof backupRoot !== 'string' || backupRoot.length === 0)) {
+    throw new InstallerError('INSTALL_ARGUMENT_INVALID', 'backupRoot must be a non-empty path when supplied', { field: 'backupRoot' });
+  }
+}
+
+async function validateStagePathTopology({ sourceRepo, profilePath, root }) {
+  const protectedPaths = {
+    repo: await pathForms(sourceRepo, true),
+    profile: await pathForms(profilePath, true),
+    releaseRoot: await pathForms(root),
+  };
+  if (formsOverlap(protectedPaths.repo, protectedPaths.profile)
+    || formsOverlap(protectedPaths.repo, protectedPaths.releaseRoot)
+    || formsOverlap(protectedPaths.profile, protectedPaths.releaseRoot)) {
+    throw new InstallerError('PATH_PROTECTED_OVERLAP', 'repo, profile, and releaseRoot must remain disjoint');
+  }
+  protectedPaths.releaseRoot.anchorIdentity = await captureAncestorIdentity(
+    protectedPaths.releaseRoot.canonical, 'RELEASE_ROOT_IDENTITY_CHANGED',
+  );
+  return protectedPaths;
+}
+
+async function validateActivationPathTopology({ releaseDir, backupRoot, links }) {
+  const release = await pathForms(releaseDir, true);
+  const releaseRoot = await pathForms(dirname(release.canonical), true);
+  const backup = backupRoot ? await pathForms(backupRoot) : null;
+  if (backup && (formsOverlap(release, backup) || formsOverlap(releaseRoot, backup))) {
+    throw new InstallerError('BACKUP_PATH_INVALID', 'backupRoot must not overlap the immutable release');
+  }
+  const linkPaths = [];
+  for (const [name, target] of Object.entries(links)) {
+    const forms = await pathForms(target);
+    if (formsOverlap(forms, release) || formsOverlap(forms, releaseRoot)
+      || (backup && formsOverlap(forms, backup))) {
+      throw new InstallerError('LINK_PATH_INVALID', 'runtime link must not overlap releaseRoot or backupRoot', {
+        link: name, target,
+      });
+    }
+    linkPaths.push({ name, target, forms, canonical: forms.canonical });
+  }
+  for (let index = 0; index < linkPaths.length; index += 1) {
+    for (let other = index + 1; other < linkPaths.length; other += 1) {
+      if (formsOverlap(linkPaths[index].forms, linkPaths[other].forms)) {
+        throw new InstallerError('LINK_TARGET_TOPOLOGY_INVALID', 'runtime links must be distinct non-nested paths', {
+          link: linkPaths[index].name, other_link: linkPaths[other].name,
+        });
+      }
+    }
+  }
+  if (backup) {
+    backup.anchorIdentity = await captureAncestorIdentity(
+      backup.canonical, 'BACKUP_ROOT_IDENTITY_CHANGED',
+    );
+  }
+  for (const link of linkPaths) link.parentIdentity = await captureParentIdentity(link.canonical, link.name);
+  return { release, releaseRoot, backup, linkPaths };
+}
+
+export async function stageRelease(
+  { repo, ref, profile, releaseRoot } = {},
+  { faultInjector } = {},
+) {
+  validateStageArguments({ repo, ref, profile, releaseRoot });
+  validateFaultInjector(faultInjector);
   const sourceRepo = resolve(repo);
   const profilePath = resolve(profile);
   const requestedRoot = resolve(releaseRoot);
-  const normalizedLinks = Object.fromEntries(Object.entries(links).map(([name, target]) => [name, resolve(target)]));
-  const normalizedBackup = backupRoot === undefined ? undefined : resolve(backupRoot);
   await directory(sourceRepo, 'REPOSITORY_INVALID', { field: 'repo' });
   await regularFile(profilePath, 'PROFILE_INVALID', { field: 'profile' });
   const capturedProfile = await captureProfile(profilePath);
-  let commit;
-  let sourceFiles;
-  let manifest;
-  let manifestDigest;
-  try {
-    commit = await resolveCommit(sourceRepo, ref);
-    sourceFiles = await readCoreFiles(sourceRepo, commit);
-    manifest = manifestFor(commit, sourceFiles, digest(capturedProfile.contents));
-    manifestDigest = digestManifest(manifest);
-  } catch (error) {
-    await capturedProfile.handle.close();
-    throw error;
-  }
-  let topology;
-  let locks;
-  try {
-    topology = await validatePathTopology({
-      sourceRepo, profilePath, root: requestedRoot, backupRoot: normalizedBackup, links: normalizedLinks,
-    });
-    locks = await acquireLocks(topology.linkPaths, topology.protectedPaths);
-  } catch (error) {
-    await capturedProfile.handle.close();
-    throw error;
-  }
-  const nonce = locks.map((lock) => lock.nonce).join('-');
   let primaryError;
   try {
-    if (faultInjector) await faultInjector('after_locks');
+    const commit = await resolveCommit(sourceRepo, ref);
+    const sourceFiles = await readCoreFiles(sourceRepo, commit);
+    const manifest = manifestFor(commit, sourceFiles, digest(capturedProfile.contents));
+    const manifestDigest = digestManifest(manifest);
+    const topology = await validateStagePathTopology({ sourceRepo, profilePath, root: requestedRoot });
     await assertStableDirectory(
-      topology.protectedPaths.releaseRoot.anchorIdentity, 'RELEASE_ROOT_IDENTITY_CHANGED', 'prepare',
+      topology.releaseRoot.anchorIdentity, 'RELEASE_ROOT_IDENTITY_CHANGED', 'stage-prepare',
     );
-    if (topology.protectedPaths.backupRoot) {
-      await assertStableDirectory(
-        topology.protectedPaths.backupRoot.anchorIdentity, 'BACKUP_ROOT_IDENTITY_CHANGED', 'prepare',
-      );
-    }
-    await inspectLinkTargets(topology.linkPaths, normalizedBackup);
-    const root = topology.protectedPaths.releaseRoot.canonical;
-    const transactionBackup = topology.protectedPaths.backupRoot?.canonical;
+    const root = topology.releaseRoot.canonical;
     await mkdir(root, { recursive: true, mode: RELEASE_DIRECTORY_MODE });
     await assertStableDirectory(
-      topology.protectedPaths.releaseRoot.anchorIdentity, 'RELEASE_ROOT_IDENTITY_CHANGED', 'release-root-created',
+      topology.releaseRoot.anchorIdentity, 'RELEASE_ROOT_IDENTITY_CHANGED', 'stage-root-created',
     );
     await directory(root, 'RELEASE_ROOT_INVALID', { field: 'releaseRoot' });
     await chmod(root, RELEASE_DIRECTORY_MODE);
     const releaseRootIdentity = await captureDirectoryIdentity(root, 'RELEASE_ROOT_IDENTITY_CHANGED');
-
-    const profileContents = capturedProfile.contents;
     const releaseDir = join(root, commit);
     await ensureRelease({
-      releaseRoot: root, releaseDir, sourceFiles, profileContents, manifest, releaseRootIdentity,
+      releaseRoot: root,
+      releaseDir,
+      sourceFiles,
+      profileContents: capturedProfile.contents,
+      manifest,
+      releaseRootIdentity,
     });
-    const releaseIdentity = await captureDirectoryIdentity(releaseDir, 'RELEASE_IDENTITY_CHANGED');
     if (faultInjector) await faultInjector('after_release');
+    return {
+      commit,
+      releaseDir,
+      manifest,
+      manifestDigest,
+      runtimeSurfaces: manifest.runtime_surfaces,
+    };
+  } catch (error) {
+    primaryError = error;
+    throw error;
+  } finally {
+    try {
+      await capturedProfile.handle.close();
+    } catch (cleanupError) {
+      if (primaryError) primaryError.cleanupFailure = cleanupError.code ?? 'PROFILE_CLOSE_FAILED';
+      else throw cleanupError;
+    }
+  }
+}
+
+export async function activateRelease(
+  { releaseDir, expectedManifestDigest, links, backupRoot } = {},
+  { faultInjector } = {},
+) {
+  validateActivateArguments({ releaseDir, expectedManifestDigest, links, backupRoot });
+  validateFaultInjector(faultInjector);
+  const requestedRelease = resolve(releaseDir);
+  const normalizedLinks = Object.fromEntries(Object.entries(links).map(([name, target]) => [name, resolve(target)]));
+  const normalizedBackup = backupRoot === undefined ? undefined : resolve(backupRoot);
+  const initialVerification = await verifyRelease(requestedRelease, { expectedManifestDigest });
+  if (!initialVerification.ok) {
+    throw new InstallerError('RELEASE_DRIFT', 'staged release failed external-digest verification before activation', {
+      drift: initialVerification.drift,
+    });
+  }
+  const topology = await validateActivationPathTopology({
+    releaseDir: requestedRelease,
+    backupRoot: normalizedBackup,
+    links: normalizedLinks,
+  });
+  const locks = await acquireLocks(topology.linkPaths, {
+    releaseRoot: topology.releaseRoot,
+    backupRoot: topology.backup,
+  });
+  const nonce = locks.map((lock) => lock.nonce).join('-');
+  let primaryError;
+  try {
+    if (faultInjector) await faultInjector('after_locks');
+    if (topology.backup) {
+      await assertStableDirectory(
+        topology.backup.anchorIdentity, 'BACKUP_ROOT_IDENTITY_CHANGED', 'activate-prepare',
+      );
+    }
+    await inspectLinkTargets(topology.linkPaths, normalizedBackup);
+    const canonicalRelease = topology.release.canonical;
+    const releaseRootIdentity = await captureDirectoryIdentity(
+      topology.releaseRoot.canonical, 'RELEASE_ROOT_IDENTITY_CHANGED',
+    );
+    const releaseIdentity = await captureDirectoryIdentity(canonicalRelease, 'RELEASE_IDENTITY_CHANGED');
     const verifyReleaseIntegrity = async (phase) => {
       await assertStableDirectory(releaseRootIdentity, 'RELEASE_ROOT_IDENTITY_CHANGED', phase);
       await assertStableDirectory(releaseIdentity, 'RELEASE_IDENTITY_CHANGED', phase);
-      const verification = await verifyRelease(releaseDir, { expectedManifestDigest: manifestDigest });
+      const verification = await verifyRelease(canonicalRelease, { expectedManifestDigest });
       if (!verification.ok) {
         throw new InstallerError('RELEASE_DRIFT', 'release failed external-digest verification before runtime switch', {
           drift: verification.drift,
@@ -1056,26 +1177,56 @@ export async function installRelease(
     };
     const backups = await switchLinks(
       topology.linkPaths,
-      releaseDir,
-      transactionBackup,
-      topology.protectedPaths.backupRoot?.anchorIdentity,
+      canonicalRelease,
+      topology.backup?.canonical,
+      topology.backup?.anchorIdentity,
       nonce,
       verifyReleaseIntegrity,
     );
-    return { commit, releaseDir, manifest, manifestDigest, backups };
+    return { releaseDir: canonicalRelease, manifestDigest: expectedManifestDigest, backups };
   } catch (error) {
     primaryError = error;
     throw error;
   } finally {
     try {
-      try {
-        await releaseLocks(locks);
-      } catch (cleanupError) {
-        if (primaryError) primaryError.cleanupFailure = cleanupError.code ?? 'LOCK_RELEASE_FAILED';
-        else throw cleanupError;
-      }
-    } finally {
-      await capturedProfile.handle.close();
+      await releaseLocks(locks);
+    } catch (cleanupError) {
+      if (primaryError) primaryError.cleanupFailure = cleanupError.code ?? 'LOCK_RELEASE_FAILED';
+      else throw cleanupError;
     }
   }
+}
+
+export async function installRelease(
+  { repo, ref, profile, releaseRoot, links, backupRoot } = {},
+  { faultInjector } = {},
+) {
+  validateArguments({ repo, ref, profile, releaseRoot, links, backupRoot });
+  validateFaultInjector(faultInjector);
+  const sourceRepo = resolve(repo);
+  const profilePath = resolve(profile);
+  const requestedRoot = resolve(releaseRoot);
+  const normalizedLinks = Object.fromEntries(Object.entries(links).map(([name, target]) => [name, resolve(target)]));
+  const normalizedBackup = backupRoot === undefined ? undefined : resolve(backupRoot);
+  await directory(sourceRepo, 'REPOSITORY_INVALID', { field: 'repo' });
+  await regularFile(profilePath, 'PROFILE_INVALID', { field: 'profile' });
+  const preflight = await validatePathTopology({
+    sourceRepo,
+    profilePath,
+    root: requestedRoot,
+    backupRoot: normalizedBackup,
+    links: normalizedLinks,
+  });
+  await inspectLinkTargets(preflight.linkPaths, normalizedBackup);
+  const staged = await stageRelease(
+    { repo, ref, profile, releaseRoot },
+    { faultInjector },
+  );
+  const activated = await activateRelease({
+    releaseDir: staged.releaseDir,
+    expectedManifestDigest: staged.manifestDigest,
+    links,
+    backupRoot,
+  }, { faultInjector });
+  return { ...staged, backups: activated.backups };
 }

@@ -1,8 +1,12 @@
-import { installRelease, verifyRelease } from './lib/installer.mjs';
+import {
+  activateRelease, installRelease, stageRelease, verifyRelease,
+} from './lib/installer.mjs';
 
 function usage() {
   return [
     'Usage:',
+    '  node scripts/install.mjs stage --repo PATH --ref REF --profile FILE --release-root PATH',
+    '  node scripts/install.mjs activate --release PATH --expected-manifest-digest DIGEST --link NAME=PATH [--link NAME=PATH ...] [--backup-root PATH]',
     '  node scripts/install.mjs install --repo PATH --ref REF --profile FILE --release-root PATH --link NAME=PATH [--link NAME=PATH ...] [--backup-root PATH]',
     '  node scripts/install.mjs verify --release PATH --expected-manifest-digest DIGEST',
   ].join('\n');
@@ -25,7 +29,7 @@ function parseLinks(values) {
 function parseArguments(argv) {
   if (argv.length === 1 && argv[0] === '--help') return { help: true };
   const [command, ...rest] = argv;
-  if (!['install', 'verify'].includes(command)) throw new Error(usage());
+  if (!['stage', 'activate', 'install', 'verify'].includes(command)) throw new Error(usage());
   const values = {};
   const links = [];
   for (let index = 0; index < rest.length; index += 2) {
@@ -48,6 +52,32 @@ function parseArguments(argv) {
       command,
       release: values['--release'],
       expectedManifestDigest: values['--expected-manifest-digest'],
+    };
+  }
+  if (command === 'stage') {
+    const required = ['--repo', '--ref', '--profile', '--release-root'];
+    if (required.some((flag) => !values[flag]) || Object.keys(values).length !== required.length
+      || links.length > 0) throw new Error(usage());
+    return {
+      command,
+      repo: values['--repo'],
+      ref: values['--ref'],
+      profile: values['--profile'],
+      releaseRoot: values['--release-root'],
+    };
+  }
+  if (command === 'activate') {
+    const allowed = ['--release', '--expected-manifest-digest', '--backup-root'];
+    if (!values['--release'] || !/^[0-9a-f]{64}$/.test(values['--expected-manifest-digest'] ?? '')
+      || Object.keys(values).some((flag) => !allowed.includes(flag)) || links.length === 0) {
+      throw new Error(usage());
+    }
+    return {
+      command,
+      releaseDir: values['--release'],
+      expectedManifestDigest: values['--expected-manifest-digest'],
+      links: parseLinks(links),
+      backupRoot: values['--backup-root'],
     };
   }
   const required = ['--repo', '--ref', '--profile', '--release-root'];
@@ -84,6 +114,16 @@ async function run() {
       });
       process.stdout.write(`${JSON.stringify(result)}\n`);
       if (!result.ok) process.exitCode = 1;
+      return;
+    }
+    if (parsed.command === 'stage') {
+      const result = await stageRelease(parsed);
+      process.stdout.write(`STAGED commit=${result.commit} releaseDir=${result.releaseDir} manifestDigest=${result.manifestDigest}\n`);
+      return;
+    }
+    if (parsed.command === 'activate') {
+      const result = await activateRelease(parsed);
+      process.stdout.write(`ACTIVATED releaseDir=${result.releaseDir} manifestDigest=${result.manifestDigest}\n`);
       return;
     }
     const result = await installRelease(parsed);

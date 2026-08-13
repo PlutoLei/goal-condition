@@ -107,12 +107,23 @@ Codex 的 untrusted runtimeResult 只能是 exact candidate `{status:"ready_for_
 
 ## Release trust root
 
-安装器只从 pinned Git commit 读取公开核心的精确 closed-world 文件集，并在缺少任何成员时于 release、backup 或 runtime link 变更之前失败。安装成功会返回/打印 `manifestDigest`；编排器必须把它保存到 release 之外。以后验证必须提供该 external trust root：
+安装器只从 pinned Git commit 读取公开核心的精确 closed-world 文件集，并在缺少任何成员时于 release、backup 或 runtime link 变更之前失败。新安装器生成 manifest schema v2：整包 `manifestDigest` 仍是 release integrity 的外部 trust root；`runtime_surfaces.claude` 与 `runtime_surfaces.codex` 只从 manifest 已覆盖的 `{path,mode,sha256}` 条目计算。每个 required core file 必须恰好属于 `release_only`、`runtime_shared`、`claude` 或 `codex`；未分类、重复、未知或空 surface 都 fail closed。
+
+物化与切换分成两个显式阶段：
+
+```text
+node scripts/install.mjs stage --repo <repo> --ref <commit> --profile <file> --release-root <root>
+node scripts/install.mjs activate --release <staged-release> --expected-manifest-digest <trusted-digest> --link <name=path>
+```
+
+`stage` 只创建、验证 immutable release，不切任何 runtime link；生产 native certification 必须对该 exact physical release 执行。`activate` 重新验证同一 root 与外部 digest，再沿用原子 link switch、readback 和 rollback。兼容的 `install` 命令只是两阶段的顺序组合。stage、认证、activate、install success 与 production effect 必须分别报告。
+
+编排器必须把 stage 输出的 `manifestDigest` 保存到 release 之外。以后验证必须提供该 external trust root：
 
 ```text
 node scripts/install.mjs verify --release <release-directory> --expected-manifest-digest <trusted-manifest-digest>
 ```
 
-Verifier 先比较原始 `manifest.json` bytes 的小写 SHA-256，再解析 manifest 并核对核心文件 bytes、exact Git-derived mode、profile hash/fixed `0600` mode、manifest `0644` mode、release root/release directory/required directories 的 exact `0755` mode、目录闭包和 unexpected entries。所有 mode 都用 `lstat.mode & 0o7777` 的四位八进制值比较，因此 setuid、setgid 或 sticky bit 不会被掩掉。Release 内部被一起重算的 manifest 不具备外部信任；缺少 digest 或 digest 不匹配都 fail closed。安装事务对 link parent、release root 与 backup root 的物理 directory identity 做阶段性复核，覆盖 lock、stage、backup、cutover、readback、rollback 与 owned cleanup；祖先被重定向时停止，而不是沿新的 symlink 拓扑写入。
+Verifier 先比较原始 `manifest.json` bytes 的小写 SHA-256，再解析 manifest 并核对核心文件 bytes、exact Git-derived mode、profile hash/fixed `0600` mode、manifest `0644` mode、release root/release directory/required directories 的 exact `0755` mode、目录闭包和 unexpected entries。v2 verifier 还从 `source_files` 重新计算 runtime surface digest，绝不单独相信声明值。所有 mode 都用 `lstat.mode & 0o7777` 的四位八进制值比较，因此 setuid、setgid 或 sticky bit 不会被掩掉。Release 内部被一起重算的 manifest 不具备外部信任；缺少 digest 或 digest 不匹配都 fail closed。activation 对 link parent、release root 与 backup root 的物理 directory identity 做阶段性复核，覆盖 lock、backup、cutover、readback、rollback 与 owned cleanup；祖先被重定向时停止，而不是沿新的 symlink 拓扑写入。activation 失败保留已验证 staged release，不把它误当成 link-switch 残渣删除。
 
 任何 physical mechanism 无法验证、外部动作没有观察面、runtime 结果格式不完整、success artifact 缺失、命令退出非零或 mutation 越界时，都报告对应 diagnostic 并停止。只有独立 postflight 全绿且无剩余工作时，主会话才能进入 Close。
