@@ -91,8 +91,12 @@ test('materializes an immutable release from the requested commit without profil
 
   const manifestText = await readFile(join(result.releaseDir, 'manifest.json'), 'utf8');
   const manifest = JSON.parse(manifestText);
+  assert.equal(manifest.schema_version, 2);
   assert.equal(manifest.commit, oldCommit);
   assert.match(manifest.profile_sha256, /^[0-9a-f]{64}$/);
+  assert.deepEqual(Object.keys(manifest.runtime_surfaces).sort(), ['claude', 'codex']);
+  assert.match(manifest.runtime_surfaces.claude, /^[0-9a-f]{64}$/);
+  assert.match(manifest.runtime_surfaces.codex, /^[0-9a-f]{64}$/);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('anchors-and-rules')), false);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('tests/')), false);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('README')), false);

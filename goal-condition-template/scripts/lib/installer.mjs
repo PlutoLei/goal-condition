@@ -7,6 +7,12 @@ import {
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
+import {
+  REQUIRED_CORE_FILES, runtimeSurfaceDigests, validateRuntimeSurfaces,
+} from './runtime-surfaces.mjs';
+
+export { REQUIRED_CORE_FILES } from './runtime-surfaces.mjs';
+
 const execFile = promisify(execFileCallback);
 const TEMPLATE_ROOT = 'goal-condition-template/';
 const MANIFEST_NAME = 'manifest.json';
@@ -16,47 +22,6 @@ const PROFILE_MODE = 0o600;
 const MANIFEST_MODE = 0o644;
 const LOCK_WAIT_MS = 20;
 const LOCK_TIMEOUT_MS = 10_000;
-export const REQUIRED_CORE_FILES = Object.freeze([
-  'SKILL.md',
-  'codex-controller/package.json',
-  'codex-controller/schema/goal-session-v2.schema.json',
-  'codex-controller/schema/revision-operation-v1.schema.json',
-  'codex-controller/src/attempt.mjs',
-  'codex-controller/src/capabilities.mjs',
-  'codex-controller/src/cli.mjs',
-  'codex-controller/src/compiler.mjs',
-  'codex-controller/src/domain.mjs',
-  'codex-controller/src/evidence.mjs',
-  'codex-controller/src/execution.mjs',
-  'codex-controller/src/identity.mjs',
-  'codex-controller/src/index.mjs',
-  'codex-controller/src/migration.mjs',
-  'codex-controller/src/policy.mjs',
-  'codex-controller/src/projector.mjs',
-  'codex-controller/src/recovery.mjs',
-  'codex-controller/src/release.mjs',
-  'codex-controller/src/rollout.mjs',
-  'codex-controller/src/state-root.mjs',
-  'codex-controller/src/store.mjs',
-  'codex-controller/src/values.mjs',
-  'codex-controller/src/verification.mjs',
-  'references/codex-goal-session-v2.md',
-  'references/run-contract.md',
-  'references/adapters/claude.md',
-  'references/adapters/codex.md',
-  'schema/run-contract.schema.json',
-  'scripts/validate-contract.mjs',
-  'scripts/snapshot.mjs',
-  'scripts/install.mjs',
-  'scripts/lib/contract.mjs',
-  'scripts/lib/snapshot.mjs',
-  'scripts/lib/installer.mjs',
-  'scripts/lib/workflow.mjs',
-  'scripts/launch.mjs',
-  'scripts/lib/adapters/claude.mjs',
-  'scripts/lib/adapters/codex.mjs',
-  'scripts/lib/claude-permissions.mjs',
-]);
 const REQUIRED_CORE_SET = new Set(REQUIRED_CORE_FILES);
 const SHA256 = /^[0-9a-f]{64}$/;
 
@@ -337,11 +302,13 @@ async function readCoreFiles(repo, commit) {
 }
 
 function manifestFor(commit, sourceFiles, profileSha256) {
+  const sourceEntries = sourceFiles.map(({ path, mode, sha256 }) => ({ path, mode, sha256 }));
   return {
-    schema_version: 1,
+    schema_version: 2,
     commit,
-    source_files: sourceFiles.map(({ path, mode, sha256 }) => ({ path, mode, sha256 })),
+    source_files: sourceEntries,
     profile_sha256: profileSha256,
+    runtime_surfaces: runtimeSurfaceDigests(sourceEntries),
   };
 }
 
@@ -464,12 +431,16 @@ function manifestDiagnostics(manifest) {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
     return [{ code: 'MANIFEST_INVALID', path: MANIFEST_NAME, observed: 'not an object' }];
   }
-  const topLevelFields = ['schema_version', 'commit', 'source_files', 'profile_sha256'];
+  const topLevelFields = manifest.schema_version === 1
+    ? ['schema_version', 'commit', 'source_files', 'profile_sha256']
+    : ['schema_version', 'commit', 'source_files', 'profile_sha256', 'runtime_surfaces'];
   if (Object.keys(manifest).length !== topLevelFields.length
     || topLevelFields.some((field) => !Object.hasOwn(manifest, field))) {
     drift.push({ code: 'MANIFEST_INVALID', path: MANIFEST_NAME, observed: 'unexpected manifest fields' });
   }
-  if (manifest.schema_version !== 1) drift.push({ code: 'MANIFEST_INVALID', path: 'schema_version', observed: manifest.schema_version });
+  if (![1, 2].includes(manifest.schema_version)) {
+    drift.push({ code: 'MANIFEST_INVALID', path: 'schema_version', observed: manifest.schema_version });
+  }
   if (typeof manifest.commit !== 'string' || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(manifest.commit)) drift.push({ code: 'MANIFEST_INVALID', path: 'commit', observed: manifest.commit });
   if (typeof manifest.profile_sha256 !== 'string' || !SHA256.test(manifest.profile_sha256)) drift.push({ code: 'MANIFEST_INVALID', path: 'profile_sha256', observed: 'invalid fingerprint' });
   if (!Array.isArray(manifest.source_files) || manifest.source_files.length === 0) {
@@ -494,6 +465,17 @@ function manifestDiagnostics(manifest) {
     const expected = [...REQUIRED_CORE_FILES].sort();
     if (JSON.stringify(actual) !== JSON.stringify(expected)) {
       drift.push({ code: 'MANIFEST_CORE_SET_MISMATCH', path: 'source_files', observed: 'incomplete or unexpected core set' });
+    }
+  }
+  if (manifest.schema_version === 2) {
+    try {
+      validateRuntimeSurfaces(manifest);
+    } catch (error) {
+      drift.push({
+        code: error.code ?? 'RUNTIME_SURFACE_INVALID',
+        path: 'runtime_surfaces',
+        observed: 'invalid runtime surface binding',
+      });
     }
   }
   return drift;
