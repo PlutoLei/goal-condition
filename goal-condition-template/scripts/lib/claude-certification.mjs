@@ -382,7 +382,11 @@ async function defaultAssertSentinelAbsent({ compiled }) {
 }
 
 async function defaultVerifyBaseline({ compiled, baseline, baselineDigest: expectedBaselineDigest }) {
-  const baselineGitHeads = Object.fromEntries(baseline.entries
+  // `?? []` 对齐 codex-controller/src/cli.mjs 的同名助手：形状不合法的 baseline 应当落到
+  // compareSnapshot 的结构化诊断（它自己也用 `baseline?.entries ?? []`），而不是在这里抛
+  // 未捕获的 TypeError——runClaudeCertification 调用本函数时没有 try/catch，操作员会拿到
+  // 非结构化报错而不是 SNAPSHOT_ENTRY_INVALID / BASELINE_DIGEST_MISMATCH。
+  const baselineGitHeads = Object.fromEntries((baseline?.entries ?? [])
     .filter((entry) => entry.type === 'git')
     .map((entry) => [entry.id, entry.head]));
   const current = await captureSnapshot(compiled.contract, { baselineGitHeads, phase: 'verify' });

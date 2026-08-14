@@ -126,6 +126,10 @@ test('quota, subscription, session, network, and provider failures classify bloc
     { code: 'ECONNRESET' },
     { message: 'subscription or session limit reached' },
     { provider_error: true },
+    // errors 是闭集里唯一真实出现在 envelope（error_max_turns 形态）上的文本字段，必须有一条
+    // 只靠它判定的用例：下面那条 line 132 的 errors 同时带 api_error_status，数值分支先命中，
+    // 词表支路等于零覆盖——删掉 haystack 里的 errorTexts 也能全绿（2026-08-14 并行审发现）。
+    { errors: ['upstream provider overloaded'] },
   ]) assert.equal(classifyClaudeCanaryBlocker(result), 'blocked');
   assert.equal(classifyClaudeCanaryBlocker({ outcome: 'candidate_rejected' }), 'candidate_rejected');
   assert.equal(classifyClaudeCanaryBlocker(new TypeError('controller bug')), 'controller_error');
