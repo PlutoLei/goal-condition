@@ -93,6 +93,8 @@ test('core skill leads with the condition path and gates the contract lane behin
   for (const term of [
     '单一可度量终态', '陈述检查方式', '要紧的约束', '停止条款',
     '不写操作步骤', '只在用户显式点名时进入', '默认永不建议、永不自动升级',
+    // 交付要求：编译完直接进剪贴板，且与展示的那份逐字一致——用户不该再手工框选复制。
+    'pbcopy', '逐字一致',
   ]) {
     assert.ok(skill.includes(term), `condition path is missing ${term}`);
   }
