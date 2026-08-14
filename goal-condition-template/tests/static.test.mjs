@@ -9,7 +9,7 @@ const templateRoot = join(repositoryRoot, 'goal-condition-template');
 const skillPath = join(templateRoot, 'SKILL.md');
 const boundarySkillPath = join(repositoryRoot, 'boundary-design/SKILL.md');
 const referencesRoot = join(templateRoot, 'references');
-const requiredDescription = '当用户要求把任务、边界包或已有完成条件编译成可确认、可验证的 Claude Code 或 Codex goal 运行契约时使用。';
+const requiredDescription = '当用户要把会话收口成一段可直接交给原生 /goal 的 condition 时使用；也在用户显式点名高危任务要审计留痕时，把任务或边界包编译成可确认、可验证的 Claude Code 或 Codex goal 运行契约。';
 
 function read(pathname) {
   return existsSync(pathname) ? readFileSync(pathname, 'utf8') : '';
@@ -79,6 +79,25 @@ test('core skill has the exact public identity and stays compact', () => {
   assert.equal(metadata.name, 'goal-condition');
   assert.equal(metadata.description, requiredDescription);
   assert.ok(skill.split('\n').length <= 201, 'SKILL.md must contain at most 200 lines');
+});
+
+// 主路径是「编译一段 condition 交给用户自己敲 /goal」，契约轨只在用户显式点名高危任务时进入。
+// 这条钉住优先级本身：契约轨的细节最厚、最容易在后续编辑里重新爬回开头，把轻任务又拖进
+// hash 确认与快照流程——2026-08-14 真实会话里连续三次误入契约轨，正是那次的制度性修复。
+test('core skill leads with the condition path and gates the contract lane behind explicit opt-in', () => {
+  const skill = read(skillPath);
+  const conditionHeading = skill.indexOf('## 主路径：把会话收口成一段 condition');
+  const contractHeading = skill.indexOf('## 例外通道：run contract');
+  assert.ok(conditionHeading > 0, 'core skill lost the condition compilation path');
+  assert.ok(contractHeading > conditionHeading, 'the contract lane must not precede the condition path');
+  for (const term of [
+    '单一可度量终态', '陈述检查方式', '要紧的约束', '停止条款',
+    '不写操作步骤', '只在用户显式点名时进入', '默认永不建议、永不自动升级',
+  ]) {
+    assert.ok(skill.includes(term), `condition path is missing ${term}`);
+  }
+  // 评估器只看 transcript 这条事实必须留在正文：它决定 condition 要写「贴出来」而不是「确保成立」。
+  assert.ok(skill.includes('只看 transcript'), 'core skill no longer states the evaluator input boundary');
 });
 
 test('core skill exposes every required reference and every relative Markdown link resolves', () => {
