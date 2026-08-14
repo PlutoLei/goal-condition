@@ -15,6 +15,36 @@ function read(pathname) {
   return existsSync(pathname) ? readFileSync(pathname, 'utf8') : '';
 }
 
+// 从 open paren 起按括号配平取出实参列表原文；跳过字符串、模板串与注释，避免其中的括号错配。
+// 返回 null 表示括号不配平（源码本身有问题，调用方按失败处理）。
+function callArguments(source, openParenIndex) {
+  let depth = 0;
+  for (let index = openParenIndex; index < source.length; index += 1) {
+    const char = source[index];
+    if (char === '/' && source[index + 1] === '/') {
+      index = source.indexOf('\n', index);
+      if (index === -1) return null;
+    } else if (char === '/' && source[index + 1] === '*') {
+      index = source.indexOf('*/', index + 2);
+      if (index === -1) return null;
+      index += 1;
+    } else if (char === "'" || char === '"' || char === '`') {
+      const quote = char;
+      index += 1;
+      while (index < source.length && source[index] !== quote) {
+        index += source[index] === '\\' ? 2 : 1;
+      }
+      if (index >= source.length) return null;
+    } else if (char === '(') {
+      depth += 1;
+    } else if (char === ')') {
+      depth -= 1;
+      if (depth === 0) return source.slice(openParenIndex + 1, index);
+    }
+  }
+  return null;
+}
+
 function markdownFiles(root) {
   if (!existsSync(root)) return [];
   return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
@@ -247,8 +277,14 @@ test('public docs expose the external release trust root and complete required c
     'schema/run-contract.schema.json',
     'scripts/validate-contract.mjs', 'scripts/snapshot.mjs', 'scripts/install.mjs',
     'scripts/lib/contract.mjs', 'scripts/lib/snapshot.mjs',
-    'scripts/lib/installer.mjs', 'scripts/lib/workflow.mjs',
+    'scripts/lib/installer.mjs', 'scripts/lib/permission-specifier.mjs',
+    'scripts/lib/runner-common.mjs',
+    'scripts/lib/runtime-surfaces.mjs', 'scripts/lib/workflow.mjs',
     'scripts/launch.mjs', 'scripts/lib/adapters/claude.mjs', 'scripts/lib/adapters/codex.mjs',
+    'scripts/lib/claude-capability.mjs', 'scripts/lib/claude-certification.mjs',
+    'scripts/lib/claude-permissions.mjs',
+    'scripts/lib/runners/claude.mjs',
+    'scripts/lib/runners/codex.mjs',
     'codex-controller/src/migration.mjs', 'codex-controller/src/attempt.mjs',
     'codex-controller/src/capabilities.mjs', 'codex-controller/src/execution.mjs',
     'codex-controller/src/recovery.mjs', 'codex-controller/src/release.mjs',
@@ -257,6 +293,28 @@ test('public docs expose the external release trust root and complete required c
   ]) {
     assert.ok(readme.includes(term), `README is missing required release member ${term}`);
   }
+});
+
+test('public docs separate release integrity from runtime certification end to end', () => {
+  const readme = read(join(repositoryRoot, 'README.md'));
+  const skill = read(skillPath);
+  const runContract = read(join(referencesRoot, 'run-contract.md'));
+  const claude = read(join(referencesRoot, 'adapters/claude.md'));
+  const codex = read(join(referencesRoot, 'adapters/codex.md'));
+  const protocol = read(join(referencesRoot, 'codex-goal-session-v2.md'));
+  const production = `${readme}\n${skill}\n${runContract}\n${claude}\n${codex}\n${protocol}`;
+  for (const term of [
+    'release integrity', 'runtime certification', 'stage', 'activate',
+    'Candidate', 'Certified', 'certify-claude-prepare', 'certify-claude-run',
+    '完整 preview', 'exact hash', 'Git checkout', 'external manifest v2',
+    'schema-v5', 'runtime_surface_digest', '实现、测试、review、Claude live certification',
+    'GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST',
+  ]) {
+    assert.ok(production.includes(term), `runtime certification docs are missing ${term}`);
+  }
+  assert.match(readme, /Codex runtime surface digest/);
+  assert.match(readme, /source checkout.*不能.*staged|checkout.*不能.*installed/s);
+  assert.doesNotMatch(readme, /receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary/);
 });
 
 test('every current release verify example requires the external manifest digest', () => {
@@ -295,6 +353,33 @@ test('every shipped CLI usage names a path that ships in the release', () => {
       );
     }
   }
+});
+
+test('launcher is a thin dispatcher and runtime attempt lifecycles stay runtime-owned', () => {
+  const launcher = read(join(templateRoot, 'scripts', 'launch.mjs'));
+  const common = read(join(templateRoot, 'scripts', 'lib', 'runner-common.mjs'));
+  const claude = read(join(templateRoot, 'scripts', 'lib', 'runners', 'claude.mjs'));
+  const codex = read(join(templateRoot, 'scripts', 'lib', 'runners', 'codex.mjs'));
+
+  assert.match(launcher, /import\('.\/lib\/runners\/claude\.mjs'\)/);
+  assert.match(launcher, /import\('.\/lib\/runners\/codex\.mjs'\)/);
+  assert.doesNotMatch(launcher, /^import .*\/(?:runners\/(?:claude|codex)|claude-(?:capability|certification))\.mjs';$/m);
+  assert.doesNotMatch(launcher, /function (?:prepareClaude|runClaudeAttempt|runCodexLaunch|runCodexResume)\b/);
+  assert.doesNotMatch(common, /adapters\/(?:claude|codex)\.mjs/);
+  assert.match(claude, /export async function runClaudeAttempt\b/);
+  assert.doesNotMatch(claude, /runCodex(?:Launch|Resume|Finalize|Close)/);
+  assert.match(codex, /export async function runCodexLaunch\b/);
+  assert.doesNotMatch(codex, /runClaude(?:Attempt|Readback)/);
+});
+
+test('Codex controller and shared dispatcher do not statically load the other runtime surface', () => {
+  const launcher = read(join(templateRoot, 'scripts', 'launch.mjs'));
+  const controller = read(join(templateRoot, 'codex-controller', 'src', 'cli.mjs'));
+  assert.doesNotMatch(controller, /scripts\/launch\.mjs/);
+  assert.match(controller, /scripts\/lib\/runner-common\.mjs/);
+  assert.match(controller, /scripts\/lib\/runners\/codex\.mjs/);
+  assert.doesNotMatch(controller, /runners\/claude\.mjs|claude-(?:capability|certification)\.mjs/);
+  assert.doesNotMatch(launcher, /^export \* from .*\/(?:runners|claude-)/m);
 });
 
 test('core and run-contract docs bind launch to canonical artifact bytes and complete preview', () => {
@@ -389,6 +474,34 @@ test('Codex adapter scopes blocked to a healthy tool surface and drops the dispr
   assert.doesNotMatch(adapter, /在状态维度是 no-op/);
   assert.match(adapter, /`1786257720` 推进到 `1786257793`/);
   assert.match(adapter, /并叠加下文的单调序列号/);
+});
+
+test('every captureSnapshot call site declares its phase explicitly', () => {
+  // 真实教训（2026-08-13）：claude-certification 的 defaultCaptureBaseline / defaultVerifyBaseline
+  // 裸调 captureSnapshot(contract)，而 phase 是 fail-closed 必填——离线测试全部注入 fake capture，
+  // 真实 certify-claude-run 因此在 HEAD 上永远 Snapshot preflight failed。离线 fake 盖不住的
+  // 调用形状约束，用静态断言钉死。
+  // 判据必须钉在实参列表上，不能用定长滑窗 + includes：滑窗会让裸调用从注释、相邻调用或无关
+  // 对象字面量里「借」到 phase:，而那正是本断言要拦的形状（2026-08-14 并行审三引擎同时命中）。
+  // 扫描范围同理必须覆盖全部 runtime 源码——只扫 scripts/ 时 codex-controller/src 的调用点在
+  // 断言之外，测试名却写着 every。
+  const roots = ['scripts', 'codex-controller/src'];
+  const sourceFiles = roots.flatMap((relativeRoot) => coreCandidateFiles(join(templateRoot, relativeRoot))
+    .filter((name) => name.endsWith('.mjs'))
+    .map((name) => join(templateRoot, relativeRoot, name)));
+  let callSites = 0;
+  for (const pathname of sourceFiles) {
+    const source = read(pathname);
+    // 只认调用位置：函数声明处的同名 token 不是调用点（否则形参表会被当成实参表）。
+    for (const match of source.matchAll(/\bcaptureSnapshot\s*\(/g)) {
+      if (/\bfunction\s+$/.test(source.slice(Math.max(0, match.index - 24), match.index))) continue;
+      callSites += 1;
+      const args = callArguments(source, match.index + match[0].length - 1);
+      assert.ok(args !== null, `unbalanced captureSnapshot call in ${pathname}`);
+      assert.match(args, /(^|[,{\s])phase:/, `captureSnapshot call without explicit phase in ${pathname}`);
+    }
+  }
+  assert.ok(callSites >= 7, `expected to find the known captureSnapshot call sites, found ${callSites}`);
 });
 
 test('boundary-design emits platform-neutral run-contract vocabulary', () => {

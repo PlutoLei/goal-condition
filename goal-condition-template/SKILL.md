@@ -28,9 +28,11 @@ Claude: Compile shared run contract → Validate → Preview → Confirm(contrac
 
 `runtime="codex"` 永远读取 [GoalSession v2 操作协议](references/codex-goal-session-v2.md) 与 [Codex adapter](references/adapters/codex.md)。controller 缺失、版本不兼容或 gate 未开放时 fail closed，并给出安装、升级或迁移下一步；不得回退到 Codex v1。
 
-V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live；`canary` 只运行显式选择的 V2 canary；`enabled` 是正常 Codex 路由。`canary→enabled` 必须绑定当前安装 manifest digest、controller-owned Certified live canary receipt；换 release 后旧 receipt 失效。旧 rollout state 只做一次单向转换，不恢复旧执行协议。
+V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live；`canary` 只运行显式选择的 V2 canary；`enabled` 是正常 Codex 路由。`canary→enabled` 必须绑定当前安装 manifest digest、Codex runtime-surface digest 与 controller-owned Certified live canary receipt。整包只有 Claude/release-only 文件变化时保留 Codex 认证并刷新当前 release 身份；Codex 或 shared runtime surface 变化时自动降为 `canary`。旧 rollout state 只做一次单向转换；schema-v4 的任何 live 状态都降为 schema-v5 `canary`，不继承旧 receipt。
 
 普通命令省略 `--state-root`，共享机器级 controller store：显式 flag > `GOAL_CONDITION_CODEX_STATE_ROOT` > `$XDG_STATE_HOME/goal-condition/codex-v2` > `<home>/.local/state/goal-condition/codex-v2`。无效的高优先级输入 fail closed，不向低优先级回退；显式 override 是独立 deployment namespace，必须独立 rollout。
+
+installed Codex controller 的 `mode`/live 命令还必须由编排器从 release 外设置 `GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST=<trusted digest>`；缺失或不匹配在 rollout/state 写入前 fail closed。Git checkout 直接验证 HEAD runtime material。
 
 机器级 store 的 `session_id` 与 `run_id` 只能由 controller 生成 128-bit 随机 ID：调用方用 128-bit `request_id`/`nonce` 绑定创建请求，controller 在同一事务保存 resource 与 creation receipt；相同请求可找回原 ID，同 key 改输入 fail closed。`init`/`migrate-v1` 回传 session ID，`prepare`/`resume` 只持久化 Attempt 并回传 run ID，后续显式 `launch`；新建输入不得自选全局主键。
 
@@ -50,11 +52,25 @@ Hard Prohibition 只能是 controller schema 枚举的 capability ID，且 `rule
 
 ## Claude shared run contract
 
+Claude 普通 launch 还必须通过 machine-level Candidate/Certified capability gate。state 位于
+`<controller-state-root>/runtime-certifications/claude.json`，精确绑定已验证 source identity、Claude
+runtime-surface digest、CLI/OS/arch 与非秘密 auth context。Candidate 不得占 attempt、写 settings、claim
+session 或 spawn；不得使用 `force`/`skip`。
+
+唯一 Candidate 豁口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 用户明确确认
+该 hash → `certify-claude-run`。hash 覆盖 source/runtime/auth/disposable roots/sentinel/budget/contract 的闭世界
+certification artifact；source 必须是实际执行根，state 输出固定从已确认 state root 派生。认证命令只接受 controller 内置 profile，必须同时证明
+`ambient-deny-control`、`isolated-adapter-candidate`、`sentinel-output`、`flag-settings-hook`、
+`baseline-preserved`；output 必须在 control 前与 adapter 前都不存在，ambient denial 必须精确命中 sentinel Read，hook 只计本轮
+增量；全绿才原子发布 Certified receipt。429、subscription/session limit、网络或 provider
+错误归 `blocked`，保留旧 receipt，不得写成 canary red。`auth_context_id` 由 operator 管理且不从 secret
+派生；认证主体或 administrative policy context 变化时必须轮换。
+
 ### Compile
 
-按 [run contract 字段与编译规则](references/run-contract.md) 和 [schema](schema/run-contract.schema.json) 生成 canonical JSON，并读取安装实例的 [项目 profile](references/anchors-and-rules.md)。它必须无损包含 single objective、stable context、`judgment_criteria`、`success_criteria`、`constraints`、`allowed_mutations`、`preflight`、`postflight` 与用户明确给出的 `budget.user_provided=true`。
+按 [run contract 字段与编译规则](references/run-contract.md) 和 [schema](schema/run-contract.schema.json) 生成 canonical JSON，并读取安装实例的 [项目 profile](references/anchors-and-rules.md)。它必须无损包含 single objective、stable context、`judgment_criteria`、`success_criteria`、`constraints`、`allowed_mutations`、`preflight`、`postflight`，以及用户明确给出的 `execution_permissions` / `budget.user_provided=true`。
 
-`physical` 只用于已有可执行 mechanism 且有 verifier 的约束；否则写 `audit_only`。Claude 没有面向用户约束的物理面，因此约束一律是 `audit_only`。预算不得推测，`budget.max_turns` 只接受正整数。
+`execution_permissions` 仅用于 Claude，声明自动批准/可达面，不等于 physical constraint；Codex 出现该字段即红。`physical` 只用于已有可执行 mechanism 且有 verifier 的约束；Claude 没有面向用户约束的通用物理面，因此约束一律是 `audit_only`。预算不得推测，`budget.max_turns` 只接受正整数；Claude 默认 50，用户显式值可提高到 200，超过 200 在 launch 前置闸红。
 
 ### Validate、Preview 与 Confirm
 

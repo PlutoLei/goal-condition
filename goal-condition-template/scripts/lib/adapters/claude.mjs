@@ -1,5 +1,13 @@
 // Claude runtime adapter 纯函数。执行豁口在 scripts/launch.mjs；本文件不 spawn、不读写盘。
 
+import {
+  isAbsolute, join, relative, sep,
+} from 'node:path';
+
+import {
+  assertPermissionSpecifier, permissionRule, permissionSpecifierProblem,
+} from '../claude-permissions.mjs';
+
 // 版本闸是**下限**不是精确 allowlist。它想挡的是 result envelope 形状漂移，可那是个代理指标——
 // 真正要防的东西下面的 21-key 全集校验已经**直接**在管：envelope 没变的新版本被精确 allowlist 拦下
 // 是纯误杀，envelope 真变了的新版本直检照样红且诊断更精确。代理指标严于直接指标，代价却是 claude
@@ -18,24 +26,63 @@ export const CLAUDE_RESULT_KEYS = Object.freeze([
 
 const EXPECTED_KEYS = new Set(CLAUDE_RESULT_KEYS);
 
+// max-turns 硬停的 error 形态 envelope 完整 key 集：2.1.226 真实 run 与 2.1.228 spike S-B 逐 key
+// 一致（比成功锚少 api_error_status/result/time_to_request_ms/ttft_ms/ttft_stream_ms、多 errors，
+// terminal_reason 取值 max_turns）。只为实测过的 error_max_turns 建锚；其他 error subtype 没有
+// 实测锚，一律按成功锚落红（fail closed）——「没干完」和「协议漂移」是两类事，2026-08-10 真实
+// run 曾因单锚把前者判成后者而封死续跑。
+export const CLAUDE_ERROR_MAX_TURNS_KEYS = Object.freeze([
+  'duration_api_ms', 'duration_ms', 'errors', 'fast_mode_disabled_reason', 'fast_mode_state',
+  'is_error', 'modelUsage', 'num_turns', 'permission_denials', 'session_id', 'stop_reason',
+  'subtype', 'terminal_reason', 'total_cost_usd', 'type', 'usage', 'uuid',
+]);
+
+const ERROR_MAX_TURNS_KEYS = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
+
 // 版本闸放宽成下限之后，「新版本改了 result envelope」全靠这道直检兜底，所以诊断必须直接指路：
 // 只说「多了 N 个未知 key」的操作员不知道下一步该干什么。隐私纪律不变——只给计数，不回显 key 名。
-const DRIFT_HINT = 'this may be a claude upgrade drifting the result envelope: '
-  + "re-check the new version's result envelope, then update CLAUDE_RESULT_KEYS";
+function driftHint(table) {
+  return 'this may be a claude upgrade drifting the result envelope: '
+    + `re-check the new version's result envelope, then update ${table}`;
+}
 
 export function normalizeTerminal(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, reasons: ['Claude result must be an object'] };
   }
-  const actual = Object.keys(raw);
-  const missing = CLAUDE_RESULT_KEYS.filter((key) => !Object.hasOwn(raw, key));
-  const unknown = actual.filter((key) => !EXPECTED_KEYS.has(key));
+  // 锚按 subtype 二选一：error_max_turns 走 17-key error 锚，其余（含未知 error subtype）一律
+  // 按 21-key 成功锚判。两个锚都是全集相等校验，互斥不重叠。
+  const usesMaxTurnsAnchor = raw.subtype === 'error_max_turns';
+  const budgetExhausted = usesMaxTurnsAnchor
+    && raw.type === 'result'
+    && raw.is_error === true
+    && raw.terminal_reason === 'max_turns';
+  const anchor = usesMaxTurnsAnchor ? CLAUDE_ERROR_MAX_TURNS_KEYS : CLAUDE_RESULT_KEYS;
+  const anchorSet = usesMaxTurnsAnchor ? ERROR_MAX_TURNS_KEYS : EXPECTED_KEYS;
+  const table = usesMaxTurnsAnchor ? 'CLAUDE_ERROR_MAX_TURNS_KEYS' : 'CLAUDE_RESULT_KEYS';
+  const missing = anchor.filter((key) => !Object.hasOwn(raw, key));
+  const unknown = Object.keys(raw).filter((key) => !anchorSet.has(key));
   const reasons = [];
-  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${DRIFT_HINT}`);
-  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${DRIFT_HINT}`);
+  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${driftHint(table)}`);
+  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${driftHint(table)}`);
+  if (usesMaxTurnsAnchor && !budgetExhausted) {
+    reasons.push('Claude error_max_turns result does not match the measured discriminator tuple');
+  }
   if (reasons.length) return { ok: false, reasons };
+  // Provider availability belongs to the controller report, not the four-field candidate. Preserve
+  // only the bounded status needed for routing; never propagate result/errors/transcript bytes.
+  const apiErrorStatus = Number(raw.api_error_status);
+  const providerBlocker = Number.isInteger(apiErrorStatus)
+    && (apiErrorStatus === 429 || apiErrorStatus >= 500)
+    ? { api_error_status: apiErrorStatus }
+    : null;
+  // budgetExhausted 是给控制器报告体的路由信号（「预算耗尽、可续跑」），不进 candidate——
+  // candidate 恒为 4 字段：workflow.mjs 的 claudeTerminalState 做闭世界形状检查，多一个字段
+  // 就把「未达标候选」变成 reject 里的形状错误，两种红不是一回事。
   return {
     ok: true,
+    budgetExhausted,
+    providerBlocker,
     candidate: {
       subtype: raw.subtype,
       is_error: raw.is_error,
@@ -109,32 +156,77 @@ function shellSingleQuote(value) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-export function buildSettings({ hookScriptPath, stateDir }) {
+function unique(values) {
+  return [...new Set(values)];
+}
+
+export function buildSettings({
+  contract = {}, hookScriptPath, stateDir,
+  targetRoots = contract.target_roots ?? [],
+  additionalReadRoots = contract.execution_permissions?.additional_read_roots ?? [],
+}) {
+  const execution = contract.execution_permissions ?? {};
+  // postflight verifier **不进** Bash allow-list（V5'）：argv 是 execFile 语义、Bash specifier 是
+  // shell 字符串语义，两者之间没有可靠编码——argv[0] 通配把整个可执行家族授权出去（git diff 顺带
+  // 授权 git push），argv.join(' ') 既 over-auth（['printf','%s','a; touch x'] 的 join 在 shell 里是
+  // 两条命令）又 under-match（['git','diff','a b.txt'] 的 join 与真实 tokenize 永不匹配，规则静默
+  // 死掉还让作者以为已授权）。verifier 的执行不依赖这条通道：hook 用 execFileSync 跑它（不经
+  // claude permission）；执行体要自己跑 verifier 由作者显式 bash_prefixes 声明（:* 前缀语义）。
+  for (const value of [
+    ...(execution.bash_prefixes ?? []),
+    ...(execution.webfetch_domains ?? []),
+    ...(execution.skills ?? []),
+    hookScriptPath,
+    stateDir,
+  ]) assertPermissionSpecifier(value);
+  const allow = [
+    ...unique(execution.bash_prefixes ?? []).map((prefix) => permissionRule('Bash', `${prefix}:*`)),
+    ...(execution.webfetch_domains ?? []).map((domain) => permissionRule('WebFetch', `domain:${domain}`)),
+    ...(execution.skills ?? []).map((skill) => permissionRule('Skill', skill)),
+  ];
+  const canonicalTargets = unique(targetRoots);
+  const additionalDirectories = unique([
+    ...canonicalTargets.slice(1),
+    ...additionalReadRoots,
+  ]);
   return {
     hooks: { Stop: [{ hooks: [{ type: 'command', command: `node ${shellSingleQuote(hookScriptPath)}` }] }] },
     // S5 实测：Edit deny 对简单 Bash 重定向也有效（permission_denials 实录 tool_name:Bash），
     // 但精确上限（语义级 vs 字面匹配）INCONCLUSIVE——不宣称完全物理保证。
     // deny 路径必须是 realpath 规范形（/var/folders vs /private/var/folders 的字面失配会让 deny 落空）。
-    permissions: { deny: [`Edit(/${hookScriptPath})`, `Edit(/${stateDir}/**)`] },
+    permissions: {
+      allow,
+      deny: [
+        permissionRule('Edit', `/${hookScriptPath}`),
+        permissionRule('Edit', `/${stateDir}/**`),
+      ],
+      additionalDirectories,
+    },
   };
 }
 
-export const CLI_MAX_TURNS = 50;
+export const DEFAULT_MAX_TURNS = 50;
+export const MAX_TURNS_CEILING = 200;
 
-// 用户显式给的 max_turns 与 CLI 默认上限取 min——与 launch.mjs 的 effectiveDeadlineMs 对
-// max_minutes 的处置同形，用户明给的预算不能被更宽的默认值盖过。gate 与 buildStopHook 的
-// maxBlocks 逐字一致（user_provided 且是数字才算数），两处不能对同一个字段各认各的。
+// 50 是未声明预算时的默认值，不是用户预算的静默上限。显式值原样进入 argv；超过 200 的形态
+// 由 assertLaunchable 在 spawn 前拒绝。把两者混成 Math.min 会让用户写 51/200 仍只跑 50 轮，
+// contract 与真实执行预算不一致；把 >200 静默钳制则同样是在改写已确认 contract。
 export function effectiveMaxTurns(budget) {
   return budget?.user_provided && typeof budget.max_turns === 'number'
-    ? Math.min(CLI_MAX_TURNS, Math.floor(budget.max_turns))
-    : CLI_MAX_TURNS;
+    ? budget.max_turns
+    : DEFAULT_MAX_TURNS;
 }
 
-export function launchSpec({ prompt, settingsPath, cwd, budget }) {
+export function launchSpec({ prompt, settingsPath, cwd, budget, sessionId }) {
   // prompt 由调用方从权限受控文件 bytes 读出、单 argv 传入（现行规则）；本函数纯数据不执行。
+  // sessionId 由控制器预派（claim-before-dispatch）：resume 指针在 spawn 之前就落盘，max-turns
+  // 硬停、进程崩溃、stdout 不可解析等一切终局形态下都不丢指针。CLI 对重复 UUID 明确拒绝
+  // （spike S-A 实测），预派不会静默串台。
   return {
-    argv: ['claude', '-p', prompt, '--output-format', 'json', '--settings', settingsPath,
-      '--permission-mode', 'acceptEdits', '--max-turns', String(effectiveMaxTurns(budget))],
+    argv: ['claude', '-p', prompt, '--output-format', 'json', '--session-id', sessionId,
+      '--setting-sources', '',
+      '--settings', settingsPath, '--permission-mode', 'acceptEdits',
+      '--max-turns', String(effectiveMaxTurns(budget))],
     settingsPath, cwd, env_names: [],
   };
 }
@@ -144,6 +236,7 @@ export function resumeSpec({
 }) {
   return {
     argv: ['claude', '-p', diagnosticText, '--resume', sessionId, '--output-format', 'json',
+      '--setting-sources', '',
       '--settings', settingsPath, '--permission-mode', 'acceptEdits',
       '--max-turns', String(effectiveMaxTurns(budget))],
     settingsPath, cwd, env_names: [],
@@ -190,13 +283,43 @@ export function assertLaunchable(contract, probes) {
   if (!DIGEST.test(probes?.contractHash ?? '')) reasons.push('contractHash must be lowercase SHA-256');
   if (probes?.confirmedHash !== probes?.contractHash) reasons.push('confirmed hash does not match contract hash');
   if (probes?.baselineDigestStored !== true) reasons.push('baseline digest is not stored in trusted orchestration state');
+  if (contract?.budget?.user_provided === true
+    && typeof contract.budget.max_turns === 'number'
+    && contract.budget.max_turns > MAX_TURNS_CEILING) {
+    reasons.push(`contract budget.max_turns exceeds the Claude hard ceiling ${MAX_TURNS_CEILING}; reduce the confirmed budget before launch`);
+  }
   const versionReason = versionFloorReason(probes?.claudeVersion);
   if (versionReason !== null) reasons.push(versionReason);
+  // --session-id 是恢复模型的前提（指针先于 spawn 存在）。这不是版本代理：prepare 采集
+  // `claude --help` 直接探测 flag 存在性，直接检查优先于版本推断——flag 何时引入无从由版本
+  // 下限证明，而它是否存在可以直接问。旧 state 目录（本探测引入之前 prepare 的）没有这个值，
+  // 同样落红：重跑 prepare 即可，前置闸拒绝不烧 attempt 配额。
+  if (probes?.claudeSessionIdFlag !== true) {
+    reasons.push('claude --help does not advertise --session-id (or probes.json predates the '
+      + 'capability probe): re-run prepare against a claude that supports controller-issued session ids');
+  }
+  if (probes?.claudeSettingSourcesFlag !== true) {
+    reasons.push('claude --help does not advertise --setting-sources (or probes.json predates the capability '
+      + 'probe): re-run prepare against a claude that can exclude ambient project and user settings');
+  }
   if (settingsContainKey(probes?.settings, ['disableAllHooks', 'allowManagedHooksOnly'])) {
     reasons.push('settings must not disable or restrict hooks');
   }
   const hook = probes?.hookScript;
-  const deny = probes?.settings?.permissions?.deny ?? [];
+  const permissions = probes?.settings?.permissions ?? {};
+  const deny = permissions.deny ?? [];
+  // postflight argv 不进权限 DSL（V5'），因此这里没有它的投影——含括号/空格的 verifier 路径
+  // 不该 false-red 一次本可正常起飞的 launch。
+  const permissionInputs = [
+    ...(contract?.execution_permissions?.bash_prefixes ?? []),
+    ...(contract?.execution_permissions?.webfetch_domains ?? []),
+    ...(contract?.execution_permissions?.skills ?? []),
+    probes?.stateDir,
+    hook?.path,
+  ];
+  if (permissionInputs.some((value) => permissionSpecifierProblem(value) !== null)) {
+    reasons.push('a value entering the Claude permission specifier DSL is not representable');
+  }
   if (!hook?.exists) reasons.push('hook script is not on disk in controller state');
   if (hook?.sha256 !== probes?.expectedHookSha256) reasons.push('hook script bytes do not match the generated script');
   if (hook?.mode !== '0500') reasons.push('hook script mode must be 0500');
@@ -211,21 +334,59 @@ export function assertLaunchable(contract, probes) {
   if (!deny.includes(`Edit(/${probes?.stateDir}/**)`)) {
     reasons.push('settings must deny Edit on the whole controller state directory');
   }
-  if ((probes?.targetRoots ?? []).some((root) => typeof hook?.path === 'string' && hook.path.startsWith(`${root}/`))) {
-    reasons.push('hook script must live outside every target root');
+  // allow/additionalDirectories 与 deny 一样属于 buildSettings 的消费面。这里独立重算期望形状，
+  // 防的是生成器回归（生产路径的 settings 是现场重写，磁盘比对本身抓不到“稳定地产错”）。
+  // 与 buildSettings 逐字镜像：显式 bash_prefixes → :* 前缀；postflight 不进 allow（V5'），
+  // 镜像里同样没有它——两侧再无 argv 投影可分叉。
+  const expectedAllow = [
+    ...unique(contract?.execution_permissions?.bash_prefixes ?? []).map((prefix) => `Bash(${prefix}:*)`),
+    ...(contract?.execution_permissions?.webfetch_domains ?? [])
+      .map((domain) => `WebFetch(domain:${domain})`),
+    ...(contract?.execution_permissions?.skills ?? []).map((skill) => `Skill(${skill})`),
+  ];
+  if (JSON.stringify(permissions.allow ?? null) !== JSON.stringify(expectedAllow)) {
+    reasons.push('settings allow rules do not exactly match the confirmed contract');
   }
-  // buildSettings 不接收 contract：生成的 deny 恒为「hook 脚本 + state 目录」两条，护的都是控制器
-  // 自己的机件。也就是说 claude runtime 上根本不存在面向用户约束的物理拦截面，任何
-  // enforcement:"physical" 都不成立，一律红——降级成 audit_only 是 contract 作者的决定，执行层
-  // 只负责停车。曾经的判据是「mechanism 必须逐字点名一条生成的 deny 规则」：行为同样是红，但
-  // 诊断在骗人——它读起来像「改 mechanism 就能过」，而那两条 deny 含 contractHash（还含 prepare
-  // 才知道的 stateRoot/controller），把它写进 contract 会改掉 hash，是个不动点陷阱。故 reason 直说
-  // 真因，且刻意不提 mechanism（N1）。
+  // unique 后再 slice，与 buildSettings 的 unique(targetRoots).slice(1) 逐字同序：unique(T).slice(1)
+  // ≠ unique(T.slice(1))，重复首根时两者分叉会把合法 contract 永久判红（V1，三方收敛）。
+  const expectedAdditionalDirectories = unique([
+    ...unique(probes?.targetRoots ?? []).slice(1),
+    ...(probes?.additionalReadRoots ?? []),
+  ]);
+  if (JSON.stringify(permissions.additionalDirectories ?? null)
+    !== JSON.stringify(expectedAdditionalDirectories)) {
+    reasons.push('settings additionalDirectories do not exactly match the canonical contract roots');
+  }
+  // target_roots 与 additional_read_roots 都是 Claude 可达面。任何一根与 controller state 互为
+  // 祖先（包括根目录 /）都会暴露 hook-env.json。用 path.relative 做 component-safe 包含判定，
+  // 避免字符串 `${root}/` 在 / 上退化成 //，也避免 /foo 与 /foobar 的前缀误判。
+  const containsPath = (parent, child) => {
+    if (typeof parent !== 'string' || typeof child !== 'string') return false;
+    const rel = relative(parent, child);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const authorizedRoots = [
+    ...(probes?.targetRoots ?? []),
+    ...(probes?.additionalReadRoots ?? []),
+  ];
+  for (const root of authorizedRoots) {
+    if (containsPath(root, probes?.stateDir) || containsPath(probes?.stateDir, root)) {
+      reasons.push('an authorized root overlaps the controller state directory; credentials and controller '
+        + 'evidence must stay outside every Claude-accessible root');
+    }
+  }
+  // execution_permissions 编译的是自动授权，deny 保护的是 controller 与 Claude 项目配置；两者都
+  // 没有把任意业务 constraint 编译成可验证的 OS enforcement。因此 enforcement:"physical" 仍一律
+  // 红——降级成 audit_only 是 contract 作者的决定，执行层只负责停车。曾经的判据是「mechanism
+  // 必须逐字点名一条生成的 deny 规则」：行为同样是红，但诊断在骗人——它读起来像「改 mechanism
+  // 就能过」，而 controller deny 含 contractHash/stateRoot/controller，把它写进 contract 会改 hash，
+  // 是不动点陷阱。故 reason 直说真因，且刻意不提 mechanism（N1）。
   for (const constraint of contract?.constraints ?? []) {
     if (constraint?.enforcement !== 'physical') continue;
     reasons.push(`constraint ${constraint.id ?? '?'} declares physical enforcement, which the claude `
-      + 'runtime cannot support: this adapter generates deny rules only for its own hook script and '
-      + 'state directory, never for user-facing constraints, so rewrite the constraint as audit_only');
+      + 'runtime cannot support: execution permissions authorize tools and generated deny rules protect '
+      + 'controller or Claude settings, but arbitrary user-facing constraints have no physical compiler; '
+      + 'rewrite the constraint as audit_only');
   }
   return { ok: reasons.length === 0, reasons };
 }

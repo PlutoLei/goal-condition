@@ -85,28 +85,40 @@ Claude 与 Codex 共用底层 snapshot、launcher 安全能力，但不再共用
 
 Claude 使用 controller-owned `runBinding`、`preflightEvidence` 与 `postflightEvidence`。Codex V2 由独立 controller 绑定 Authorization、Design Revision、AttemptManifest、LaunchIntent、Evidence、turn receipt 与 runtime readback。候选不得伪造任一控制器证据；任何缺项、乱序、cross-binding、旁路、权限错误或 remaining work 都 fail closed。
 
+整包 `release integrity` 与供应商原生 `runtime certification` 是两份状态。manifest schema v2 的外部摘要证明整个 release 未漂移；Claude/Codex runtime surface digest 只决定相应运行时认证何时失效。代码完成也不等于已经投产：实现、测试、review、Claude live certification、push、merge、install、release 与 production effect 必须分别报告。
+
+Claude 普通 launch 只接受与当前 source、Claude runtime surface、CLI/OS/arch、auth mode 和 opaque auth context 精确匹配的 Certified state；缺失或漂移只得到 Candidate，并在任何 attempt、settings、pointer、lease 或进程副作用前阻断。唯一入口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 明确确认 exact hash → `certify-claude-run`。确认 hash 覆盖 closed-world certification artifact：source realpath + commit/manifest、runtime digest、auth mode/context、disposable roots、sentinel、预算与固定 run contract；`--source` 还必须正是当前 `launch.mjs` 的执行根。capability state 不接受自由输出路径，只能从已确认且与 source/target 隔离的 state root 派生为 `runtime-certifications/claude.json`。开发态 Git checkout receipt 绑定 checkout 的 realpath 与 commit，source checkout 认证不能转移给 staged 或 installed 的 external manifest v2 release；生产认证必须直接针对待激活的 staged release。
+
 ### Codex GoalSession v2
 
 Codex 只使用 GoalSession v2：用户只确认稳定 Goal 与 Maximum Authority，Boundary、Condition 与 content-bound Context 在授权内以 typed Design Revision 演化，每次 revision 产生新的 immutable Attempt。controller 不可用或 V2 gate 关闭时 fail closed，不回退到旧 Codex lifecycle。旧 contract 只能通过 `migrate-v1` 生成未确认 V2 Draft。Grill 只用于设计评审，不进入 runtime。Context path 必须在 Active Boundary 内；无 `write` Authority 的 Attempt 使用 `read-only` sandbox，获授 `write` 才使用 `workspace-write`。
 
 机器级 store 的 session/run 主键由 controller 生成；调用方用已知的 128-bit `request_id`/`nonce` 绑定创建请求，creation receipt 与 session，或与 LaunchIntent + lease，在同一事务提交。响应丢失后重发完全相同的输入会找回原 ID，同 key 改输入 fail closed。`resume` 只完成这次 durable prepare 并返回 run ID，显式 `launch` 才启动 runtime，避免 runtime 初始化失败吞掉唯一可寻址结果。
 
-LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；`canary→enabled` 的 receipt 绑定当前安装 `manifestDigest`，因此 release 切换后必须重新 canary，不能复用旧版本绿证据。
+LaunchIntent MAC 绑定 controller release digest、AttemptManifest 投影与 target root 物理身份。verify 的额外 native turn、finalize 前后 turn fence 的任何差异都会形成持久化旁路；close 只有证明 runtime quiesced 才释放 controller root lease。V2 gate 使用 `disabled → canary → enabled`；schema-v5 同时记录当前整包 manifest 与 Codex runtime surface digest。只有 Claude/release-only 文件变化时刷新整包审计身份并保留 Codex 认证；Codex/shared runtime surface 变化时清 receipt、自动降为 `canary`。旧 schema-v4 live 状态也一律降为 schema-v5 `canary`，不能把整包摘要冒充运行时认证。调用 installed controller 的 `mode` 或 live 命令时，编排器必须从 release 外保留的 trust root 设置 `GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST=<digest>`；缺失或不匹配只返回安全错误码，并在 rollout/state 写入前停止。Git checkout 模式则直接核 HEAD runtime material，不使用该值。
 
 ## 安装与私有 profile
 
-安装器从明确的 Git commit 物化共享核心，而不是复制目录。它把私有 profile 注入 release，并只切换命令中显式给出的 runtime link；因此可以同时切 Claude/Codex，也可以像本次 Codex-only rollout 一样只给 `--link codex=...`，Claude link 保持旧 release。profile 不应提交到这个公开仓。安装输出包含 `manifestDigest`，它是 release 外部（external）保留的信任根，不能从待验证 release 自己重建。本节两段命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`，两者指的是同一个文件，差别只在你站在哪一层。下面仅展示 Codex-only 参数形状，所有值都是占位符，示例不执行安装：
+安装器从明确的 Git commit 物化共享核心，而不是复制目录。`stage` 只生成并验证 immutable release，不切 runtime link；原生认证直接针对这个物理 release 执行。`activate` 必须重新提供 staged release 的外部 `manifestDigest`，验证 root/digest 后才原子切换显式给出的 runtime link。profile 不应提交到这个公开仓。manifest schema v2 在整包 digest 之外还保存 Claude/Codex 各自的 runtime surface digest；整包 digest 仍是 release integrity 的外部信任根。本节命令都**从本仓 checkout 根目录执行**，因此写作 `goal-condition-template/scripts/install.mjs`；脚本自身打印的 usage 用的是 release 根目录下的 `scripts/install.mjs`。
 
 ```text
-node goal-condition-template/scripts/install.mjs install \
+node goal-condition-template/scripts/install.mjs stage \
   --repo <PUBLIC_REPOSITORY> \
   --ref <COMMIT_SHA> \
   --profile <PRIVATE_PROFILE_FILE> \
-  --release-root <RELEASE_DIRECTORY> \
+  --release-root <RELEASE_DIRECTORY>
+```
+
+保存 stage 输出的 `releaseDir` 与 `manifestDigest`。完成该 staged release 所需的 runtime 原生认证后，使用同一 root 和 digest 激活；下面只切 Codex link，Claude link 保持原状态：
+
+```text
+node goal-condition-template/scripts/install.mjs activate \
+  --release <STAGED_RELEASE_DIRECTORY> \
+  --expected-manifest-digest <TRUSTED_MANIFEST_DIGEST> \
   --link codex=<CODEX_SKILL_LINK>
 ```
 
-安装后保存输出的 `manifestDigest`。验证指定 release 时必须显式传回这个外部值；verifier 会先校验原始 manifest bytes，再核对 closed-world 文件 hashes、core 的 exact Git-derived mode、profile `0600`、manifest `0644`，以及 release root 和所有必需目录的 `0755`；四位八进制比较也会拒绝 setuid、setgid 与 sticky bits：
+`install` 仍作为 `stage` 后紧接 `activate` 的兼容命令存在，但它不提供两个阶段之间运行原生认证的窗口。验证指定 release 时必须显式传回外部 digest；verifier 会先校验原始 manifest bytes，再核对 closed-world 文件 hashes、core 的 exact Git-derived mode、profile `0600`、manifest `0644`，以及 release root 和所有必需目录的 `0755`；四位八进制比较也会拒绝 setuid、setgid 与 sticky bits：
 
 ```text
 node goal-condition-template/scripts/install.mjs verify \
@@ -128,10 +140,18 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `scripts/lib/contract.mjs`
 - `scripts/lib/snapshot.mjs`
 - `scripts/lib/installer.mjs`
+- `scripts/lib/permission-specifier.mjs`
+- `scripts/lib/runner-common.mjs`
+- `scripts/lib/runtime-surfaces.mjs`
 - `scripts/lib/workflow.mjs`
 - `scripts/launch.mjs`
 - `scripts/lib/adapters/claude.mjs`
 - `scripts/lib/adapters/codex.mjs`
+- `scripts/lib/claude-capability.mjs`
+- `scripts/lib/claude-certification.mjs`
+- `scripts/lib/claude-permissions.mjs`
+- `scripts/lib/runners/claude.mjs`
+- `scripts/lib/runners/codex.mjs`
 - `codex-controller/package.json`
 - `codex-controller/schema/goal-session-v2.schema.json`
 - `codex-controller/schema/revision-operation-v1.schema.json`
@@ -156,6 +176,8 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `codex-controller/src/verification.mjs`
 
 安装事务对 runtime link parent、release root 与 backup root 的物理 directory identity 反复核对；stage、backup、cutover、readback、rollback 或 owned cleanup 期间发生祖先重定向都会 fail closed。
+
+runtime surface 分类同时受静态 import-closure 回归约束：shared 文件不能静态加载单一 runtime，Claude/Codex 文件只能静态依赖 shared 与自身 surface。共享 dispatcher 按实际命令延迟加载 runner；Codex controller 直接加载 common + Codex runner，不经混合 dispatcher。这样“摘要未变化”才真正意味着另一 runtime 的代码无法在模块启动期破坏当前运行时。
 
 ## 测试
 

@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { commandNames } from '../src/cli.mjs';
-import { stateDirFor } from '../../scripts/launch.mjs';
+import { stateDirFor } from '../../scripts/lib/runner-common.mjs';
 import { validCompilerInput } from './helpers.mjs';
 
 const cliPath = new URL('../src/cli.mjs', import.meta.url).pathname;
@@ -480,6 +480,7 @@ test('mode and capability commands are closed-world and controller-only', async 
   const initialMode = run(['mode', '--state-root', stateRoot, '--input', get]).stdoutJson;
   assert.equal(initialMode.mode, 'disabled');
   assert.match(initialMode.release_manifest_digest, /^[0-9a-f]{64}$/);
+  assert.match(initialMode.runtime_surface_digest, /^[0-9a-f]{64}$/);
   const set = await writeJson(root, 'mode-set.json', {
     action: 'set', next: 'canary', changed_at: '2026-08-11T00:00:00.000Z', canary_session_id: null,
   });

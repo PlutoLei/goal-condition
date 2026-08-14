@@ -12,10 +12,19 @@ const NEXT = Object.freeze({
   canary: new Set(['disabled', 'enabled']),
   enabled: new Set(['disabled', 'canary']),
 });
-const STATE_FIELDS = Object.freeze([
+const STATE_FIELDS_V5 = Object.freeze([
+  'schema_version', 'mode', 'changed_at', 'release_manifest_digest',
+  'runtime_surface_digest', 'canary_receipt',
+]);
+const STATE_FIELDS_V4 = Object.freeze([
   'schema_version', 'mode', 'changed_at', 'release_manifest_digest', 'canary_receipt',
 ]);
-const CANARY_FIELDS = Object.freeze([
+const CANARY_FIELDS_V3 = Object.freeze([
+  'receipt_version', 'session_id', 'authorization_hash', 'attempt_id', 'run_id',
+  'release_manifest_digest', 'runtime_surface_digest', 'design_revision_hash',
+  'launch_receipt_hash', 'certification_event_hash',
+]);
+const CANARY_FIELDS_V2 = Object.freeze([
   'receipt_version', 'session_id', 'authorization_hash', 'attempt_id', 'run_id',
   'controller_release_digest', 'design_revision_hash', 'launch_receipt_hash',
   'certification_event_hash',
@@ -29,7 +38,24 @@ function rolloutError(code, message) {
 
 function validCanaryReceipt(receipt) {
   try {
-    exactFields(receipt, CANARY_FIELDS, 'rollout_canary_receipt');
+    exactFields(receipt, CANARY_FIELDS_V3, 'rollout_canary_receipt');
+  } catch {
+    return false;
+  }
+  return receipt.receipt_version === 3
+    && ['session_id', 'attempt_id', 'run_id'].every(
+      (field) => typeof receipt[field] === 'string' && receipt[field].length > 0,
+    )
+    && [
+      'authorization_hash', 'release_manifest_digest', 'runtime_surface_digest',
+      'design_revision_hash', 'launch_receipt_hash', 'certification_event_hash',
+    ]
+      .every((field) => typeof receipt[field] === 'string' && HASH.test(receipt[field]));
+}
+
+function validLegacyCanaryReceipt(receipt) {
+  try {
+    exactFields(receipt, CANARY_FIELDS_V2, 'legacy_rollout_canary_receipt');
   } catch {
     return false;
   }
@@ -40,11 +66,13 @@ function validCanaryReceipt(receipt) {
     && [
       'authorization_hash', 'controller_release_digest', 'design_revision_hash',
       'launch_receipt_hash', 'certification_event_hash',
-    ]
-      .every((field) => typeof receipt[field] === 'string' && HASH.test(receipt[field]));
+    ].every((field) => typeof receipt[field] === 'string' && HASH.test(receipt[field]));
 }
 
-export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
+export function certifyRolloutCanary(
+  exported,
+  { releaseManifestDigest, runtimeSurfaceDigest } = {},
+) {
   const session = exported?.session;
   const events = exported?.events;
   const finalDesign = session?.design_revisions?.at(-1);
@@ -69,6 +97,7 @@ export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
     && attempt?.status === 'Verified'
     && attempt?.completion_level === 'certified'
     && HASH.test(releaseManifestDigest ?? '')
+    && HASH.test(runtimeSurfaceDigest ?? '')
     && attempt?.controller_release_digest === releaseManifestDigest
     && attempt?.design_revision_hash === finalDesign?.design_revision_hash
     && Array.isArray(attempt?.bypasses)
@@ -91,12 +120,13 @@ export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
     );
   }
   return {
-    receipt_version: 2,
+    receipt_version: 3,
     session_id: session.session_id,
     authorization_hash: session.authorization_hash,
     attempt_id: attempt.attempt_id,
     run_id: attempt.run_id,
-    controller_release_digest: releaseManifestDigest,
+    release_manifest_digest: releaseManifestDigest,
+    runtime_surface_digest: runtimeSurfaceDigest,
     design_revision_hash: finalDesign.design_revision_hash,
     launch_receipt_hash: digestCanonical(receipt),
     certification_event_hash: certification.event_hash,
@@ -115,10 +145,11 @@ export function transitionRollout(current, next, { canaryReceipt = null } = {}) 
 
 function disabledState() {
   return {
-    schema_version: 4,
+    schema_version: 5,
     mode: 'disabled',
     changed_at: null,
     release_manifest_digest: null,
+    runtime_surface_digest: null,
     canary_receipt: null,
   };
 }
@@ -129,7 +160,28 @@ function timestampValid(value) {
 
 function validV2State(value) {
   try {
-    exactFields(value, STATE_FIELDS, 'rollout_state');
+    exactFields(value, STATE_FIELDS_V5, 'rollout_state');
+  } catch {
+    return false;
+  }
+  if (value.schema_version !== 5
+    || !ROLLOUT_MODES.includes(value.mode)
+    || !timestampValid(value.changed_at)) return false;
+  if (value.mode === 'disabled') {
+    return value.release_manifest_digest === null
+      && value.runtime_surface_digest === null
+      && value.canary_receipt === null;
+  }
+  if (!HASH.test(value.release_manifest_digest ?? '')
+    || !HASH.test(value.runtime_surface_digest ?? '')) return false;
+  if (value.mode === 'canary') return value.canary_receipt === null;
+  return validCanaryReceipt(value.canary_receipt)
+    && value.runtime_surface_digest === value.canary_receipt.runtime_surface_digest;
+}
+
+function validV4State(value) {
+  try {
+    exactFields(value, STATE_FIELDS_V4, 'rollout_v4_state');
   } catch {
     return false;
   }
@@ -141,13 +193,13 @@ function validV2State(value) {
   }
   if (!HASH.test(value.release_manifest_digest ?? '')) return false;
   if (value.mode === 'canary') return value.canary_receipt === null;
-  return validCanaryReceipt(value.canary_receipt)
+  return validLegacyCanaryReceipt(value.canary_receipt)
     && value.release_manifest_digest === value.canary_receipt.controller_release_digest;
 }
 
-function validLegacyState(value) {
+function validV3State(value) {
   try {
-    exactFields(value, STATE_FIELDS, 'legacy_rollout_state');
+    exactFields(value, STATE_FIELDS_V4, 'rollout_v3_state');
   } catch {
     return false;
   }
@@ -155,7 +207,7 @@ function validLegacyState(value) {
     && LEGACY_ROLLOUT_MODES.includes(value.mode)
     && timestampValid(value.changed_at)
     && (['default', 'legacy-freeze'].includes(value.mode)
-      ? validCanaryReceipt(value.canary_receipt)
+      ? validLegacyCanaryReceipt(value.canary_receipt)
         && value.release_manifest_digest === value.canary_receipt.controller_release_digest
       : value.canary_receipt === null && value.release_manifest_digest === null);
 }
@@ -182,33 +234,56 @@ export function readRolloutState(path) {
   return value;
 }
 
-export function ensureRolloutState(path, { releaseManifestDigest } = {}) {
+function assertCurrentRuntimeIdentity({ releaseManifestDigest, runtimeSurfaceDigest }) {
+  if (!HASH.test(releaseManifestDigest ?? '')) {
+    throw rolloutError('ROLLOUT_RELEASE_REQUIRED', 'live V2 rollout requires the installed release digest');
+  }
+  if (!HASH.test(runtimeSurfaceDigest ?? '')) {
+    throw rolloutError('ROLLOUT_RUNTIME_REQUIRED', 'live V2 rollout requires the Codex runtime surface digest');
+  }
+}
+
+function currentCanaryState(value, { releaseManifestDigest, runtimeSurfaceDigest }) {
+  assertCurrentRuntimeIdentity({ releaseManifestDigest, runtimeSurfaceDigest });
+  return {
+    schema_version: 5,
+    mode: 'canary',
+    changed_at: value.changed_at,
+    release_manifest_digest: releaseManifestDigest,
+    runtime_surface_digest: runtimeSurfaceDigest,
+    canary_receipt: null,
+  };
+}
+
+export function ensureRolloutState(
+  path,
+  { releaseManifestDigest, runtimeSurfaceDigest } = {},
+) {
   const value = parseRolloutState(path);
   if (value === null) return disabledState();
-  if (validV2State(value)) return value;
-  if (!validLegacyState(value)) throw rolloutError('ROLLOUT_STATE_INVALID', 'rollout state is invalid');
-  let next;
-  if (value.mode === 'shadow') {
-    next = { ...disabledState(), changed_at: value.changed_at };
-  } else if (value.mode === 'opt-in') {
-    if (!HASH.test(releaseManifestDigest ?? '')) {
-      throw rolloutError('ROLLOUT_RELEASE_REQUIRED', 'legacy canary migration requires the installed release digest');
+  if (validV2State(value)) {
+    if (value.mode === 'disabled') return value;
+    assertCurrentRuntimeIdentity({ releaseManifestDigest, runtimeSurfaceDigest });
+    if (value.runtime_surface_digest !== runtimeSurfaceDigest) {
+      const next = currentCanaryState(value, { releaseManifestDigest, runtimeSurfaceDigest });
+      writeState(path, next);
+      return next;
     }
-    next = {
-      schema_version: 4,
-      mode: 'canary',
-      changed_at: value.changed_at,
-      release_manifest_digest: releaseManifestDigest,
-      canary_receipt: null,
-    };
+    if (value.release_manifest_digest !== releaseManifestDigest) {
+      const next = { ...value, release_manifest_digest: releaseManifestDigest };
+      writeState(path, next);
+      return next;
+    }
+    return value;
+  }
+  if (!validV4State(value) && !validV3State(value)) {
+    throw rolloutError('ROLLOUT_STATE_INVALID', 'rollout state is invalid');
+  }
+  let next;
+  if (value.mode === 'disabled' || value.mode === 'shadow') {
+    next = { ...disabledState(), changed_at: value.changed_at };
   } else {
-    next = {
-      schema_version: 4,
-      mode: 'enabled',
-      changed_at: value.changed_at,
-      release_manifest_digest: value.release_manifest_digest,
-      canary_receipt: value.canary_receipt,
-    };
+    next = currentCanaryState(value, { releaseManifestDigest, runtimeSurfaceDigest });
   }
   writeState(path, next);
   return next;
@@ -220,19 +295,19 @@ export function readRolloutMode(path, options) {
 
 export function writeRolloutMode({
   path, current, next, changedAt, canaryReceipt = null, releaseManifestDigest,
+  runtimeSurfaceDigest,
 }) {
   const mode = transitionRollout(current, next, { canaryReceipt });
   const timestamp = new Date(changedAt);
   if (Number.isNaN(timestamp.getTime())) throw rolloutError('ROLLOUT_TIME_INVALID', 'changedAt is invalid');
-  if (mode !== 'disabled' && !HASH.test(releaseManifestDigest ?? '')) {
-    throw rolloutError('ROLLOUT_RELEASE_REQUIRED', 'live V2 rollout requires the installed release digest');
-  }
+  if (mode !== 'disabled') assertCurrentRuntimeIdentity({ releaseManifestDigest, runtimeSurfaceDigest });
   const nextReceipt = mode === 'enabled' ? canaryReceipt : null;
   const state = {
-    schema_version: 4,
+    schema_version: 5,
     mode,
     changed_at: timestamp.toISOString(),
     release_manifest_digest: mode === 'disabled' ? null : releaseManifestDigest,
+    runtime_surface_digest: mode === 'disabled' ? null : runtimeSurfaceDigest,
     canary_receipt: nextReceipt,
   };
   if (!validV2State(state)) throw rolloutError('ROLLOUT_STATE_INVALID', 'next rollout state is invalid');
@@ -240,8 +315,14 @@ export function writeRolloutMode({
   return mode;
 }
 
-export function assertLiveRollout(stateRoot, { releaseManifestDigest } = {}) {
-  const state = ensureRolloutState(join(stateRoot, 'rollout.json'), { releaseManifestDigest });
+export function assertLiveRollout(
+  stateRoot,
+  { releaseManifestDigest, runtimeSurfaceDigest } = {},
+) {
+  const state = ensureRolloutState(join(stateRoot, 'rollout.json'), {
+    releaseManifestDigest,
+    runtimeSurfaceDigest,
+  });
   const { mode } = state;
   if (mode === 'disabled') {
     throw rolloutError(
@@ -254,6 +335,13 @@ export function assertLiveRollout(stateRoot, { releaseManifestDigest } = {}) {
     throw rolloutError(
       'ROLLOUT_RELEASE_MISMATCH',
       'the live rollout was certified by a different controller release',
+    );
+  }
+  if (!HASH.test(runtimeSurfaceDigest ?? '')
+    || state.runtime_surface_digest !== runtimeSurfaceDigest) {
+    throw rolloutError(
+      'ROLLOUT_RUNTIME_MISMATCH',
+      'the live rollout belongs to a different Codex runtime surface',
     );
   }
   return mode;

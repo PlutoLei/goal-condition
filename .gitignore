@@ -1,1 +1,3 @@
 .worktrees/
+# launch.test.mjs 把 state 根开在仓根下（.gc-state-test-*），异常退出时 exit 钩子可能删不干净
+.gc-state-test-*/

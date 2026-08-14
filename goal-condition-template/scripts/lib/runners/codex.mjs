@@ -1,0 +1,1295 @@
+// Codex-owned probe, isolated client, launch/resume/finalize, lease, and close lifecycle.
+import { execFile as execFileCallback } from 'node:child_process';
+import {
+  appendFileSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync,
+} from 'node:fs';
+import { appendFile, chmod, readFile, writeFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { homedir, tmpdir } from 'node:os';
+import { basename, isAbsolute, join } from 'node:path';
+import { promisify } from 'node:util';
+
+import {
+  assertLaunchable as assertCodexLaunchable, assertResumedSession, assertSetReturnedStatus,
+  bindControllerTurnText, CODEX_SANDBOX_MODE, GoalRpcClient, normalizeTerminal as normalizeCodexTerminal,
+  noteworthyNotification, resumeRpcOps, TURN_BOUNDARY_METHODS, verifyFinalizeAttribution,
+} from '../adapters/codex.mjs';
+import { contractHash } from '../contract.mjs';
+import {
+  AttemptClaimError, MAX_AUTO_RESUMES, assertAttemptBudgetLeft, canonicalPath, initStateDir,
+  maxExistingAttempt, nextAttempt,
+} from '../runner-common.mjs';
+import { runtimeTerminalState } from '../workflow.mjs';
+
+const execFile = promisify(execFileCallback);
+
+const SHA256 = /^[0-9a-f]{64}$/;
+const HEX64 = SHA256;
+
+function sha256Text(text) {
+  return createHash('sha256').update(text, 'utf8').digest('hex');
+}
+
+function nativeTurnInputSha256(turn) {
+  const userMessages = Array.isArray(turn?.items)
+    ? turn.items.filter((item) => item?.type === 'userMessage') : [];
+  const content = userMessages[0]?.content;
+  if (userMessages.length !== 1
+    || !Array.isArray(content)
+    || content.length !== 1
+    || content[0]?.type !== 'text'
+    || typeof content[0]?.text !== 'string') return null;
+  return sha256Text(content[0].text);
+}
+
+function summarizeNativeTurn(turn) {
+  return {
+    id: turn?.id,
+    status: turn?.status ?? null,
+    input_sha256: nativeTurnInputSha256(turn),
+  };
+}
+
+async function defaultCodexCollect() {
+  const { stdout } = await execFile('codex', ['--version']);
+  return stdout;
+}
+
+// collect 与 prepareClaude 的同名参数同构：测试注入 stub，不真调 codex 二进制。
+export async function prepareCodexProbesOnly({ stateDir, collect = defaultCodexCollect }) {
+  await initStateDir(stateDir);
+  const realStateDir = realpathSync(stateDir);
+  let codexVersionRaw = null;
+  try {
+    codexVersionRaw = await collect();
+  } catch (error) {
+    // 探测失败照样落盘，但落的是一句自证的失败文本——assertLaunchable 从中解析不出版本号形态
+    // 就会红，「codex 根本没装」因此过不了前置闸（F-2 附带）。
+    codexVersionRaw = `probe failed: ${error.message}`;
+  }
+  const probes = { codexVersionRaw };
+  await writeFile(join(realStateDir, 'probes.json'), JSON.stringify(probes, null, 2));
+  return { stateDir: realStateDir, probes };
+}
+
+export const POLL_INTERVAL_MS = 5000;
+export const WALL_CLOCK_DEADLINE_MS = 1_800_000;
+// 跑飞护栏（P-2）。与上面的 WALL_CLOCK_DEADLINE_MS、与 MAX_AUTO_RESUMES 同类：**adapter 侧的
+// 安全常量，不是 contract 预算**。它们不写进 contract、不由用户提供、不受「budget 只在用户明给
+// 时才设」那条协议规则约束——那条规则管的是 tokenBudget 这类会改变执行体行为的参数，这两条只
+// 决定控制器什么时候停止等待。
+//
+// 起因是第二次 codex 真实冒烟：执行面坏掉（工具调用全部失败）之后，服务端的自动链式续轮把一个
+// 必然失败的 turn 重复了 9 次、烧掉 57,952 tokens、target root 分毫未动，而且不会自己停——唯一
+// 的兜底是 30 分钟 wall clock，对「每 15 秒烧 35k tokens」这种形态几乎不构成保护，跑满会是
+// 100+ turn、数百万 tokens。是人手工 SIGTERM 才停的，无人值守场景下就是一个敞开的成本敞口。
+//
+// 信号只取控制器已经拿到的两样：轮询回来的 goal envelope 里的 tokensUsed，以及已订阅的
+// turn/started·turn/completed 计数。**不解析执行体输出**——那会撕开信任模型（执行体产出的内容
+// 不得成为控制器判据）；护栏属资源层，不属证据通道。也刻意**不做**「连续 N 轮无文件变更即熔断」：
+// 合法任务可能连着几轮只读不写，误杀真活的代价比多烧一点 token 更高。
+//
+// 取值依据（不是拍脑袋，是按 2026-08-09 那次冒烟的实测节奏推算的）：9 个 turn / 195 秒 /
+// 57,952 tokens，即约 6,439 tokens 每 turn、约 297 tokens 每秒。据此——
+//   - 30 turn  → 约 193k tokens、约 11 分钟触顶；
+//   - 200k tokens → 约 31 turn、约 11 分钟触顶。
+// 两条因此在这个形态下**大致同时**触顶，谁都不是死重。而对「轮次少、单轮上下文巨大」的另一种
+// 形态，token 那条自然先触顶，各司其职。200k 对一个零产出的跑飞 run 来说仍然给得很宽。
+// 曾取 500k，被这套推算否掉：那要约 28 分钟才触顶，只比 30 分钟的 wall clock 早两分钟，等于死重。
+export const MAX_TURNS_PER_ATTEMPT = 30;
+export const MAX_TOKENS_PER_ATTEMPT = 200_000;
+// 判「上次 launch 是否还活着」的启发式：心跳每 poll 拍刷新一次（默认 5s 一拍）；30s 容忍几拍
+// 失联抖动，超过就认定持有者进程死了（SIGKILL/断电，finally 没机会跑）。注意「持有者死了」
+// **不等于**「它起的 app-server 也死了」：租约到期没有任何一侧会去 clear goal（终审 I2），
+// 孤儿 daemon 是否随 stdio EOF 自退本轮未实测。因此过期租约同样拦住 relaunch，要先跑 close。
+export const LEASE_TTL_MS = 30_000;
+
+function sleep(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+// contract.budget.max_minutes 存在时与传入 deadlineMs（缺省 WALL_CLOCK_DEADLINE_MS）取 min——
+// 用户显式给的墙钟预算永远不能被更宽的默认值盖过。
+function effectiveDeadlineMs(contract, deadlineMs) {
+  const base = deadlineMs ?? WALL_CLOCK_DEADLINE_MS;
+  const budget = contract?.budget;
+  const budgetMs = budget?.user_provided && typeof budget.max_minutes === 'number'
+    ? budget.max_minutes * 60_000
+    : undefined;
+  return budgetMs === undefined ? base : Math.min(base, budgetMs);
+}
+
+// 护栏与 contract 预算取更紧的那侧，方向与 effectiveDeadlineMs 一致：用户明给的预算永远不能被
+// 更宽的护栏盖过。反过来也成立且是刻意的——contract 只能把护栏调得**更紧**，抬不高它。护栏是
+// adapter 常量，把它做成可由 contract 抬高的字段就等于让一份 contract 关掉自己的刹车。
+function effectiveCap(base, contract, field) {
+  const budget = contract?.budget;
+  const limit = budget?.user_provided && typeof budget[field] === 'number' && budget[field] > 0
+    ? budget[field]
+    : undefined;
+  return limit === undefined ? base : Math.min(base, limit);
+}
+
+// resume 专用的 token 上限（review M-1）。根因是一个口径错配：`budget.max_tokens` 在服务端是**整个
+// run 的累计预算**（原样当 tokenBudget 交给 goal.set），护栏量的却是**本 attempt 的增量**，同一个
+// 字段在同一条路径上两种含义。后果是操作员按 §4 用 `--raise-token-budget N` 明确抬完预算之后，
+// 护栏仍按 contract 里那个旧值掐——而 reason 把他指向唯一帮不上忙的那根杆子（他刚拉过正确的那根），
+// 本该读到的 budgetLimited 成因也被换成「先查执行面是否健康」；唯一出路是改 contract，而改 contract
+// 换 hash 换 state 目录，thread 就丢了。
+//
+// `--raise-token-budget` 本身就是「用户明确确认要抬预算」的载体，所以给了就以它为准，取代 contract
+// 里那个已被它抬过的旧值。adapter 常量仍是天花板：抬预算只在常量以内被认，抬不穿它——「谁都不能
+// 关掉自己的刹车」不变。
+function resumeTokenCap(contract, raiseTokenBudget) {
+  return Number.isFinite(raiseTokenBudget) && raiseTokenBudget > 0
+    ? Math.min(MAX_TOKENS_PER_ATTEMPT, raiseTokenBudget)
+    : effectiveCap(MAX_TOKENS_PER_ATTEMPT, contract, 'max_tokens');
+}
+
+// 三态而不是「活/不活」：过期租约不是「没有残留」，而是「有残留且持有者已失联」——那一侧留下的
+// app-server 与 goal 都可能还活着（租约 TTL 到期不触发任何 clear），此时直接 relaunch 会在同一
+// target root 上叠出第二个执行器。'stale' 因此也拦，出口是先跑 close 清残留（终审 I2）。
+// 读不出文件 = 'none'；读得出但字节损坏 = 'stale'（不认成 none，坏字节不构成「没有残留」的证据）。
+async function leaseResidue(stateDir) {
+  let text;
+  try {
+    text = await readFile(join(stateDir, 'lease.json'), 'utf8');
+  } catch {
+    return 'none';
+  }
+  let lease;
+  try {
+    lease = JSON.parse(text);
+  } catch {
+    return 'stale';
+  }
+  const heartbeatAt = typeof lease?.heartbeatAt === 'number' ? lease.heartbeatAt : 0;
+  return (Date.now() - heartbeatAt) < LEASE_TTL_MS ? 'live' : 'stale';
+}
+
+// lease.json 是互斥原语：assertLaunchable 的 leaseResidue 闸读的就是它。别的进程的活租约在场
+// 时，本次运行既不覆写也不删除——覆写和无条件删除是同一个后果（原语一没，闸失效，第三个进程
+// 就能并发起 launch）。这里只做"不抢占"，不做"拒绝运行"：finalize/close 该不该在活 launch
+// 底下被拦，是证据通道的政策问题（T11 review 疑虑② 裁定不加闸），清理层不替它做主。
+function leaseHeldByAnother(leasePath) {
+  if (!existsSync(leasePath)) return false;
+  let lease;
+  try {
+    lease = JSON.parse(readFileSync(leasePath, 'utf8'));
+  } catch {
+    return true;   // 读不懂就当别人的：宁可不碰，也不销毁一份可能有效的原语
+  }
+  const heartbeatAt = typeof lease?.heartbeatAt === 'number' ? lease.heartbeatAt : 0;
+  return lease?.pid !== process.pid && (Date.now() - heartbeatAt) < LEASE_TTL_MS;
+}
+
+// cleanup 只删自己写的那一份租约（T11 review Minor 1 实测：finalize/close 在一次活 launch 底下
+// 删掉了对方的租约）。认领凭据就是 refreshLease 写进去的 {pid, startedAt}；对不上就留在原地并
+// 给出 reason。纯清理层：reason 只走 stderr，不进任何证据通道。
+export function releaseOwnLease({ leasePath, pid, startedAt }) {
+  if (!existsSync(leasePath)) return { released: false };
+  let lease;
+  try {
+    lease = JSON.parse(readFileSync(leasePath, 'utf8'));
+  } catch {
+    return { released: false, reason: `${leasePath} is unreadable or malformed; left in place` };
+  }
+  if (lease?.pid !== pid || lease?.startedAt !== startedAt) {
+    return {
+      released: false,
+      reason: `${leasePath} belongs to another run (pid=${lease?.pid}, startedAt=${lease?.startedAt}); left in place`,
+    };
+  }
+  rmSync(leasePath, { force: true });
+  return { released: true };
+}
+
+// 租约持有者是否还活着。返回一句可以直接进 reason 的判据说明，活着才返回非空。
+//
+// 两条判据缺一不可（review M-3）：
+// ① 心跳在 TTL 内；② 持有者 pid 仍在。
+// 只看心跳是错的，而且是本轮 N-2 修复引入的 fail-open：心跳只在轮询每拍与连接阶段各刷一次，
+// 两次刷新之间最长可达 pollInterval + RPC_TIMEOUT_MS(60s)，**远超** LEASE_TTL_MS(30s)。一个正
+// 活着、只是卡在一次慢 rpc 上的 run，其租约会被并发的 close 判成残留删掉——实测持有者 pid 当时
+// 还活着，而 close 的 reason 却说 "left behind by an earlier run"，既不实也把互斥原语弄没了。
+// 反过来「pid 还在就保留」在 pid 被回收时只会**多保留**一份本该删的租约，方向 fail-closed，
+// 操作员仍可换 --controller 名脱身。
+function leaseHolderAlive(lease) {
+  if (lease === null || typeof lease !== 'object') return null;
+  const heartbeatAt = typeof lease.heartbeatAt === 'number' ? lease.heartbeatAt : 0;
+  const age = Date.now() - heartbeatAt;
+  if (age < LEASE_TTL_MS) return `heartbeat is ${age}ms old, still within the ${LEASE_TTL_MS}ms TTL`;
+  const { pid } = lease;
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    // signal 0 只做存在性/权限探测，不投递任何信号。
+    process.kill(pid, 0);
+    return `heartbeat is ${age}ms stale but the holder process is still running`;
+  } catch (error) {
+    // ESRCH=进程不在了。EPERM=进程在、但属于别的用户——按「还活着」处理（fail-closed）。
+    return error?.code === 'EPERM'
+      ? `heartbeat is ${age}ms stale but the holder process exists under another user`
+      : null;
+  }
+}
+
+// close 专用的租约释放：清掉会把这个 state 目录锁死的残留租约（N-2）。
+// 与 releaseOwnLease 的分工：那条是**清理层**的自我收尾，只认自己写的那一份；这条是 close 的
+// **收尾语义**本身——残留租约按定义是别人（或已死的自己）留下的，只认自己就等于永远清不掉。
+// 唯一不删的形态是**持有者还活着**的租约：删掉它就是销毁互斥原语本身，第三个进程随即能并发
+// 起 launch（T11 review Minor 1 的同一后果）。
+// 坏字节按残留处理：它没有心跳也没有 pid 可读，而 launch 侧的 leaseResidue 把它判成 'stale' 并
+// 拦住——close 不清它就没有任何一条路径清得掉。
+export function releaseResidualLease({ leasePath }) {
+  if (!existsSync(leasePath)) {
+    return { present: false, released: false, runtimeQuiesced: true, reasons: [] };
+  }
+  let lease = null;
+  try {
+    lease = JSON.parse(readFileSync(leasePath, 'utf8'));
+  } catch {
+    lease = null;
+  }
+  const alive = leaseHolderAlive(lease);
+  if (alive) {
+    return {
+      present: true,
+      released: false,
+      runtimeQuiesced: false,
+      reasons: [`lease.json belongs to a run that is still alive (pid=${lease?.pid}, ${alive}): left in place, `
+        + 'nothing was released. Confirm that run is really gone (or start fresh under a different '
+        + '--controller name) before relaunching'],
+    };
+  }
+  rmSync(leasePath, { force: true });
+  return {
+    present: true,
+    released: true,
+    runtimeQuiesced: true,
+    reasons: [`released a residual lease.json (pid=${lease?.pid ?? 'unreadable'}) left behind by a run that is no longer running`],
+  };
+}
+
+function defaultCodexClientFactory({
+  codexHome, cwd, onEnvelope, onChildFailure,
+}) {
+  return new GoalRpcClient({
+    codexHome, cwd, onEnvelope, onChildFailure,
+  });
+}
+
+const DEFAULT_AUTH_SOURCE = join(homedir(), '.codex', 'auth.json');
+// mkdtempSync 前缀，close 的整目录删除只认这个前缀（见 runCodexClose）。
+const CODEX_HOME_PREFIX = 'gc-codex-home-';
+
+// goal-set 单调序列号的唯一账本（verifyFinalizeAttribution 的三重归因第三项）。解析失败即
+// 向上抛：静默跳过坏行会让序列号看着连续、实际有洞，归因就成了假证据。
+async function readLedger(stateDir) {
+  let text;
+  try {
+    text = await readFile(join(stateDir, 'goal-set-ledger.jsonl'), 'utf8');
+  } catch {
+    return [];
+  }
+  return text.split('\n').filter((line) => line.trim().length > 0).map((line) => JSON.parse(line));
+}
+
+function appendLedgerEntry(stateDir, entry) {
+  return appendFile(join(stateDir, 'goal-set-ledger.jsonl'), `${JSON.stringify(entry)}\n`);
+}
+
+// turn-counts.json 的语义必须写在文件里（P-4）。第二次冒烟实测：pass2 只跑一个 turn 且成功，
+// 文件却是 {"started":1,"completed":0}；被中止的 pass1 是 {"started":9,"completed":8}。两处「差一」
+// 同源，而且是竞态不是漏写——收到的 turn 通知一条不落全部同步落盘（见下面的通知回调），差的那条
+// 根本没到过：goal 的 complete 是模型在 turn 内自标的，控制器轮询看得见它**严格早于**那个 turn
+// 结束，拿到判定就收口，turn/completed 因此永远等不到。成功路径上 completed = started - 1 是必然。
+//
+// 所以修法不是补一个从未观察到的 completed（那是拿观测说谎），而是让文件自己说清计数的口径。
+// 它是操作员判断「跑了几轮」的唯一依据，字面上的「差一」不解释就会被读成「最后一轮没跑完」。
+const TURN_COUNTS_SEMANTICS = 'started/completed are counts of turn/started and turn/completed '
+  + 'notifications observed by the controller, cumulative across attempts. The controller stops '
+  + 'observing the moment it reaches a verdict, so a turn still in flight at that moment is counted '
+  + 'in started only: completed = started - 1 is the normal shape of any run that ended mid-turn, '
+  + 'including every successful one, because the goal reaches complete inside a turn and strictly '
+  + 'before that turn ends. Read started as the number of turns that ran; '
+  + 'do not read a missing completed as a turn that failed to finish. '
+  // R-5：服务端对同一个 turn 的说法更强，翻 thread 历史的操作员会撞见它。两份证据都对，
+  // 但必须放在一起读，否则「turn-counts 说它 started 过、服务端说它 interrupted」看着像矛盾。
+  + 'The server records that same in-flight turn as "interrupted" in the thread history (the '
+  + 'controller stops the app-server once the goal reaches its verdict, so the turn never gets to '
+  + 'finish server-side either). Both records are accurate and describe the same normal ending.';
+
+function writeTurnCounts(path, counts) {
+  writeFileSync(path, JSON.stringify({ ...counts, semantics: TURN_COUNTS_SEMANTICS }));
+}
+
+// turn 计数是跨 attempt 累计量：resume 从磁盘现值续加，不清零——清零会让"launch 4 轮 + resume 1 轮"
+// 的文件读起来只有 1 轮。
+//
+// 损坏时退回 0 起算而不是 fail-closed。理由**不再是**「这个数只供呈现」——P-2 之后 started 是 turn
+// 护栏的直接输入（review L-1）。真正的理由是护栏只用**增量**：基线与计数器出自同一次读盘，文件损坏
+// 时两边同为 0，`started - turnsBaseline` 因此照样等于本 attempt 真实跑过的轮次，护栏一点不受影响。
+// 损坏丢掉的只有跨 attempt 的累计显示值，那一格确实只供呈现。
+// 只取两个计数字段，semantics 这类说明字段读回来即丢弃：它是写给人的，不是记账的一部分。
+function readTurnCounts(path) {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    return {
+      started: Number.isInteger(parsed?.started) ? parsed.started : 0,
+      completed: Number.isInteger(parsed?.completed) ? parsed.completed : 0,
+    };
+  } catch {
+    return { started: 0, completed: 0 };
+  }
+}
+
+// 连接阶段（auth-copy、租约、构造 client、start、initialize）的失败标记。
+// 它与 body 内的失败必须在归因上分开：到这一步为止执行器一次都没被构造/启动过，工作目录没有
+// 被碰过；混成同一条 reason 就是在如实性上说谎（F-2 实测三种形态全被报成「可能已改仓」）。
+class CodexConnectError extends Error {
+  constructor(cause) {
+    super(cause?.message ?? String(cause));
+    this.cause = cause;
+  }
+}
+
+// launch/resume/finalize/close 共用的 auth-copy + lease + client 生命周期骨架（§5 安全模式）。
+// 铁律（T10 review Important #1）：cleanup 定义与 SIGTERM/SIGINT 注册必须在 auth 副本可能落盘
+// 之前就位，try 块起点在此、复制之前——mkdtempSync 之后的任何一步（复制 auth、chmod、
+// 写 lease、构造 client）都可能抛错，保护窗口必须已经覆盖到。client 用 let 声明、
+// cleanup 里用可选链调用，早期失败（client 尚未构造）时安全跳过 stop()。cleanup 幂等，只删
+// auth 副本 + stop client + 释放**自己认领的** lease（见 releaseOwnLease），**不删 codexHome**
+// （thread/goal 状态要跨 attempt 存活；
+// 整目录清理只在 runCodexClose）。codexHome 由调用方给定：launch 现建，其余读 codex-home.path。
+// 本函数**不写** codex-home.path：那个指针是「哪个 codexHome 持有活体 thread」的真值源，只有
+// launch 在 thread/start 成功之后才有资格改它（与 thread.json 同一时刻落盘，两者必须自洽）。
+async function withCodexClient({
+  stateDir, codexHome, cwd, authSource, clientFactory,
+}, body) {
+  const authDest = join(codexHome, 'auth.json');
+  const leasePath = join(stateDir, 'lease.json');
+  const leaseStartedAt = Date.now();
+
+  let client;
+  let refreshLease;
+  // 值得留痕的通知（N-5）：连接阶段就得存在——它在 client 构造之前由通知回调闭包捕获，
+  // 又要在 body 返回后交给终局报告，两头都在内层 try 的作用域之外。
+  const notices = [];
+  // turn 计数同理，多一个理由：轮询循环的跑飞护栏（P-2）要在 body 里读它。baseline 是进入本次
+  // attempt 时的磁盘现值——文件是跨 attempt 累计量，护栏据此把它换算成本 attempt 的增量。
+  let turnCounts = { started: 0, completed: 0 };
+  let turnsBaseline = 0;
+  // 每个动作各自兜住异常。幂等此前就成立，**互不影响**却不成立：三句串在一起，第一句抛错
+  // （例如隔离 codexHome 被 chmod 成不可写）后两句连跑都没跑；在 onFatal 里它还会把 stderr 写与
+  // process.exit 一起带走，原始错误被 fs 栈盖掉（review m-1 实测 exit 7、凭证与租约双双留盘）。
+  const attempt = (label, action) => {
+    try {
+      const settled = action();
+      // stop() 是 async：它的 rejection 逃出 try/catch 就会变成 unhandledRejection，把 onFatal 引爆。
+      if (typeof settled?.catch === 'function') settled.catch(() => {});
+    } catch (error) {
+      try {
+        writeSync(2, `cleanup step "${label}" failed: ${error?.message ?? error}\n`);
+      } catch { /* stderr 不可写时也不能让清理的其余两步跟着停 */ }
+    }
+  };
+  // cleanup 可重入，不是一次性——一次性正是 M3 的成因：SIGTERM 在 auth 落盘之前到达时它跑了个空，
+  // 随后 auth 副本与租约照常落盘，而 finally 里的第二次调用被「已清理过」的标志挡掉，凭证副本与
+  // 租约双双留在盘上。三个动作各自幂等（rmSync force、kill 已退出的子进程、releaseOwnLease 只删
+  // 自己认领的那一份），重复执行没有代价，而漏执行有。
+  const cleanup = () => {
+    attempt('remove auth copy', () => rmSync(authDest, { force: true }));
+    attempt('stop app-server', () => client?.stop?.());
+    attempt('release lease', () => {
+      const lease = releaseOwnLease({ leasePath, pid: process.pid, startedAt: leaseStartedAt });
+      if (lease.reason) process.stderr.write(`${lease.reason}\n`);
+    });
+  };
+  // 信号处理器必须**真正终止进程**（review M-2）：此前它只跑 cleanup 就返回，进程照常往下跑，
+  // 轮询下一拍的 refreshLease 又把 cleanup 刚释放的租约写回盘上——操作员中止不掉一个 launch，
+  // 互斥原语还被一个已被终止的 run 重新宣示，最后那记 SIGKILL 留下的正是 N-2 的输入。
+  //
+  // 终止手段是「摘掉自己的监听器再把同一个信号重新投递给自己」，不是 process.exit()：
+  // 实测 process.exit() 在线程池被一次阻塞的 fs 读卡住时**根本不终止进程**（authSource 是 FIFO
+  // 即可复现，正是 auth 复制那一步），而 OS 层的默认信号处置不受线程池状态影响。它还有两个
+  // 附带好处：父进程看到的是「死于信号」而不是一个自造的退出码；实测 process.kill 不返回——
+  // 进程在这一行内就死了，cleanup 之后不存在任何能再写盘的窗口，因此也不需要一个中止标志。
+  const onSignal = (signal) => {
+    try {
+      cleanup();
+    } finally {
+      process.removeListener(signal, onSignal);
+      process.kill(process.pid, signal);
+    }
+  };
+  // 「finally 不执行 → 凭证副本留在盘上」这条铁律的**第三种失效形态**：前两种是外部信号
+  // （SIGTERM/SIGINT，上面那两行堵的），第三种是自家代码里的未捕获异常 / 未处理 rejection——
+  // N-1 实测就是它（spawn 的 ENOENT 从 'error' 事件异步抛出，落进事件循环，finally 一行没跑，
+  // 生产 auth.json 的字节级副本留在隔离 CODEX_HOME 里）。N-1 的就地修复已经堵住那一个入口，
+  // 但前两次修复（T10「保护窗口起点钉错」、N3「写入跟着 symlink 走」）都只堵了当时想到的那个
+  // 入口，随后各被新形态穿一次。所以这里挂进程级兜底：任何逃出 try/finally 的路径都先跑同一个
+  // 幂等 cleanup。注册时机与信号处理器同一行、在 auth 副本可能落盘之前。
+  // 兜底跑完**不得**把崩溃伪装成正常退出（F-1 的覆辙）：原始错误照常进 stderr、退出码非零，
+  // 与 Node 未捕获异常的默认收场一致。stderr 用 writeSync——process.exit 会截断走管道的异步写。
+  const onFatal = (error) => {
+    try {
+      cleanup();
+    } finally {
+      // 原始错误与非零退出码不得被 cleanup 自身的失败带走（review m-1）。
+      try {
+        writeSync(2, `${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`);
+      } catch { /* stderr 不可写也不能改变「非零退出」这一点 */ }
+      process.exit(1);
+    }
+  };
+  // 最后一道网：事件循环被走空时 Node 直接退出——没有异常、没有信号，上面四路一个都不响，
+  // finally 也永远等不到那个 await 恢复（review M-1 实测：app-server 中途死掉、且此刻恰好没有
+  // rpc 在飞时 exit 13、stdout 全空、凭证副本留盘）。根因已在 adapter 侧修掉（rpc 超时 timer
+  // 不再 unref、子进程 'exit' 归一成 rejection），这一路是兜底：'exit' 处理器只能做同步动作，
+  // 而 cleanup 正好全是同步的；它同时兜住任何 process.exit() 直调（含上面两个处理器自己那次，
+  // 重复执行无代价）。
+  const onProcessExit = () => { cleanup(); };
+  process.on('SIGTERM', onSignal);
+  process.on('SIGINT', onSignal);
+  process.on('uncaughtException', onFatal);
+  process.on('unhandledRejection', onFatal);
+  process.on('exit', onProcessExit);
+
+  try {
+    // 内层 try 精确圈出连接阶段：它抛出的一切都归一成 CodexConnectError，body 抛出的一切原样上浮。
+    // 两者的归因天差地别——连接阶段失败时执行器一次都没跑过、工作目录没被碰过，body 内失败则
+    // 可能已在 turn 里改过仓。调用方据此给出不同的 reason（F-2）。
+    try {
+      await writeFile(authDest, await readFile(authSource));
+      await chmod(authDest, 0o600);
+
+      refreshLease = leaseHeldByAnother(leasePath)
+        ? async () => {}                      // 别人占着：本次运行全程不碰这个文件
+        : () => writeFile(leasePath, JSON.stringify({
+          pid: process.pid, startedAt: leaseStartedAt, heartbeatAt: Date.now(),
+        }));
+      await refreshLease();
+
+      // 同步写：onEnvelope 由 client 在收发时机同步调用（不被 await），并发 append 到同一文件用异步
+      // fs.promises 有交错风险，这里用 *Sync 消掉这条竞争。
+      const envelopesPath = join(stateDir, 'rpc-envelopes.jsonl');
+      const onEnvelope = (entry) => appendFileSync(envelopesPath, `${JSON.stringify(entry)}\n`);
+
+      // 子进程层面的失败（起不来 / 起来之后死掉）没有 RPC 响应可挂，此前一个字都不留：
+      // 'error' 被 start() 的常驻监听器无声吞掉、'exit' 根本没人听（review m-3）。走 N-5 已经修好
+      // 的那条通道，让终局报告与 envelope 日志都说得出真正的成因。
+      const onChildFailure = (error) => {
+        const message = error?.message ?? String(error);
+        notices.push(`codex app-server failure: ${message}`);
+        appendFileSync(envelopesPath, `${JSON.stringify({ direction: 'child', event: 'failure', message })}\n`);
+      };
+
+      // SIGTERM/SIGINT 若在上面任何一个 await 处到达，onSignal 已经跑完 cleanup 并终止了进程，
+      // 根本走不到这一行——「操作员已经要求中止，进程却又拉起一个子进程」（M3）由信号处理器
+      // 自己的终态保证，不再需要一个中止标志（review M-2）。
+      client = clientFactory({
+        codexHome, cwd, onEnvelope, onChildFailure,
+      });
+
+      // turn/started·turn/completed 计数。**不再只是呈现**（review L-1）：P-2 之后 started 是 turn
+      // 跑飞护栏的直接输入，护栏触顶会给出终局报告。六态判定仍然全靠 goalGet 的 goal.status——
+      // 计数只决定「还等不等下去」，不决定 goal 处在哪个状态。
+      const turnCountsPath = join(stateDir, 'turn-counts.json');
+      turnCounts = readTurnCounts(turnCountsPath);
+      turnsBaseline = turnCounts.started;
+      // method 名取自 adapter 的实测常量，不在这里重抄字面量——两处真值源迟早会漂。
+      const [TURN_STARTED, TURN_COMPLETED] = TURN_BOUNDARY_METHODS;
+      client.onNotification?.((notification) => {
+        const { method } = notification;
+        if (method === TURN_STARTED || method === TURN_COMPLETED) {
+          if (method === TURN_STARTED) turnCounts.started += 1;
+          else turnCounts.completed += 1;
+          writeTurnCounts(turnCountsPath, turnCounts);
+        }
+        // 通知此前只被这里数了两个 method 就丢掉，一个字不落盘（N-5）。收哪些、payload 怎么收敛
+        // 全在 adapter 的 noteworthyNotification 里判；这一层只负责落盘与回传给终局报告。
+        // 与 request/response 同文件、同 append 姿态（*Sync，onEnvelope 不被 await，异步 append
+        // 会交错），方向标 'notification' 把三者分开。
+        const note = noteworthyNotification(notification);
+        if (!note.record) return;
+        notices.push(`codex notification ${note.method}: ${note.payload}`);
+        appendFileSync(envelopesPath, `${JSON.stringify({
+          direction: 'notification', method: note.method, payload: note.payload,
+        })}\n`);
+      });
+
+      await client.start();
+      await client.initialize();
+    } catch (error) {
+      throw new CodexConnectError(error);
+    }
+    return await body({
+      client, refreshLease, notices, turnCounts, turnsBaseline,
+    });
+  } finally {
+    process.removeListener('SIGTERM', onSignal);
+    process.removeListener('SIGINT', onSignal);
+    process.removeListener('uncaughtException', onFatal);
+    process.removeListener('unhandledRejection', onFatal);
+    process.removeListener('exit', onProcessExit);
+    cleanup();
+  }
+}
+
+// launch/resume 共用的异常归一。三条出口互不重叠：
+// ① 占号失败重抛——ATTEMPT_LIMIT_EXCEEDED / ATTEMPT_SLOT_TAKEN 是进程级失败（exit 1），被这里
+//    吞成 terminal_report 就降级成了 exit 3，fail-closed 的配额语义随之破掉；
+// ② 连接阶段失败如实说明仓库未被触碰——client 要么没构造出来、要么没连上，声称「可能已改仓」
+//    会把操作员推去做一次无谓的 snapshot verify（F-2）；
+// ③ 已连上之后失败保留原措辞：执行器可能已在 turn 内改过仓，「中止」绝不能被读成「无改动」（§6）。
+function codexAttemptFailure(error, threadId) {
+  if (error instanceof CodexConnectError) {
+    return {
+      outcome: 'terminal_report',
+      threadId,
+      // 措辞里刻意不出现 "snapshot verify" 这个词组：编排器与操作员都会照着 reason 决定要不要
+      // 跑核对，出现即等于在要求它，哪怕前面缀着「无需」。
+      reasons: [`codex daemon connection failed before any turn started (${error.message}): `
+        + '失败发生在连接阶段（凭证复制 / app-server 启动 / initialize），执行器一次都没被启动，'
+        + '工作目录未被触碰，没有需要核对的 mutation'],
+    };
+  }
+  return {
+    outcome: 'terminal_report',
+    threadId,
+    reasons: [`codex daemon connection failed mid-flight (${error.message}): 执行器可能已改仓，须跑 snapshot verify 才能断言 mutation 状态`],
+  };
+}
+
+// 护栏触发时的终局措辞。三件事缺一不可：说明这是护栏而不是 contract 预算（否则操作员会去改
+// contract 的 budget，而那一侧只会把上限调得更紧）、把观测值原样带上（「turn 在涨、token 在涨、
+// 产出为零」正是执行面坏掉的形态，操作员据此判断该查什么）、给出下一步。
+function guardrailReason({ what, cap, lever, observedTurns, turnCounts, observedTokens, tokensUsed }) {
+  return `controller runaway guardrail tripped: ${what} reached the cap of ${cap} before the goal `
+    + 'reached a terminal state '
+    + `(observed this attempt: ${observedTurns} turn(s) started, ${observedTokens} tokens; `
+    + `turn-counts.json cumulative started=${turnCounts.started} completed=${turnCounts.completed}; `
+    + `goal tokensUsed=${tokensUsed}): `
+    + '这是 adapter 侧的跑飞护栏（MAX_TURNS_PER_ATTEMPT / MAX_TOKENS_PER_ATTEMPT），不是 contract '
+    + '预算，也不代表目标失败——触顶即终局报告，不产候选。next=先查执行面是否健康（工具调用是否'
+    + `在连续失败、target root 是否分毫未动），执行面坏掉时这条护栏是唯一还在工作的刹车；${lever}`;
+}
+
+// 两条护栏各自的「这根杆子能不能拉」——分支必须分开说（review M-1）：contract 的 budget 一律只能
+// 把护栏调得更紧（取 min），而 token 那条另有一根**能**拉的杆子（`--raise-token-budget`，用户确认
+// 的载体，在 adapter 常量以内被认）。合成一句话就会在其中一支上把操作员推向帮不上忙的那根。
+const TURN_LEVER = 'contract 的 budget 只能把护栏调得更紧（取 min）；这条轮次上限是 adapter 常量，'
+  + 'contract 与 CLI 都抬不高它';
+const TOKEN_LEVER = 'contract 的 budget 只能把护栏调得更紧（取 min）；确需更多预算时，resume 的 '
+  + '--raise-token-budget N 是用户确认的载体，护栏会认它，但不超过 adapter 常量 MAX_TOKENS_PER_ATTEMPT';
+
+// launch/resume 共用的轮询循环：每 pollIntervalMs 一拍 goalGet + 刷新租约，normalizeTerminal 分派
+// 四态；超 deadline 即 fail-closed 终局。turn/token 两条跑飞护栏在「本拍判定不终局」之后才评估——
+// 目标已经达成时不该被护栏改判：活干完了就是干完了，与它烧了多少无关。
+//
+// 两条护栏都按**本次 attempt** 计（与 deadline 同口径，deadline 也是每次 attempt 重新起算）：
+// turn 数扣掉进入本 attempt 时的磁盘现值（turn-counts.json 是跨 attempt 累计量），token 数扣掉本
+// attempt 第一拍观测到的 tokensUsed（goal 的 tokensUsed 同样跨 attempt 累计，resume 一进来就是个
+// 大数——不扣基线会让一次合法续跑在第一拍就被误杀）。
+async function pollGoalUntilTerminal({
+  client, threadId, stateDir, attemptNumber, binding, refreshLease, deadline, pollIntervalMs, notices = [],
+  turnCounts = { started: 0, completed: 0 }, turnsBaseline = 0,
+  turnCap = MAX_TURNS_PER_ATTEMPT, tokenCap = MAX_TOKENS_PER_ATTEMPT,
+}) {
+  // 终局状态词自己不解释自己：`usageLimited` 是服务端给的字符串，成因（credits 余额 0、重置时间）
+  // 只在 `account/rateLimits/updated` 通知里，而 close 会把唯一存着它的 codexHome 连 rollout 日志
+  // 一起删掉（N-5）。终局报告是操作员唯一会读的东西，所以把收下来的通知并进 reasons。
+  // 候选路径不并——那条不是失败，没有成因要解释。
+  // notices 里存的是成形的整句（通知一类、子进程失败一类），这里只负责并进去。
+  const withNotices = (reasons) => [...reasons, ...notices];
+  const startedAt = Date.now();
+  let tokensBaseline = null;
+  while (true) {
+    const elapsed = Date.now() - startedAt;
+    if (elapsed >= deadline) {
+      return {
+        outcome: 'terminal_report',
+        threadId,
+        reasons: withNotices([`wall clock deadline of ${deadline}ms exceeded before the goal reached a terminal state`]),
+      };
+    }
+    await sleep(Math.min(pollIntervalMs, deadline - elapsed));
+    await refreshLease();
+    const getEnvelope = await client.goalGet({ threadId });
+    const normalized = normalizeCodexTerminal(getEnvelope?.result?.goal);
+    if (normalized.kind === 'poll') {
+      // tokensUsed 的类型不由 validateGoalEnvelope 保证（它只查键在不在），非数就当这一拍没有可用
+      // 的 token 观测：护栏宁可少响一拍，也不拿一个 NaN 去比大小把 active 判成终局。
+      const rawTokens = getEnvelope?.result?.goal?.tokensUsed;
+      const tokensUsed = Number.isFinite(rawTokens) ? rawTokens : null;
+      if (tokensUsed !== null && tokensBaseline === null) tokensBaseline = tokensUsed;
+      const observedTokens = tokensUsed === null ? 0 : tokensUsed - tokensBaseline;
+      const observedTurns = turnCounts.started - turnsBaseline;
+      const tripped = observedTurns >= turnCap
+        ? { what: 'turns started this attempt', cap: turnCap, lever: TURN_LEVER }
+        : (observedTokens >= tokenCap
+          ? { what: 'tokens used this attempt', cap: tokenCap, lever: TOKEN_LEVER } : null);
+      if (tripped === null) continue;
+      return {
+        outcome: 'terminal_report',
+        threadId,
+        reasons: withNotices([guardrailReason({
+          ...tripped, observedTurns, turnCounts, observedTokens, tokensUsed,
+        })]),
+      };
+    }
+    if (normalized.kind === 'candidate') {
+      await writeCodexCandidate({
+        stateDir, attemptNumber, candidate: normalized.candidate, binding, threadId,
+      });
+      return { outcome: 'candidate', threadId, candidate: normalized.candidate };
+    }
+    if (normalized.kind === 'terminal_report') {
+      return {
+        outcome: 'terminal_report', threadId, status: normalized.status, reasons: withNotices(normalized.reasons),
+      };
+    }
+    return { outcome: 'terminal_report', threadId, reasons: withNotices(normalized.reasons) };   // kind === 'reject'
+  }
+}
+
+// launch/resume 共用的 codex 侧前置判定：probes.json 存的是 prepare 时刻的观测，这里补上现场
+// 重算的 contractHash、binding 交叉项与残留租约再交纯函数 assertLaunchable 下结论。
+async function codexLaunchVerdict({
+  contract, stateDir, binding, sandboxMode = CODEX_SANDBOX_MODE,
+}) {
+  const storedProbes = JSON.parse(await readFile(join(stateDir, 'probes.json'), 'utf8'));
+  return assertCodexLaunchable(contract, {
+    contractHash: contractHash(contract),
+    confirmedHash: binding?.contractHash,
+    baselineDigestStored: typeof binding?.baselineDigest === 'string' && HEX64.test(binding.baselineDigest),
+    codexVersionRaw: storedProbes.codexVersionRaw,
+    sandboxMode,
+    expectedSandboxMode: sandboxMode,
+    // 位置判定要比路径，两侧都先归一（contract 与 --state 各可能拿 symlink 的一边）。
+    stateDir: canonicalPath(stateDir),
+    targetRoots: (contract?.target_roots ?? []).map(canonicalPath),
+    // 本次运行实际生效的 $TMPDIR（os.tmpdir() 读的就是它）。判定要它是因为标准位置那条正则
+    // 认不出一个被改过的 TMPDIR，而沙箱的 excludeTmpdirEnvVar 说的正是「那个环境变量指的地方」。
+    temporaryRoot: canonicalPath(tmpdir()),
+    leaseResidue: await leaseResidue(stateDir),
+  });
+}
+
+// candidate 的落盘：一份按 attempt 归档的**控制器信封**、一份是「最近一次候选」的老位置。
+//
+// 起因（R-2）：codex 的候选终态是一个 exact 形状（`{status:"ready_for_postflight",remaining_work:false}`，
+// workflow.mjs 的闭世界契约），两个 attempt 产出的是**同一串字节**——「手里这份 candidate 出自哪一
+// 轮」在协议层根本不可判，而那个形状不能改（改它是协议变更，有跨版本影响）。所以身份只能由控制器
+// 侧绑定。
+//
+// 归档的**不是**裸 candidate 而是一个信封：协议对象是喂给 `nextAction` 的那个 `runtimeResult`，
+// 归档文件是控制器自己的产物，可以带控制器自己的事实。信封让 finalize 那道闸有东西可核——只看
+// 「文件在不在」的话，一个零字节文件、或把上一轮那份改个名，都能骗过它。
+// `candidate.json` 保留原位不动（既有的对外产物，仍是裸 candidate），但它只是「最近一次候选」，
+// **不是**「本轮的候选」——续跑以终局报告收场时它仍是上一轮那份。
+const CANDIDATE_ENVELOPE_FIELDS = Object.freeze(['attempt', 'binding', 'candidate', 'threadId']);
+
+async function writeCodexCandidate({
+  stateDir, attemptNumber, candidate, binding, threadId,
+}) {
+  await writeFile(join(stateDir, 'attempts', `${attemptNumber}-candidate.json`), `${JSON.stringify({
+    attempt: attemptNumber, binding: binding ?? null, candidate, threadId: threadId ?? null,
+  }, null, 2)}\n`);
+  await writeFile(join(stateDir, 'candidate.json'), JSON.stringify(candidate, null, 2));
+}
+
+// finalize 的前置：最近一次 attempt 必须自己产出过候选。
+//
+// 危险形态是 R-2 与 N-6 合流之后的那个：续跑因护栏触顶或 `budgetLimited` 返回终局报告（按文档
+// 「触顶即终局报告，不产候选」），可编排器手里还攥着首发那份 candidate；只要此刻 postflight 恰好
+// 转绿（执行体在被掐断之前把活干完了是完全可能的），这条链就能一路推到 finalize——而 finalize 自己
+// set complete 再读回，`runtimeReadback` 也照不出「执行体是被中断的」。实测确认：把 attempt 1 的
+// candidate 配 attempt 2 的绿 postflight 喂进状态机，四步与用 attempt 2 的完全一样，同样走到 complete。
+// 控制器侧能判的事实只有这一条，判它就够堵住这条 fail-open。
+//
+// 核的是信封的内容，不是「文件在不在」：文件名可预测，只判存在的话一个零字节文件就能放行。
+// 四项——信封形状闭世界、attempt 号与文件名自洽（防把上一轮那份改名顶上）、candidate 本身仍是
+// 合法终态（判据取自 workflow.mjs 那个闭世界契约，不在这里抄第二遍）、binding 三元组与本次
+// finalize 的 binding 逐字相同（跨 run 的候选顶不进来）。
+// 前提仍是「state 目录在执行体可写面之外」——那条由 launch 前置闸把关（见 codex.mjs 的
+// stateDirReasons）；采集层传入的 targetRoots 不是一组路径字符串时（非数组、空集、含非字符串
+// 元素），那道位置闸同样 fail-closed。本闸不声称能识别一个能写 state 目录的对手伪造的信封。
+async function assertLatestAttemptProducedCandidate(stateDir, binding) {
+  const attempt = await maxExistingAttempt(stateDir);
+  if (attempt === 0) {
+    return { ok: false, reasons: ['no attempt has been claimed in this state dir: there is nothing to finalize'] };
+  }
+  const stale = `attempt ${attempt} produced no usable candidate: the most recent runtime action on this `
+    + 'state dir did not leave one, so any candidate still in hand belongs to an earlier attempt and must '
+    + 'not be finalized (next=re-run `resume` until the latest attempt itself yields a candidate, or report '
+    + 'the terminal outcome and stop)';
+  let envelope;
+  try {
+    envelope = JSON.parse(await readFile(join(stateDir, 'attempts', `${attempt}-candidate.json`), 'utf8'));
+  } catch {
+    return { ok: false, reasons: [stale] };
+  }
+  const shaped = envelope !== null && typeof envelope === 'object' && !Array.isArray(envelope)
+    && CANDIDATE_ENVELOPE_FIELDS.length === Object.keys(envelope).length
+    && CANDIDATE_ENVELOPE_FIELDS.every((field) => Object.hasOwn(envelope, field));
+  if (!shaped || envelope.attempt !== attempt) {
+    return { ok: false, reasons: [`${stale}; the archived candidate for that attempt is not a well-formed controller envelope`] };
+  }
+  const terminal = runtimeTerminalState('codex', envelope.candidate);
+  if (!terminal.ok) {
+    return { ok: false, reasons: [`${stale}; the archived candidate is not a valid codex terminal state`, ...terminal.reasons] };
+  }
+  const bound = envelope.binding !== null && typeof envelope.binding === 'object'
+    && ['contractHash', 'baselineDigest', 'runId'].every((field) => envelope.binding[field] === binding?.[field]);
+  if (!bound) {
+    return { ok: false, reasons: [`${stale}; the archived candidate is bound to a different run than this finalize`] };
+  }
+  return { ok: true, reasons: [] };
+}
+
+// 从 `thread/resume` 响应里采出与物理面有关的三项 + thread 身份，判定交纯函数 assertResumedSession。
+// 路径在这一层过 canonicalPath：判定是纯函数、碰不了 fs，归一只能在采集层做。
+// 取不到的字段原样留 undefined 交给判定——这层不做任何「缺了就当没事」的兜底，缺失本身就是红。
+function observeResumedSession(envelope) {
+  const result = envelope?.result;
+  const roots = result?.runtimeWorkspaceRoots;
+  return {
+    threadId: result?.thread?.id,
+    // 沙箱块整块交出去（判定要逐字比对，见 sandboxDrift）。这里不摘字段——摘一个字段正是
+    // 「同 type 而可写面被放大的沙箱照样过闸」那条缺口的成因。
+    sandbox: result?.sandbox,
+    cwd: canonicalPath(result?.cwd),
+    workspaceRoots: Array.isArray(roots) ? roots.map(canonicalPath) : roots,
+  };
+}
+
+// resume/finalize/close 复用上一次 launch 留下的会话坐标：threadId 与 codexHome 都是 launch 落盘的
+// 事实，读不回来就没有可续跑/可收口的活体 thread（fail-closed，不新建）。
+async function readCodexSession(stateDir) {
+  let threadId;
+  let cwd;
+  let codexHome;
+  try {
+    ({ threadId, cwd } = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8')));
+  } catch {
+    return { ok: false, reasons: ['no thread.json in the state dir: there is no prior codex thread to reconnect to'] };
+  }
+  try {
+    codexHome = (await readFile(join(stateDir, 'codex-home.path'), 'utf8')).trim();
+  } catch {
+    return { ok: false, reasons: ['no codex-home.path in the state dir: the isolated CODEX_HOME from launch is gone'] };
+  }
+  if (typeof threadId !== 'string' || threadId.length === 0) {
+    return { ok: false, reasons: ['thread.json holds no usable threadId'] };
+  }
+  if (codexHome.length === 0) {
+    return { ok: false, reasons: ['codex-home.path is empty'] };
+  }
+  return {
+    ok: true, threadId, cwd, codexHome, reasons: [],
+  };
+}
+
+// 八步（task-10 brief）：binding 三方交叉（同 T9 fail-closed 姿态）→ codex 侧 assertLaunchable
+// 前置（残留租约/沙箱声明/版本采集，红即不起 client）→ 配额天花板只读预检 → auth-copy（独立
+// mkdtemp、只读复制、chmod 0600，绝不碰 sqlite/config）→ start/initialize → nextAttempt 占号
+// （连上了才算起飞）→ threadStart → threadId 落盘 →
+// goalSet（ledger 先落再判 status）→ assertSetReturnedStatus 不过即终局（不发 turnStart）→
+// turnStart 起首轮 → 轮询（每拍 goalGet + 刷新租约，通知只记 turn 边界计数）→ normalizeTerminal
+// 分派 → deadline / daemon 中途死均 fail-closed 终局（后者报告体显式要求 snapshot verify）。
+export async function runCodexLaunch({
+  contract, stateDir, prompt, turnText, binding, clientFactory = defaultCodexClientFactory,
+  authSource = DEFAULT_AUTH_SOURCE, deadlineMs, pollIntervalMs = POLL_INTERVAL_MS,
+  sandboxMode = CODEX_SANDBOX_MODE,
+}) {
+  // binding（主会话持有的 runBinding）缺失、损坏、或对不上 stateDir 末段一律 fail-closed，不起 client。
+  if (binding?.contractHash !== basename(stateDir)) {
+    return {
+      outcome: 'terminal_report',
+      reasons: ['runBinding is missing, malformed, or does not match the state directory this attempt was prepared under'],
+    };
+  }
+
+  const verdict = await codexLaunchVerdict({ contract, stateDir, binding, sandboxMode });
+  if (!verdict.ok) {
+    return { outcome: 'terminal_report', reasons: verdict.reasons };
+  }
+
+  // 配额耗尽是死局，零副作用处先判掉：不占号、不复制凭证、不起 daemon（真正的占号在下面的
+  // 回调体里）。throw 而不是返回终局报告——它是进程级失败（exit 1），见 AttemptClaimError。
+  await assertAttemptBudgetLeft(stateDir);
+
+  // auth-copy（§5 安全模式）：codexHome 与任何 work 目录独立 mkdtemp，只读复制生产 auth、chmod 0600，
+  // 绝不碰 goals sqlite/config；路径在 thread/start 成功后与 thread.json 一同落盘供 resume/finalize/close 复用。
+  const codexHome = mkdtempSync(join(tmpdir(), CODEX_HOME_PREFIX));
+  const cwd = contract.target_roots[0];
+
+  let threadId;
+  let initialTurnIds;
+  try {
+    return await withCodexClient({
+      stateDir, codexHome, cwd, authSource, clientFactory,
+    }, async ({
+      client, refreshLease, notices, turnCounts, turnsBaseline,
+    }) => {
+      // 真占号的时刻：start/initialize 都过了，daemon 真的连上了才算起飞（F-2，与 claude 侧
+      // 「下一行就是 spawn」同构）。auth.json 不存在、codex 二进制缺失、daemon 起不来这三种
+      // 「什么都没发生」的失败全落在连接阶段，一格都不占——它们的原因都在 contract 之外，改正
+      // 不换 contract hash 也就不换 state 目录，占在前面等于连撞三次就把这份 contract 锁死。
+      const attemptNumber = await nextAttempt(stateDir);
+
+      ({ threadId, initialTurnIds } = await client.threadStart({ sandbox: sandboxMode }));
+      // cwd 一并落盘：finalize/close 不读 contract，重连 daemon 时要拿回同一个工作目录。
+      // codex-home.path 与 thread.json 在同一时刻落盘：这一刻之前，state 目录里的两个指针都还
+      // 指向上一次成功的那套；这一刻之后，两个都指向本次。中间不存在「thread 坐标说重连旧
+      // thread、codexHome 指针说用这个空目录」的自相矛盾态。
+      await writeFile(join(stateDir, 'codex-home.path'), codexHome);
+      await writeFile(join(stateDir, 'thread.json'), JSON.stringify({ threadId, cwd }));
+
+      const tokenBudgetParam = contract.budget?.user_provided && contract.budget.max_tokens
+        ? { tokenBudget: contract.budget.max_tokens } : {};
+      const setEnvelope = await client.goalSet({ threadId, objective: prompt, ...tokenBudgetParam });
+      const sequence = (await readLedger(stateDir)).length + 1;
+      await appendLedgerEntry(stateDir, {
+        sequence,
+        requestedStatus: 'active',
+        updatedAt: setEnvelope?.result?.goal?.updatedAt ?? null,
+        threadId,
+      });
+      const setVerdict = assertSetReturnedStatus(setEnvelope, 'active');
+      if (!setVerdict.ok) {
+        return {
+          outcome: 'terminal_report', threadId, status: setVerdict.observed ?? undefined, reasons: setVerdict.reasons,
+        };
+      }
+
+      const turnCorrelation = randomBytes(32).toString('hex');
+      const turnInputText = bindControllerTurnText({
+        text: turnText ?? prompt,
+        correlation: turnCorrelation,
+      });
+      const turnInputSha256 = sha256Text(turnInputText);
+      const turnEnvelope = await client.turnStart({ threadId, text: turnInputText });
+      const turnId = turnEnvelope?.result?.turn?.id ?? null;
+      const terminal = await pollGoalUntilTerminal({
+        client,
+        threadId,
+        stateDir,
+        attemptNumber,
+        binding,
+        refreshLease,
+        deadline: effectiveDeadlineMs(contract, deadlineMs),
+        pollIntervalMs,
+        notices,
+        turnCounts,
+        turnsBaseline,
+        turnCap: effectiveCap(MAX_TURNS_PER_ATTEMPT, contract, 'max_turns'),
+        tokenCap: effectiveCap(MAX_TOKENS_PER_ATTEMPT, contract, 'max_tokens'),
+      });
+      return { ...terminal, turnId, initialTurnIds, turnInputSha256 };
+    });
+  } catch (error) {
+    if (error instanceof AttemptClaimError) throw error;
+    // 连接阶段失败的 codexHome 是本次 mkdtemp 出来、从未连上过的：没有 thread、没有 goal，
+    // cleanup 已把唯一落过盘的东西（auth 副本）删掉，它按定义是空的。删掉它——
+    // 「cleanup 不删 codexHome」那条铁律保护的是**连上过**的 codexHome（thread/goal 状态要跨
+    // attempt 存活），从未连上的不在保护范围。
+    //
+    // 不删的代价是本轮占号挪位新造出来的：被拒的 launch 从此没有次数上限（上限正是本轮拿掉的），
+    // 每撞一次就留一个无人回收的临时目录。连上之后才失败的那些仍然占号，因而仍受配额封顶。
+    if (error instanceof CodexConnectError) rmSync(codexHome, { recursive: true, force: true });
+    return codexAttemptFailure(error, threadId);
+  }
+}
+
+// GoalSession v2 recovery/readback. It reuses the same isolated CODEX_HOME and client lifecycle as
+// resume/finalize, but performs no goal mutation and starts no turn.
+export async function runCodexReadback({
+  stateDir, clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
+}) {
+  const session = await readCodexSession(stateDir);
+  if (!session.ok) return { available: false, reasons: session.reasons };
+  try {
+    return await withCodexClient({
+      stateDir,
+      codexHome: session.codexHome,
+      cwd: session.cwd,
+      authSource,
+      clientFactory,
+    }, async ({ client }) => {
+      const envelope = await client.threadRead({ threadId: session.threadId, includeTurns: true });
+      const thread = envelope?.result?.thread;
+      if (thread?.id !== session.threadId || !Array.isArray(thread.turns)) {
+        return { available: false, reasons: ['thread/read returned no attributable turn history'] };
+      }
+      return {
+        available: true,
+        thread_id: thread.id,
+        turns: thread.turns.map(summarizeNativeTurn),
+      };
+    });
+  } catch (error) {
+    return { available: false, reasons: [`native readback failed: ${error.message}`] };
+  }
+}
+
+// 六步（task-11 brief）：binding 三方交叉 → codex 侧 assertLaunchable 前置 → 复用 launch 落盘的
+// threadId/codexHome（读不回来即终局，不新建 thread）→ 配额天花板只读预检 → withCodexClient
+// 连上 daemon 后 nextAttempt 占号 →
+// thread/resume 重连，再按 resumeRpcOps 逐 op 执行（goal.set → inject_items → turn/start；
+// set 后 ledger 续接 +1 并 assertSetReturnedStatus，不过即终局，后两个 op 一个都不发）→
+// 与 launch 同一个轮询循环。
+//
+// raiseTokenBudget 只在调用方显式传入时才带上：预算仅用户明给，抬预算须经用户确认，CLI 的
+// --raise-token-budget 就是那份确认的载体（缺省绝不自动抬，否则等于绕过 §4 的 budgetLimited 停机）。
+export async function runCodexResume({
+  contract, stateDir, diagnosticText, binding, raiseTokenBudget,
+  clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
+  deadlineMs, pollIntervalMs = POLL_INTERVAL_MS,
+}) {
+  // 按值判而不是按类型判：NaN / Infinity / -5 / 0 全是 typeof 'number'，一道纯类型闸放它们过去
+  // 之后，resumeTokenCap 的 `Number.isFinite && > 0` 会把它们**静默**换回 contract 里那个旧上限，
+  // 而 resumeRpcOps 同时把同一个值原样当 tokenBudget 送到服务端 goal.set。两处回落都不出声，
+  // 正是这条守卫要消掉的形态（realrun review 发现 3b）。
+  if (raiseTokenBudget !== undefined && !(Number.isFinite(raiseTokenBudget) && raiseTokenBudget > 0)) {
+    throw new TypeError('raiseTokenBudget must be a positive finite number when provided');
+  }
+  if (binding?.contractHash !== basename(stateDir)) {
+    return {
+      outcome: 'terminal_report',
+      reasons: ['runBinding is missing, malformed, or does not match the state directory this attempt was prepared under'],
+    };
+  }
+
+  const verdict = await codexLaunchVerdict({ contract, stateDir, binding });
+  if (!verdict.ok) {
+    return { outcome: 'terminal_report', reasons: verdict.reasons };
+  }
+
+  const session = await readCodexSession(stateDir);
+  if (!session.ok) {
+    return { outcome: 'terminal_report', reasons: session.reasons };
+  }
+  const { threadId, codexHome } = session;
+
+  // 配额耗尽先在零副作用处判掉（同 runCodexLaunch）；真占号在回调体里，连上 daemon 之后。
+  await assertAttemptBudgetLeft(stateDir);
+
+  try {
+    return await withCodexClient({
+      stateDir, codexHome, cwd: session.cwd ?? contract.target_roots[0], authSource, clientFactory,
+    }, async ({
+      client, refreshLease, notices, turnCounts, turnsBaseline,
+    }) => {
+      // 与 claude 侧同构（F-2）：daemon 真的连上了才占号，连接阶段的失败一格都不占。
+      const attemptNumber = await nextAttempt(stateDir);
+
+      // 重连既有 thread 用 thread/resume（不是新建的 thread/start）；参数形状 {threadId} 已由
+      // T5 的 schema 核对坐实（required=['threadId']）。
+      //
+      // 返回体不得丢弃：它是**续跑路径上唯一的物理面观测**。launch 靠请求参数把 `--sandbox` 钉死，
+      // resume 只传 threadId，沙箱由服务端从持久化 thread 状态恢复——不读回来核一遍，「本 adapter
+      // 唯一可核的物理面」这句声明在续跑上就只是信任，不是观测。核不过即终局报告：此刻还没发
+      // goal.set、没注入、没起 turn，执行体一步都没跑。
+      const continuity = assertResumedSession({
+        observed: observeResumedSession(await client.threadResume({ threadId })),
+        threadId,
+        targetRoots: contract.target_roots.map(canonicalPath),
+      });
+      if (!continuity.ok) {
+        return { outcome: 'terminal_report', threadId, reasons: continuity.reasons };
+      }
+
+      // 逐 op 执行 resumeRpcOps 的返回：params 一律取自那个纯函数，不在这里二次拼装——
+      // tokenBudget 带不带、inject 的 item 形状、turn/start 的收口句都只有一处真值源。
+      for (const op of resumeRpcOps({ threadId, diagnosticText, tokenBudget: raiseTokenBudget })) {
+        const envelope = await client.rpc(op.method, op.params);
+        if (op.expectStatus === undefined) continue;
+
+        const sequence = (await readLedger(stateDir)).length + 1;
+        await appendLedgerEntry(stateDir, {
+          sequence,
+          requestedStatus: op.params.status,
+          updatedAt: envelope?.result?.goal?.updatedAt ?? null,
+          threadId,
+        });
+
+        const setVerdict = assertSetReturnedStatus(envelope, op.expectStatus);
+        if (setVerdict.ok) continue;
+        const reasons = [...setVerdict.reasons];
+        if (setVerdict.observed === 'budgetLimited' && raiseTokenBudget === undefined) {
+          reasons.push('raising the token budget needs explicit user confirmation: re-run resume with --raise-token-budget N');
+        }
+        return {
+          outcome: 'terminal_report', threadId, status: setVerdict.observed ?? undefined, reasons,
+        };
+      }
+
+      return pollGoalUntilTerminal({
+        client,
+        threadId,
+        stateDir,
+        attemptNumber,
+        binding,
+        refreshLease,
+        deadline: effectiveDeadlineMs(contract, deadlineMs),
+        pollIntervalMs,
+        notices,
+        turnCounts,
+        turnsBaseline,
+        turnCap: effectiveCap(MAX_TURNS_PER_ATTEMPT, contract, 'max_turns'),
+        // 与 launch 不同：这里认 --raise-token-budget（review M-1），见 resumeTokenCap。
+        tokenCap: resumeTokenCap(contract, raiseTokenBudget),
+      });
+    });
+  } catch (error) {
+    if (error instanceof AttemptClaimError) throw error;
+    return codexAttemptFailure(error, threadId);
+  }
+}
+
+// finalize：控制器 postflight 全绿、nextAction 返回 finalize_runtime 之后才该被调用——顺序由主会话
+// 把关，本函数不自证（CLI 看不到 postflight 结论，自证只会造出一个假的顺序证据）。
+// 产物是两份 controller-owned 证据文件，字段与 workflow.mjs 的闭世界形状逐字对齐；归因不过就把
+// 两份都写成 ok:false + 安全 reasons（fail-closed：主会话再喂 nextAction 自然被拒，而不是缺文件）。
+function verifyNativeTurnFence(envelope, threadId, expectedTurnIds, expectedTurns) {
+  const v2 = expectedTurns !== undefined;
+  const normalizedExpected = v2 ? expectedTurns : expectedTurnIds;
+  if (!Array.isArray(normalizedExpected)
+    || normalizedExpected.length === 0
+    || (v2 && normalizedExpected.length !== 1)
+    || (v2 && normalizedExpected.some((turn) => {
+      const keys = Object.keys(turn ?? {}).sort();
+      return keys.length !== 2
+        || keys[0] !== 'id'
+        || keys[1] !== 'input_sha256'
+        || typeof turn.id !== 'string'
+        || turn.id.length === 0
+        || typeof turn.input_sha256 !== 'string'
+        || !SHA256.test(turn.input_sha256);
+    }))
+    || (!v2 && (new Set(normalizedExpected).size !== normalizedExpected.length
+      || normalizedExpected.some((id) => typeof id !== 'string' || id.length === 0)))) {
+    return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_INVALID'] };
+  }
+  const thread = envelope?.result?.thread;
+  if (thread?.id !== threadId || !Array.isArray(thread.turns)) {
+    return { ok: false, reason_codes: ['FINALIZE_NATIVE_READBACK_UNAVAILABLE'] };
+  }
+  const observedTurns = thread.turns.map(summarizeNativeTurn);
+  const observed = observedTurns.map((turn) => turn.id);
+  if (observed.some((id) => typeof id !== 'string' || id.length === 0)
+    || new Set(observed).size !== observed.length
+    || (v2 && observedTurns.some((turn) => !SHA256.test(turn.input_sha256 ?? '')))) {
+    return { ok: false, reason_codes: ['FINALIZE_NATIVE_TURN_HISTORY_INVALID'] };
+  }
+  const expected = new Set(v2
+    ? normalizedExpected.map((turn) => `${turn.id}:${turn.input_sha256}`)
+    : normalizedExpected);
+  const observedKeys = v2
+    ? observedTurns.map((turn) => `${turn.id}:${turn.input_sha256}`)
+    : observed;
+  if (observedKeys.some((key) => !expected.has(key))) {
+    return { ok: false, reason_codes: ['UNRECEIPTED_NATIVE_TURN'] };
+  }
+  if ([...expected].some((key) => !observedKeys.includes(key))) {
+    return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_MISMATCH'] };
+  }
+  return { ok: true, reason_codes: [] };
+}
+
+export async function runCodexFinalize({
+  stateDir, binding, expectedTurnIds, expectedTurns,
+  clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
+}) {
+  const receiptPath = join(stateDir, 'finalization-receipt.json');
+  const readbackPath = join(stateDir, 'runtime-readback.json');
+
+  const writeEvidence = async (
+    attribution,
+    { setStatus = null, readStatus = null, turnFence = null } = {},
+  ) => {
+    const { ok } = attribution;
+    const reasons = ok ? [] : attribution.reasons;
+    await writeFile(receiptPath, `${JSON.stringify({
+      ok, operation: 'thread/goal/set', status: setStatus, reasons, binding: binding ?? null,
+    }, null, 2)}\n`);
+    await writeFile(readbackPath, `${JSON.stringify({
+      ok,
+      source: 'thread/goal/get',
+      status: readStatus,
+      // 归因不成立时断言不了"没有剩余工作、没有出错"，两项都取 fail-closed 的那一侧。
+      remaining_work: !ok,
+      error: !ok,
+      blocked: readStatus === 'blocked',
+      reasons,
+      binding: binding ?? null,
+    }, null, 2)}\n`);
+    return { receiptPath, readbackPath, attribution, turnFence };
+  };
+
+  // --binding-file 与 --state 是两个独立入参：对不上意味着这份 receipt 会把某个 run 的 finalize
+  // 按到另一份 binding 上。nextAction 只比对 receipt.binding 与主会话手里的 runBinding（同一份
+  // 文件，必然自洽），看不见这层错配，只能在这里挡。
+  if (binding?.contractHash !== basename(stateDir)) {
+    return writeEvidence({
+      ok: false,
+      reasons: ['runBinding is missing, malformed, or does not match the state directory this run was prepared under'],
+    });
+  }
+
+  // 陈旧 candidate 的闸（R-2）：最近一次 attempt 自己没产出候选，就没有任何东西可 finalize。
+  // 判在起 client 之前——它是零副作用的读盘，没必要先复制凭证、起一个 daemon 再发现。
+  const latest = await assertLatestAttemptProducedCandidate(stateDir, binding);
+  if (!latest.ok) {
+    return writeEvidence({ ok: false, reasons: latest.reasons });
+  }
+
+  const session = await readCodexSession(stateDir);
+  if (!session.ok) {
+    return writeEvidence({ ok: false, reasons: session.reasons });
+  }
+  const { threadId, codexHome, cwd } = session;
+
+  try {
+    return await withCodexClient({
+      stateDir, codexHome, cwd, authSource, clientFactory,
+    }, async ({ client }) => {
+      let turnFence = null;
+      if (expectedTurnIds !== undefined || expectedTurns !== undefined) {
+        turnFence = verifyNativeTurnFence(
+          await client.threadRead({ threadId, includeTurns: true }),
+          threadId,
+          expectedTurnIds,
+          expectedTurns,
+        );
+        if (!turnFence.ok) {
+          return writeEvidence({ ok: false, reasons: turnFence.reason_codes }, { turnFence });
+        }
+      }
+      const setEnvelope = await client.goalSet({ threadId, status: 'complete' });
+      const sequence = (await readLedger(stateDir)).length + 1;
+      await appendLedgerEntry(stateDir, {
+        sequence,
+        requestedStatus: 'complete',
+        updatedAt: setEnvelope?.result?.goal?.updatedAt ?? null,
+        threadId,
+      });
+      const readbackEnvelope = await client.goalGet({ threadId });
+      let attribution = verifyFinalizeAttribution({
+        setEnvelope, readbackEnvelope, threadId, sequence, ledger: await readLedger(stateDir),
+      });
+      if (expectedTurnIds !== undefined || expectedTurns !== undefined) {
+        turnFence = verifyNativeTurnFence(
+          await client.threadRead({ threadId, includeTurns: true }),
+          threadId,
+          expectedTurnIds,
+          expectedTurns,
+        );
+        if (!turnFence.ok) attribution = { ok: false, reasons: turnFence.reason_codes };
+      }
+      return writeEvidence(attribution, {
+        setStatus: setEnvelope?.result?.goal?.status ?? null,
+        readStatus: readbackEnvelope?.result?.goal?.status ?? null,
+        turnFence,
+      });
+    });
+  } catch (error) {
+    return writeEvidence({
+      ok: false,
+      reasons: [`codex finalize failed before attribution could be established: ${error.message}`],
+    });
+  }
+}
+
+// close：残留清理。goal 只要还活着就先 clear——active 是最常见的残留形态，paused/blocked/
+// usageLimited/budgetLimited 同样是没收口的活 goal，一并清（complete 已收口，不动）。随后整目录
+// 删除 codexHome（withCodexClient 的 cleanup 只删 auth 副本，thread/goal 状态到这一步才该消失）。
+export async function runCodexClose({
+  stateDir, clientFactory = defaultCodexClientFactory, authSource = DEFAULT_AUTH_SOURCE,
+}) {
+  // 残留租约的释放**不能**挂在「读得到 codex-home.path」下面（N-2）：崩溃留下的 lease.json 让
+  // 下一次 launch 被拦、诊断指向 close，而 close 第一件事就是读 codex-home.path，读不到直接
+  // return——launch 说跑 close、close 说没什么可关，两句话互相指认，磁盘状态一动不动，唯一出路
+  // 是手工 rm 或换 --controller 名。租约与 codexHome 本来就是两件独立的残留，先把租约收掉。
+  const lease = releaseResidualLease({ leasePath: join(stateDir, 'lease.json') });
+
+  let codexHome;
+  try {
+    codexHome = (await readFile(join(stateDir, 'codex-home.path'), 'utf8')).trim();
+  } catch {
+    return {
+      cleanupComplete: lease.runtimeQuiesced,
+      runtimeQuiesced: lease.runtimeQuiesced,
+      codexHome: null,
+      goalCleared: false,
+      leaseReleased: lease.released,
+      reasons: [...lease.reasons, lease.released
+        // 如实说做了什么：清掉租约之后再说「nothing to close」就是在谎报这次一动没动。
+        ? 'no codex-home.path in the state dir: the residual lease was the only thing left to release'
+        : 'no codex-home.path in the state dir: nothing to close'],
+    };
+  }
+
+  // A live foreign runtime lease is proof that the runtime is not quiescent. Do not clear its goal,
+  // delete its CODEX_HOME, or tell the controller that cleanup completed: any of those would let the
+  // controller release the target-root lease and overlap a new Attempt with the still-running one.
+  if (!lease.runtimeQuiesced) {
+    return {
+      cleanupComplete: false,
+      runtimeQuiesced: false,
+      codexHome,
+      goalCleared: false,
+      leaseReleased: false,
+      reasons: lease.reasons,
+    };
+  }
+
+  // 这是全流程唯一的递归删除。路径来自磁盘文件，损坏或被改写就会把 rm -rf 指向任意目录——
+  // 只删自己 mkdtemp 出来的那种形态（绝对路径 + gc-codex-home- 前缀），其余一律拒绝并留 reason。
+  if (!isAbsolute(codexHome) || !basename(codexHome).startsWith(CODEX_HOME_PREFIX)) {
+    return {
+      cleanupComplete: false,
+      runtimeQuiesced: true,
+      codexHome,
+      goalCleared: false,
+      leaseReleased: lease.released,
+      reasons: [...lease.reasons,
+        `refusing to delete a codex-home.path outside the managed ${CODEX_HOME_PREFIX}* form`],
+    };
+  }
+
+  const reasons = [...lease.reasons];
+  let goalCleared = false;
+  const session = await readCodexSession(stateDir);
+  if (session.ok) {
+    try {
+      await withCodexClient({
+        stateDir, codexHome, cwd: session.cwd, authSource, clientFactory,
+      }, async ({ client }) => {
+        const goal = (await client.goalGet({ threadId: session.threadId }))?.result?.goal;
+        if (goal && goal.status !== 'complete') {
+          await client.goalClear({ threadId: session.threadId });
+          goalCleared = true;
+        }
+      });
+    } catch (error) {
+      // daemon 已经不可达时 goal 随 codexHome 一起消失，清理照常往下走，只留 reason。
+      reasons.push(`goal clear skipped: ${error.message}`);
+    }
+  } else {
+    reasons.push(...session.reasons);
+  }
+
+  rmSync(codexHome, { recursive: true, force: true });
+  rmSync(join(stateDir, 'codex-home.path'), { force: true });
+  return {
+    cleanupComplete: true,
+    runtimeQuiesced: true,
+    codexHome,
+    goalCleared,
+    leaseReleased: lease.released,
+    reasons,
+  };
+}

@@ -1,11 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { CLAUDE_RESULT_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, CLI_MAX_TURNS } from '../scripts/lib/adapters/claude.mjs';
+import { CLAUDE_RESULT_KEYS, CLAUDE_ERROR_MAX_TURNS_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, DEFAULT_MAX_TURNS, MAX_TURNS_CEILING } from '../scripts/lib/adapters/claude.mjs';
 import { runtimeTerminalState } from '../scripts/lib/workflow.mjs';
 
 const fixtureUrl = new URL('./fixtures/claude-result-21key.json', import.meta.url);
 const realResult = JSON.parse(await readFile(fixtureUrl, 'utf8'));
+
+// spike S-B（2.1.228）的实测产物：--max-turns 1 触发硬停，CLI 出 error 形态 envelope。与
+// 2026-08-10/08-12 两次真实 run 在 2.1.226/2.1.228 的观测逐 key 一致。形状从实测文件读，不手抄。
+const errorFixtureUrl = new URL('./fixtures/claude-result-17key-error-max-turns.json', import.meta.url);
+const errorMaxTurnsResult = JSON.parse(await readFile(errorFixtureUrl, 'utf8'));
 
 // spike S5 runB 的实测产物：模型改不动 hook 就换 Bash 直接重定向（`printf 'exit 0' > stop-hook.sh`），
 // 被 settings.permissions.deny 挡下，留下这条 permission_denials 记录。形状从实测文件读，不手抄。
@@ -38,6 +43,93 @@ test('normalizeTerminal fails closed on unknown, missing, or non-object input', 
     assert.ok(normalized.reasons.length > 0);
     assert.ok(!('candidate' in normalized));
   }
+});
+
+// ---------------------------------------------------------------------------
+// error_max_turns 第二锚（D5）：「没干完」和「协议漂移」是两类事。2026-08-10 真实 run 里
+// max-turns 硬停的 17-key envelope 被单锚判成 malformed，thread.json 不落盘，resume 死锁。
+// ---------------------------------------------------------------------------
+
+test('CLAUDE_ERROR_MAX_TURNS_KEYS pins the measured error envelope exactly', () => {
+  assert.equal(CLAUDE_ERROR_MAX_TURNS_KEYS.length, 17);
+  assert.deepEqual([...Object.keys(errorMaxTurnsResult)].sort(), [...CLAUDE_ERROR_MAX_TURNS_KEYS].sort());
+  // 与成功锚的差集也是实测事实（少 5 多 1），锚表改动必须两边一起过目。
+  const success = new Set(CLAUDE_RESULT_KEYS);
+  const error = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
+  assert.deepEqual(
+    CLAUDE_RESULT_KEYS.filter((key) => !error.has(key)).sort(),
+    ['api_error_status', 'result', 'time_to_request_ms', 'ttft_ms', 'ttft_stream_ms'],
+  );
+  assert.deepEqual(CLAUDE_ERROR_MAX_TURNS_KEYS.filter((key) => !success.has(key)), ['errors']);
+});
+
+test('a measured error_max_turns envelope is a budget-exhausted candidate, not a terminal report', () => {
+  const normalized = normalizeTerminal(errorMaxTurnsResult);
+  assert.equal(normalized.ok, true);
+  assert.equal(normalized.budgetExhausted, true);
+  // candidate 恒 4 字段：budgetExhausted 是报告体信号，不得混进 candidate——workflow.mjs 的
+  // claudeTerminalState 做闭世界形状检查，多一个字段就把「未达标」变成形状错误。
+  assert.deepEqual(Object.keys(normalized.candidate).sort(),
+    ['is_error', 'permission_denials', 'subtype', 'terminal_reason']);
+  assert.equal(normalized.candidate.subtype, 'error_max_turns');
+  assert.equal(normalized.candidate.terminal_reason, 'max_turns');
+  // 它是候选但不是达标候选：公共状态机照常拒绝 Close，这正是「如实标注未达标」。
+  const verdict = runtimeTerminalState('claude', normalized.candidate);
+  assert.equal(verdict.ok, false);
+});
+
+test('error_max_turns routing requires the complete measured discriminator tuple', () => {
+  for (const [field, value] of [
+    ['type', 'assistant'],
+    ['is_error', false],
+    ['terminal_reason', 'completed'],
+  ]) {
+    const normalized = normalizeTerminal({ ...errorMaxTurnsResult, [field]: value });
+    assert.equal(normalized.ok, false, `${field} must be value-anchored`);
+    assert.ok(normalized.reasons.some((reason) => reason.includes('discriminator')));
+    assert.equal(normalized.budgetExhausted, undefined);
+  }
+});
+
+test('the success path reports budgetExhausted=false explicitly', () => {
+  assert.equal(normalizeTerminal(realResult).budgetExhausted, false);
+});
+
+test('provider status is preserved outside the four-field candidate as a privacy-safe blocker signal', () => {
+  const normalized = normalizeTerminal({ ...realResult, api_error_status: 429, is_error: true });
+  assert.equal(normalized.ok, true);
+  assert.deepEqual(normalized.providerBlocker, { api_error_status: 429 });
+  assert.deepEqual(Object.keys(normalized.candidate).sort(),
+    ['is_error', 'permission_denials', 'subtype', 'terminal_reason']);
+  assert.equal(JSON.stringify(normalized.providerBlocker).includes(realResult.result), false);
+});
+
+test('the error anchor is exhaustive: every key removed or added fails closed', () => {
+  for (const key of CLAUDE_ERROR_MAX_TURNS_KEYS) {
+    const mutated = { ...errorMaxTurnsResult };
+    delete mutated[key];
+    // 删 subtype 本身会把判定送回成功锚——两种走向都必须红。
+    const normalized = normalizeTerminal(mutated);
+    assert.equal(normalized.ok, false, `deleting ${key} must fail closed`);
+  }
+  const extra = normalizeTerminal({ ...errorMaxTurnsResult, surprise_key: 1 });
+  assert.equal(extra.ok, false);
+  // 隐私纪律与成功锚同款：只给计数，不回显 key 名。
+  assert.ok(extra.reasons.every((reason) => !reason.includes('surprise_key')));
+});
+
+test('cross-shape confusion fails closed in both directions and hints the right table', () => {
+  // 成功形态谎报 error_max_turns：按 error 锚判，多 5 缺 1，红。
+  const successBody = normalizeTerminal({ ...realResult, subtype: 'error_max_turns' });
+  assert.equal(successBody.ok, false);
+  assert.ok(successBody.reasons.some((reason) => reason.includes('CLAUDE_ERROR_MAX_TURNS_KEYS')));
+  // error 形态谎报 success：按成功锚判，缺 5 多 1，红。
+  const errorBody = normalizeTerminal({ ...errorMaxTurnsResult, subtype: 'success' });
+  assert.equal(errorBody.ok, false);
+  assert.ok(errorBody.reasons.some((reason) => reason.includes('CLAUDE_RESULT_KEYS')));
+  // 没建锚的 error subtype（形状同为 17-key）不放行：只为实测过的形态建锚，其余 fail closed。
+  const unanchored = normalizeTerminal({ ...errorMaxTurnsResult, subtype: 'error_during_execution' });
+  assert.equal(unanchored.ok, false);
 });
 
 // fault injection 类别③（hook 篡改探针）的 pipeline 末端：探针层（assertLaunchable 的 sha256/mode/
@@ -88,6 +180,7 @@ test('diagnostics stay privacy-safe: counts only, never raw key names', () => {
 const hookContract = {
   objective: 'demo',
   budget: { user_provided: true, max_minutes: 30, max_turns: 5 },
+  target_roots: ['/work/root'],
   postflight: [
     { id: 'pf-test', type: 'command', cwd: '/work/root', argv: ['npm', 'test'], capture: 'hash' },
     { id: 'pf-artifact', type: 'command', cwd: '/work/root', argv: ['test', '-f', 'out.txt'], requires_env: ['CI_TOKEN_NAME'] },
@@ -116,13 +209,81 @@ test('buildStopHook maps user budget into embedded limits', () => {
   assert.match(noBudget.script, /maxWallMs = null/);
 });
 
-test('buildSettings wires Stop hook and denies Edit on the hook and state dir', () => {
-  const settings = buildSettings({ hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir' });
+test('buildSettings compiles contract permissions and protects controller state', () => {
+  const contract = {
+    ...hookContract,
+    target_roots: ['/work/root-link', '/work/other-link'],
+    execution_permissions: {
+      bash_prefixes: ['git add', 'npm'],
+      webfetch_domains: ['cloud.langfuse.com'],
+      skills: ['langfuse'],
+      additional_read_roots: ['/reference/link'],
+    },
+  };
+  const settings = buildSettings({
+    contract,
+    hookScriptPath: '/state/dir/stop-hook.mjs',
+    stateDir: '/state/dir',
+    targetRoots: ['/work/root-real', '/work/other-real'],
+    additionalReadRoots: ['/reference/real'],
+  });
   assert.equal(settings.hooks.Stop[0].hooks[0].type, 'command');
   assert.match(settings.hooks.Stop[0].hooks[0].command, /^node '\/state\/dir\/stop-hook\.mjs'$/);
-  assert.ok(settings.permissions.deny.includes('Edit(//state/dir/stop-hook.mjs)'));
-  assert.ok(settings.permissions.deny.includes('Edit(//state/dir/**)'));
+  assert.deepEqual(settings.permissions.allow, [
+    'Bash(git add:*)', 'Bash(npm:*)',                     // 显式 bash_prefixes → :* 前缀；postflight 不进 allow（V5'）
+    'WebFetch(domain:cloud.langfuse.com)', 'Skill(langfuse)',
+  ]);
+  assert.deepEqual(settings.permissions.additionalDirectories, ['/work/other-real', '/reference/real']);
+  assert.deepEqual(settings.permissions.deny, [
+    'Edit(//state/dir/stop-hook.mjs)', 'Edit(//state/dir/**)',
+  ]);
   assert.equal(JSON.stringify(settings).includes('disableAllHooks'), false);
+});
+
+test('assertLaunchable does not depend on ambient project-settings inspection', () => {
+  // launchSpec 用 --setting-sources "" 从加载面移除 user/project/local；受控 --settings 仍作为
+  // flagSettings 加载。项目 settings 因而不是判定输入，也不需要竞态扫描器。
+  assert.deepEqual(assertLaunchable(hookContract, {
+    ...goodProbes,
+    projectSettingsWithPermissions: ['/work/root/.claude/settings.local.json'],
+  }), { ok: true, reasons: [] });
+});
+
+test('postflight verifiers never enter the Bash allow-list (V5\')', () => {
+  // 第一波修法（argv.join(' ') 精确命令）双向坏死：['printf','%s','a; touch x'] join 出的
+  // Bash(printf %s a; touch x) 在 shell 语义下授权了第二条命令（over-auth）；['git','diff','a b.txt']
+  // join 出的规则与真实 tokenize（'a b.txt' 是一个参数）永不匹配（dead rule）。病根是 argv
+  // （execFile 语义）与 Bash specifier（shell 字符串语义）之间没有可靠编码——整条自动推导通道移除。
+  // verifier 的执行不受影响：hook 用 execFileSync 跑它，不经 claude 权限；执行体要自己跑 verifier
+  // 由作者显式 bash_prefixes 声明。
+  const contract = {
+    ...hookContract,
+    postflight: [
+      { id: 'pf', type: 'command', cwd: '/work/root', argv: ['git', 'diff', '--exit-code'] },
+      { id: 'pf2', type: 'command', cwd: '/work/root', argv: ['printf', '%s', 'a; touch /tmp/x'] },
+    ],
+    execution_permissions: { bash_prefixes: ['npm run'] },
+  };
+  const settings = buildSettings({
+    contract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+  });
+  // 显式 bash_prefixes 仍是前缀授权（作者明知在声明前缀）；postflight 一条都不出现。
+  assert.deepEqual(settings.permissions.allow, ['Bash(npm run:*)']);
+});
+
+test('unrepresentable postflight argv never blocks or enters the launch gate (V5\')', () => {
+  // postflight 不再投影进权限 DSL，含括号/空格的 verifier 可执行路径既不该让 buildSettings 抛、
+  // 也不该让 assertLaunchable false-red（第一波曾遗留 argv[0] 投影在 permissionInputs 里）。
+  const contract = {
+    ...hookContract,
+    postflight: [{ id: 'pf', type: 'command', cwd: '/work/root', argv: ['/Applications/App (1).app/bin/check', 'a b.txt'] }],
+  };
+  const settings = buildSettings({
+    contract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+  });
+  assert.deepEqual(settings.permissions.allow, []);
+  const probes = { ...goodProbes, settings };
+  assert.deepEqual(assertLaunchable(contract, probes), { ok: true, reasons: [] });
 });
 
 test('buildSettings shell-escapes hostile paths with POSIX single quotes', () => {
@@ -130,50 +291,90 @@ test('buildSettings shell-escapes hostile paths with POSIX single quotes', () =>
   assert.equal(hostile.hooks.Stop[0].hooks[0].command, "node '/tmp/a$b`c'\\''d/stop-hook.mjs'");
 });
 
+test('buildSettings rejects every unrepresentable value interpolated into permission rules', () => {
+  const cases = [
+    { hookScriptPath: '/state/bad)/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'] },
+    { hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/bad)', targetRoots: ['/work/root'] },
+    {
+      contract: { ...hookContract, execution_permissions: { bash_prefixes: ['safe) Bash(evil'] } },
+      hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir', targetRoots: ['/work/root'],
+    },
+  ];
+  for (const input of cases) {
+    assert.throws(() => buildSettings(input), /permission specifier/i);
+  }
+});
+
 const goodProbes = Object.freeze({
   contractHash: 'a'.repeat(64), confirmedHash: 'a'.repeat(64), baselineDigestStored: true,
   claudeVersion: '2.1.223',
-  settings: buildSettings({ hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir' }),
+  claudeSessionIdFlag: true,
+  claudeSettingSourcesFlag: true,
+  settings: buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: ['/work/root'],
+  }),
   hookScript: { path: '/state/dir/stop-hook.mjs', exists: true, sha256: 'f'.repeat(64), mode: '0500' },
   expectedHookSha256: 'f'.repeat(64),
   targetRoots: ['/work/root'],
   stateDir: '/state/dir',
 });
 
+test('assertLaunchable dedups target roots the same way buildSettings does (V1)', () => {
+  // 重复/symlink 等价的 canonical target root（validateContract 不去重、不规范化，能过校验）：
+  // buildSettings 用 unique(T).slice(1)，assertLaunchable 曾用 T.slice(1) 再 unique，两者对
+  // 重复首根给出不同 additionalDirectories，合法 contract 每次 launch 都红、永久拒绝。
+  const roots = ['/work/root', '/work/root', '/work/extra'];
+  const settings = buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: roots,
+  });
+  const probes = { ...goodProbes, settings, targetRoots: roots };
+  assert.deepEqual(assertLaunchable(hookContract, probes), { ok: true, reasons: [] });
+});
+
 test('launchSpec/resumeSpec are pure argv data with settings pinned', () => {
-  const spec = launchSpec({ prompt: 'OBJECTIVE TEXT', settingsPath: '/state/dir/settings.json', cwd: '/work/root' });
+  const spec = launchSpec({
+    prompt: 'OBJECTIVE TEXT', settingsPath: '/state/dir/settings.json', cwd: '/work/root', sessionId: 'sid-launch',
+  });
   assert.deepEqual(spec.argv, ['claude', '-p', 'OBJECTIVE TEXT', '--output-format', 'json',
+    '--session-id', 'sid-launch',
+    '--setting-sources', '',
     '--settings', '/state/dir/settings.json', '--permission-mode', 'acceptEdits',
-    '--max-turns', String(CLI_MAX_TURNS)]);
+    '--max-turns', String(DEFAULT_MAX_TURNS)]);
   const resume = resumeSpec({ sessionId: 'sid-1', settingsPath: '/state/dir/settings.json',
     diagnosticText: 'fix pf-test', cwd: '/work/root' });
   assert.ok(resume.argv.includes('--resume') && resume.argv.includes('sid-1'));
   assert.ok(resume.argv.includes('--settings'));   // S3：resume 不带 settings 则 hook 静默失效
 });
 
-// M1：budget.max_turns 此前只约束 hook 的 block 次数，argv 里恒是 --max-turns 50——用户写了
-// max_turns=5 也拦不住 CLI 跑到第 50 轮。与 launch.mjs 对 max_minutes 取 min 的处置对齐。
-test('launchSpec/resumeSpec clamp --max-turns to the user-provided budget', () => {
+test('explicit Claude turn budgets can raise the default up to a hard preflight ceiling', () => {
   const argvOf = (spec) => spec.argv[spec.argv.indexOf('--max-turns') + 1];
-  const budget = { user_provided: true, max_minutes: 30, max_turns: 5 };
-  assert.equal(argvOf(launchSpec({ prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget })), '5');
-  assert.equal(argvOf(resumeSpec({
-    sessionId: 'sid-1', settingsPath: '/s.json', diagnosticText: 'd', cwd: '/w', budget,
-  })), '5');
-
-  // 用户没给（或没标 user_provided）时退回 CLI 常量；更宽的用户预算不放大 CLI 上限。
+  assert.equal(DEFAULT_MAX_TURNS, 50);
+  assert.equal(MAX_TURNS_CEILING, 200);
   for (const notUserGiven of [undefined, { max_turns: 5 }, { user_provided: true, max_minutes: 30 }]) {
     assert.equal(
       argvOf(launchSpec({ prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget: notUserGiven })),
-      String(CLI_MAX_TURNS),
+      String(DEFAULT_MAX_TURNS),
     );
   }
-  assert.equal(
-    argvOf(launchSpec({
-      prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget: { user_provided: true, max_turns: 500 },
-    })),
-    String(CLI_MAX_TURNS),
-  );
+  for (const max_turns of [5, 50, 51, 200, 201]) {
+    const budget = { user_provided: true, max_turns };
+    assert.equal(argvOf(launchSpec({ prompt: 'p', settingsPath: '/s.json', cwd: '/w', budget })), String(max_turns));
+    assert.equal(argvOf(resumeSpec({
+      sessionId: 'sid-1', settingsPath: '/s.json', diagnosticText: 'd', cwd: '/w', budget,
+    })), String(max_turns));
+  }
+
+  for (const max_turns of [50, 51, 200]) {
+    assert.deepEqual(assertLaunchable({ ...hookContract, budget: { user_provided: true, max_turns } }, goodProbes),
+      { ok: true, reasons: [] });
+  }
+  const over = assertLaunchable({
+    ...hookContract, budget: { user_provided: true, max_turns: 201 },
+  }, goodProbes);
+  assert.equal(over.ok, false);
+  assert.ok(over.reasons.some((reason) => reason.includes('200')));
 });
 
 test('assertLaunchable passes the good probe set and fails each broken one', () => {
@@ -182,6 +383,9 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
     { ...goodProbes, confirmedHash: 'b'.repeat(64) },
     { ...goodProbes, baselineDigestStored: false },
     { ...goodProbes, claudeVersion: '2.1.222' },                      // 低于实测下限的旧版本
+    { ...goodProbes, claudeSessionIdFlag: false },                    // --help 探测不到 --session-id
+    { ...goodProbes, claudeSettingSourcesFlag: false },               // 隔离环境 settings 的能力缺失
+    (() => { const p = { ...goodProbes }; delete p.claudeSessionIdFlag; return p; })(),  // 旧 probes.json 缺探测值
     { ...goodProbes, settings: { ...goodProbes.settings, disableAllHooks: true } },
     { ...goodProbes, settings: { hooks: goodProbes.settings.hooks, permissions: { deny: [] } } },  // 缺 deny
     { ...goodProbes, hookScript: { ...goodProbes.hookScript, exists: false } },
@@ -195,6 +399,67 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
     assert.equal(verdict.ok, false);
     assert.ok(verdict.reasons.length > 0);
   }
+});
+
+test('every authorized root must be disjoint from controller state (V6\')', () => {
+  // target_roots 与 additional_read_roots 都是执行体可达面。任一根与 stateDir 有包含关系，执行体
+  // （与控制器同 uid，0600 挡不住）就能读 hook-env.json。根目录 / 是最强反例，必须命中同一判据。
+  const cases = [
+    ['/', 'the filesystem root'],
+    ['/state', 'an ancestor of the state dir'],
+    ['/state/dir', 'the state dir itself'],
+    ['/state/dir/attempts', 'a directory inside the state dir'],
+  ];
+  for (const [root, label] of cases) {
+    const settings = buildSettings({
+      contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+      targetRoots: ['/work/root'], additionalReadRoots: [root],
+    });
+    const verdict = assertLaunchable(hookContract, {
+      ...goodProbes, settings, additionalReadRoots: [root],
+    });
+    assert.equal(verdict.ok, false, `${label} must be rejected`);
+    assert.ok(verdict.reasons.some((reason) => reason.includes('authorized root overlaps')), label);
+  }
+  const targetInsideState = '/state/dir/work';
+  const targetSettings = buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: [targetInsideState], additionalReadRoots: [],
+  });
+  const targetVerdict = assertLaunchable(hookContract, {
+    ...goodProbes, settings: targetSettings, targetRoots: [targetInsideState], additionalReadRoots: [],
+  });
+  assert.equal(targetVerdict.ok, false);
+  assert.ok(targetVerdict.reasons.some((reason) => reason.includes('authorized root overlaps')));
+  // 与 controller state 无关的读根照常放行。
+  const harmless = buildSettings({
+    contract: hookContract, hookScriptPath: '/state/dir/stop-hook.mjs', stateDir: '/state/dir',
+    targetRoots: ['/work/root'], additionalReadRoots: ['/reference/data'],
+  });
+  assert.deepEqual(assertLaunchable(hookContract, {
+    ...goodProbes, settings: harmless, additionalReadRoots: ['/reference/data'],
+  }), { ok: true, reasons: [] });
+});
+
+test('assertLaunchable independently rejects a direct-call permission DSL bypass', () => {
+  const hostileContract = {
+    ...hookContract,
+    execution_permissions: { bash_prefixes: ['safe) Bash(evil'] },
+  };
+  const hostileSettings = structuredClone(goodProbes.settings);
+  hostileSettings.permissions.allow = [
+    'Bash(npm:*)', 'Bash(test:*)', 'Bash(safe) Bash(evil:*)',
+  ];
+  const verdict = assertLaunchable(hostileContract, { ...goodProbes, settings: hostileSettings });
+  assert.equal(verdict.ok, false);
+  assert.ok(verdict.reasons.some((reason) => reason.includes('permission specifier')));
+
+  const hostilePath = assertLaunchable(hookContract, {
+    ...goodProbes,
+    stateDir: '/state/bad)',
+  });
+  assert.equal(hostilePath.ok, false);
+  assert.ok(hostilePath.reasons.some((reason) => reason.includes('permission specifier')));
 });
 
 // 版本闸是下限不是精确 allowlist：精确 allowlist 每次 claude 升版都会挡下合法 launch（2026-08-09
@@ -266,7 +531,11 @@ test('assertLaunchable also verifies the state-directory deny rule, not just the
     ...goodProbes,
     settings: {
       hooks: goodProbes.settings.hooks,
-      permissions: { deny: ['Edit(//state/dir/stop-hook.mjs)'] },   // 只摘掉 state 目录那条
+      permissions: {
+        ...goodProbes.settings.permissions,
+        deny: goodProbes.settings.permissions.deny
+          .filter((rule) => rule !== 'Edit(//state/dir/**)'),   // 只摘掉 state 目录那条
+      },
     },
   };
   const verdict = assertLaunchable(hookContract, hookOnlyDeny);

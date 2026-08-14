@@ -13,7 +13,7 @@ import {
   bindControllerTurnText, singleTurnCandidateText, SINGLE_TURN_CANDIDATE_PROTOCOL,
 } from '../scripts/lib/adapters/codex.mjs';
 import { runtimeTerminalState } from '../scripts/lib/workflow.mjs';
-import { LEASE_TTL_MS } from '../scripts/launch.mjs';
+import { LEASE_TTL_MS } from '../scripts/lib/runners/codex.mjs';
 
 const fixtures = JSON.parse(await readFile(new URL('./fixtures/codex-goal-envelopes.json', import.meta.url), 'utf8'));
 // 按 fixture 实际结构取真实 goal 对象（写测试时核对 JSON path）：

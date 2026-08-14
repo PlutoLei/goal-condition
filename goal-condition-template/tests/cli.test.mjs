@@ -44,6 +44,16 @@ test('parseArgs accepts each command with exactly its required flags', () => {
   assert.equal(parseArgs(['resume', '--contract', 'c.json', '--state', '/s', '--diagnostics-file', 'd.txt', '--binding-file', 'b.json']).command, 'resume');
   assert.equal(parseArgs(['finalize', '--state', '/s', '--binding-file', 'b.json']).command, 'finalize');
   assert.equal(parseArgs(['close', '--state', '/s']).command, 'close');
+  assert.equal(parseArgs([
+    'certify-claude-prepare', '--source', '/source', '--target', '/target', '--state-root', '/state',
+    '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
+    '--max-turns', '5', '--out', 'canary.json',
+  ]).command, 'certify-claude-prepare');
+  assert.equal(parseArgs([
+    'certify-claude-run', '--source', '/source', '--target', '/target', '--state-root', '/state',
+    '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
+    '--max-turns', '5', '--contract', 'canary.json', '--confirmed-hash', 'b'.repeat(64),
+  ]).command, 'certify-claude-run');
 });
 
 test('parseArgs rejects unknown commands, unknown/duplicate/valueless flags, and missing required flags', () => {
@@ -57,6 +67,10 @@ test('parseArgs rejects unknown commands, unknown/duplicate/valueless flags, and
     ['close', '--state', '/s', '--state', '/other'],                // 重复 flag
     ['close', '--state'],                                           // flag 无值
     ['close', '--state', '/s', '--binding-file'],                   // 末尾 flag 无值
+    ['certify-claude-run', '--source', '/source', '--target', '/target', '--state-root', '/state',
+      '--auth-mode', 'claude_ai', '--auth-context-id', 'primary', '--sentinel-sha256', 'a'.repeat(64),
+      '--max-turns', '5', '--contract', 'canary.json', '--confirmed-hash', 'b'.repeat(64),
+      '--capability-state', '/target/.claude/settings.json'],
   ]) {
     assert.throws(() => parseArgs(argv), /Usage:/, JSON.stringify(argv));
   }
@@ -107,6 +121,28 @@ async function runLaunchCliVia(scriptPath, args) {
     return { code: error.code, stdout: error.stdout ?? '', stderr: error.stderr ?? '' };
   }
 }
+
+test('Claude certification source must be the exact runtime root executing the command', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-foreign-runtime-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const foreignRepo = join(root, 'foreign');
+  const repositoryRoot = dirname(dirname(dirname(launchPath)));
+  await execFile('git', ['clone', '--quiet', '--no-hardlinks', repositoryRoot, foreignRepo]);
+  const executionRoot = await mkdtemp(join(stateTestRoot, 'foreign-source-'));
+  const result = await runLaunchCliVia(launchPath, [
+    'certify-claude-prepare',
+    '--source', join(foreignRepo, 'goal-condition-template'),
+    '--target', join(executionRoot, 'target'),
+    '--state-root', join(executionRoot, 'state'),
+    '--auth-mode', 'claude_ai',
+    '--auth-context-id', 'cert-primary',
+    '--sentinel-sha256', 'a'.repeat(64),
+    '--max-turns', '5',
+    '--out', join(executionRoot, 'canary.json'),
+  ]);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /RUNTIME_SOURCE_EXECUTION_MISMATCH/);
+});
 
 async function runLaunchCli(args) {
   return runLaunchCliVia(launchPath, args);
@@ -190,11 +226,9 @@ test('CLI refuses a free-text diagnostics file before anything is launched', asy
   assert.equal(existsSync(join(dir, 'attempts')), false);
 });
 
-// 第二次冒烟 N-1：`outcome=terminal_report` 此前与「起飞且拿到候选」同为 exit 0——「根本没起飞」
-// 对只读退出码的编排器完全不可见。改置 3，与进程级失败(1)、usage(2) 各占一格。
-// 用例安全性同上：binding 文件不存在 → readBindingFile 归一为 undefined → 三方交叉在读 probes.json
-// 之前就 fail-closed，两个 runtime 都是零 spawn、零 daemon、零凭证接触。
-test('CLI launch refused by a pre-flight gate exits 3 with the terminal report on stdout', async () => {
+// Codex 保留既有 terminal-report 语义；Claude 现在还有一个更外层的 machine capability gate。
+// 未提供 controller-owned Certified context 时，它必须在 binding/probes 之前以进程级失败拒绝，且零 mutation。
+test('CLI launch distinguishes an uncertified Claude process failure from a Codex terminal report', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gc-cli-terminal-'));
   const promptPath = join(dir, 'prompt.txt');
   await writeFile(promptPath, 'OBJECTIVE TEXT\n');
@@ -205,11 +239,17 @@ test('CLI launch refused by a pre-flight gate exits 3 with the terminal report o
       '--contract', await writeContract(dir, runtime), '--state', dir,
       '--prompt-file', promptPath, '--binding-file', missingBinding]);
 
-    assert.equal(code, 3, runtime);
-    assert.equal(stderr, '', runtime);
-    const report = JSON.parse(stdout);
-    assert.equal(report.outcome, 'terminal_report', runtime);
-    assert.ok(report.reasons.length > 0, runtime);   // 权威在报告体，退出码只是可读的粗信号
+    if (runtime === 'claude') {
+      assert.equal(code, 1, runtime);
+      assert.equal(stdout, '', runtime);
+      assert.match(stderr, /CLAUDE_CAPABILITY_UNCERTIFIED/, runtime);
+    } else {
+      assert.equal(code, 3, runtime);
+      assert.equal(stderr, '', runtime);
+      const report = JSON.parse(stdout);
+      assert.equal(report.outcome, 'terminal_report', runtime);
+      assert.ok(report.reasons.length > 0, runtime);   // 权威在报告体，退出码只是可读的粗信号
+    }
   }
 
   // 同一条路径的 N-2 面：被闸挡下的 launch 一格 attempt 都没占（attempts/ 压根没被建出来）。

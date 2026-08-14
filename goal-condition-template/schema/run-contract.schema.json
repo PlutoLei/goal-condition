@@ -29,14 +29,23 @@
     "success_criteria": {"$ref": "#/$defs/successCriteria", "minItems": 1},
     "constraints": {"type": "array", "items": {"$ref": "#/$defs/constraint"}},
     "allowed_mutations": {"$ref": "#/$defs/allowedMutations"},
+    "execution_permissions": {"$ref": "#/$defs/executionPermissions"},
     "budget": {"$ref": "#/$defs/budget"},
     "preflight": {"type": "array", "items": {"$ref": "#/$defs/preflightEntry"}, "minItems": 1},
     "postflight": {"type": "array", "items": {"$ref": "#/$defs/commandEntry"}, "minItems": 1}
   },
+  "allOf": [
+    {
+      "if": {"required": ["execution_permissions"]},
+      "then": {"properties": {"runtime": {"const": "claude"}}}
+    }
+  ],
   "$defs": {
     "nonEmptyString": {"type": "string", "minLength": 1},
     "pathList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
     "stringList": {"type": "array", "items": {"$ref": "#/$defs/nonEmptyString"}},
+    "permissionSafeString": {"type": "string", "minLength": 1, "pattern": "^[^()\\r\\n\\s][^()\\r\\n]*[^()\\r\\n\\s](?![\\s\\S])|^[^()\\r\\n\\s](?![\\s\\S])"},
+    "absoluteReadRoot": {"type": "string", "minLength": 1, "pattern": "^/"},
     "id": {"type": "string", "minLength": 1},
     "contextSource": {
       "type": "object",
@@ -106,6 +115,16 @@
         "files": {"$ref": "#/$defs/stringList"},
         "git": {"$ref": "#/$defs/stringList"},
         "external": {"$ref": "#/$defs/stringList"}
+      }
+    },
+    "executionPermissions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bash_prefixes": {"type": "array", "items": {"$ref": "#/$defs/permissionSafeString"}},
+        "webfetch_domains": {"type": "array", "items": {"$ref": "#/$defs/permissionSafeString"}},
+        "skills": {"type": "array", "items": {"$ref": "#/$defs/permissionSafeString"}},
+        "additional_read_roots": {"type": "array", "items": {"$ref": "#/$defs/absoluteReadRoot"}}
       }
     },
     "budget": {

@@ -6,9 +6,13 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { canonicalJson } from '../../scripts/lib/contract.mjs';
+import { inspectRuntimeSource, validateRuntimeSurfaces } from '../../scripts/lib/runtime-surfaces.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
-const MANIFEST_FIELDS = Object.freeze(['schema_version', 'commit', 'source_files', 'profile_sha256']);
+const MANIFEST_FIELDS_V1 = Object.freeze(['schema_version', 'commit', 'source_files', 'profile_sha256']);
+const MANIFEST_FIELDS_V2 = Object.freeze([
+  'schema_version', 'commit', 'source_files', 'profile_sha256', 'runtime_surfaces',
+]);
 const SOURCE_FIELDS = Object.freeze(['path', 'mode', 'sha256']);
 const CHECKOUT_ROOTS = Object.freeze([
   'SKILL.md',
@@ -69,8 +73,9 @@ function installedManifestDigest(root, manifestPath) {
   } catch {
     throw releaseError('RELEASE_MANIFEST_INVALID', 'release manifest is not valid JSON');
   }
-  if (!exactFields(manifest, MANIFEST_FIELDS)
-    || manifest.schema_version !== 1
+  const manifestFields = manifest?.schema_version === 2 ? MANIFEST_FIELDS_V2 : MANIFEST_FIELDS_V1;
+  if (!exactFields(manifest, manifestFields)
+    || ![1, 2].includes(manifest.schema_version)
     || !Array.isArray(manifest.source_files)
     || !HASH.test(manifest.profile_sha256 ?? '')) {
     throw releaseError('RELEASE_MANIFEST_INVALID', 'release manifest has an invalid closed-world shape');
@@ -90,6 +95,13 @@ function installedManifestDigest(root, manifestPath) {
   if (!seen.has('codex-controller/src/release.mjs')
     || sha256(readBoundFile(root, 'references/anchors-and-rules.md')) !== manifest.profile_sha256) {
     throw releaseError('RELEASE_SOURCE_DRIFT', 'release core or private profile is incomplete');
+  }
+  if (manifest.schema_version === 2) {
+    try {
+      validateRuntimeSurfaces(manifest);
+    } catch {
+      throw releaseError('RELEASE_MANIFEST_INVALID', 'release runtime surfaces are invalid');
+    }
   }
   if (resolve(manifestPath) !== resolve(root, 'manifest.json')) {
     throw releaseError('RELEASE_MANIFEST_INVALID', 'release manifest path is inconsistent');
@@ -133,4 +145,13 @@ export function currentControllerReleaseDigest() {
   return existsSync(manifestPath)
     ? installedManifestDigest(root, manifestPath)
     : checkoutDigest(root);
+}
+
+export function currentControllerReleaseIdentity({ expectedManifestDigest } = {}) {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  return inspectRuntimeSource({
+    root,
+    runtime: 'codex',
+    expectedManifestDigest,
+  });
 }

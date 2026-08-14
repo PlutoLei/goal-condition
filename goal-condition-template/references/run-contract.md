@@ -15,13 +15,20 @@ Run contract 是核心 compiler 与 runtime adapter 之间的平台无关 JSON �
 | `success_criteria` | 每项包含唯一 `id`、人类可读 `command` 与精确 `expected`，承接 success criterion 和验收物。 |
 | `constraints` | 每项包含 `id`、`rule`、`enforcement`；`physical` 还必须有非空 `mechanism` 与 `verify`。 |
 | `allowed_mutations` | 固定包含 `files`、`git`、`external` 三个数组。列入许可不等于动作已经发生或已经通过审计。 |
+| `execution_permissions` | 可选且仅用于 `runtime="claude"`。闭世界包含 `bash_prefixes`、`webfetch_domains`、`skills`、`additional_read_roots` 四个可选数组；它声明自动批准/可达面，不声明验收成功或通用物理隔离。 |
 | `budget` | 可选。存在时 `user_provided` 必须为 `true`，且至少有一个用户明确给出的正数限制；`max_turns` 另须为整数（见下）。 |
 | `preflight` | 启动前的 Git、path 或结构化 command entry，至少一项。 |
 | `postflight` | 主会话独立执行的结构化 command verifier，至少一项。 |
 
 所有 context、criterion、constraint、preflight 与 postflight 的 `id` 在整个 contract 内唯一。未知字段、重复 ID、非规范/相对路径，以及 `/tmp`、`/private/tmp`、`/var/folders`、`/private/var/folders` 或其词法别名均被拒绝。
 
-四个 budget 限制里只有 `max_turns` 额外要求整数，界线是「这个数会不会被我方取整」：`max_turns` 在两处被 floor——CLI 的 `--max-turns` 与 Stop hook 的 `maxBlocks`——写 `0.5` 会让两处**一起塌成 0**，即零轮直接停机且 hook 永不 block，是「什么都不做」而不是 fail-closed。`max_minutes` 与 `max_cost_usd` 的小数有真实语义（`0.5` 分钟 = 30 秒），`max_tokens` 原样透传给 runtime、不经我方取整，因此都不设这条闸。
+`execution_permissions` 的数组元素必须是非空字符串；`additional_read_roots` 另须为绝对、规范、非临时路径。Claude 权限规则是没有转义语法的 `Tool(specifier)` 字符串 DSL，因此 `bash_prefixes`、`webfetch_domains`、`skills` 中的括号、换行或首尾空白无法安全编译，validator 以 `PERMISSION_SPECIFIER_UNREPRESENTABLE` 拒绝。编译层用同一规则复核 controller state 与 hook path，launch gate 还会独立拒绝直接调用绕过；target roots 与 `additional_read_roots` 只作为 cwd / `additionalDirectories` 的 JSON 值，不进入这套 DSL，合法路径可包含括号。**postflight verifier 不进 Bash allow-list**：argv 是 execFile 语义、Bash specifier 是 shell 字符串语义，两者之间没有可靠编码（argv[0] 通配把整个可执行家族授权出去，整条拼接则既可能在 shell 语义下多授权一条命令、又可能产出永不匹配的死规则）；verifier 由 Stop hook 以 `execFileSync` 执行，不经 Claude 权限，执行体要自行运行 verifier 须由作者显式 `bash_prefixes` 声明。`bash_prefixes` 生成 `Bash(<prefix>:*)`，另生成 `WebFetch(domain:<domain>)` 与 `Skill(<skill>)`；除首个工作目录外的 target root 和 `additional_read_roots` 经 realpath 规范后进入 `permissions.additionalDirectories`。
+
+全部执行体可达根（target roots 与 `additional_read_roots`）都不得与 controller state 目录有任何包含关系；否则同 uid 执行器能读取 `requires_env` 凭证与控制器证据，Edit deny 拦不住。launch cwd 取 canonical 首 root，并在 spawn 前复核全部授权根的 device/inode；schema-v2 pointer 以十进制字符串记录 canonical roots 与 launch-time identities，resume 任一 path 或 identity 漂移都拒绝。state 级 `claude-attempt.lock` 从 attempt 专属 settings 落盘前开始，把 validation、pointer claim、attempt reservation、整轮 executor 与 result 落盘串成单写者区间；pre-dispatch 才允许在该 lease 内回滚占号，已 dispatch 的 attempt 永不回收。Controller JSON 先写入并 fsync 同目录私有 inode，再以 hard-link no-replace 原子发布；失败清理不 unlink 公开 pathname。legacy 六字段 pointer 不能由 prepare 原地升级：先用原 adapter readback/reconcile，再换 fresh controller state。
+
+launch/resume 固定传 `--setting-sources ""`，排除 ambient user/project/local settings，同时保留 Controller `--settings` 对应的 flag settings 和企业 policy settings；因此不再扫描或拒绝 target root 中预存的 `.claude/settings*.json`。`additional_read_roots` 中的 “read” 不是 OS 级只读承诺：在固定 `acceptEdits` 模式下 additional directory 也可能被编辑，实际 mutation 仍由 `allowed_mutations` 与 baseline compare 裁决。
+
+四个 budget 限制里只有 `max_turns` 额外要求整数，因为 CLI turn 数与 Stop hook block 计数都没有小数语义。Claude 未显式给 turn budget 时使用 `DEFAULT_MAX_TURNS=50`；用户显式给出的整数原样进入 `--max-turns`，可高于默认值，但超过 `MAX_TURNS_CEILING=200` 会在 launch 前置闸失败，不静默钳制。`max_minutes` 与 `max_cost_usd` 的小数有真实语义（`0.5` 分钟 = 30 秒），`max_tokens` 原样透传给 runtime，因此都不设整数闸。
 
 ## Boundary package 编译映射
 
@@ -35,6 +42,7 @@ Run contract 是核心 compiler 与 runtime adapter 之间的平台无关 JSON �
 | mechanization | 可执行且可 fault-inject 的约束用 `physical`；其余用 `audit_only` |
 | mutation scope | 分别落入 `allowed_mutations.files/git/external` |
 | verifier | 启动条件放 `preflight`；独立成功核验放 `postflight` |
+| execution authorization | Claude 自动批准的 Bash prefix、WebFetch domain、Skill 与额外目录写入可选 `execution_permissions`；Codex 出现该字段即红 |
 | resource limit | 仅用户明确给出时写 `budget` 并保留 provenance |
 
 `success_criteria.command` 是供人审阅的精确命令说明，不是 shell 执行入口。机器执行只允许 `{id, type:"command", cwd, argv, requires_env?, capture?}`；不得增加 `shell` 字段，不得用 `eval`、`sh -c` 或拼接后的 shell 字符串。`requires_env` 只记录变量名和是否存在，snapshot 不保存变量值。默认 `capture:"hash"`；只有确认输出不含敏感内容时才可显式使用 `capture:"text"`。
@@ -61,7 +69,7 @@ Contract 文件的字节级错误采用隐私安全诊断。`CONTRACT_BOM_FORBID
 
 Canonical JSON 递归排序 object key、保持 array 顺序，并追加恰好一个换行。Compiler 必须把 `canonicalJson(parsed)` 原样写成 launchable 文件；`readContract` 要求原始文件与该结果 byte-identical。空白、key 顺序、缩进或额外换行不同都会产生 `CONTRACT_BYTES_NONCANONICAL`，即使重新解析后的对象和 canonical hash 相同也禁止继续，直到重新生成 artifact、重新 preview 并重新确认。
 
-Contract hash 是 authoritative canonical JSON 的 UTF-8 bytes 的小写 SHA-256。完整 preview 在可读矩阵之外逐字包含这份 authoritative canonical JSON，因此 version、runtime、context_sources、target_roots、budget 以及每个 nested preflight/postflight flag、cwd、argv、requires_env、capture 都可见且被同一 hash 绑定。任何落盘字节编辑都会使当前 artifact 的确认失效；不得只比较解析后的对象来复用确认。
+Contract hash 是 authoritative canonical JSON 的 UTF-8 bytes 的小写 SHA-256。完整 preview 在可读矩阵之外逐字包含这份 authoritative canonical JSON，因此 version、runtime、context_sources、target_roots、execution_permissions、budget 以及每个 nested preflight/postflight flag、cwd、argv、requires_env、capture 都可见且被同一 hash 绑定。任何落盘字节编辑都会使当前 artifact 的确认失效；不得只比较解析后的对象来复用确认。
 
 ## Preflight 与可信 baseline_digest
 
@@ -99,12 +107,23 @@ Codex 的 untrusted runtimeResult 只能是 exact candidate `{status:"ready_for_
 
 ## Release trust root
 
-安装器只从 pinned Git commit 读取公开核心的精确 closed-world 文件集，并在缺少任何成员时于 release、backup 或 runtime link 变更之前失败。安装成功会返回/打印 `manifestDigest`；编排器必须把它保存到 release 之外。以后验证必须提供该 external trust root：
+安装器只从 pinned Git commit 读取公开核心的精确 closed-world 文件集，并在缺少任何成员时于 release、backup 或 runtime link 变更之前失败。新安装器生成 manifest schema v2：整包 `manifestDigest` 仍是 release integrity 的外部 trust root；`runtime_surfaces.claude` 与 `runtime_surfaces.codex` 只从 manifest 已覆盖的 `{path,mode,sha256}` 条目计算。每个 required core file 必须恰好属于 `release_only`、`runtime_shared`、`claude` 或 `codex`；未分类、重复、未知或空 surface 都 fail closed。
+
+物化与切换分成两个显式阶段：
+
+```text
+node scripts/install.mjs stage --repo <repo> --ref <commit> --profile <file> --release-root <root>
+node scripts/install.mjs activate --release <staged-release> --expected-manifest-digest <trusted-digest> --link <name=path>
+```
+
+`stage` 只创建、验证 immutable release，不切任何 runtime link；生产 native certification 必须对该 exact physical release 执行。`activate` 重新验证同一 root 与外部 digest，再沿用原子 link switch、readback 和 rollback。兼容的 `install` 命令只是两阶段的顺序组合。stage、认证、activate、install success 与 production effect 必须分别报告。
+
+编排器必须把 stage 输出的 `manifestDigest` 保存到 release 之外。以后验证必须提供该 external trust root：
 
 ```text
 node scripts/install.mjs verify --release <release-directory> --expected-manifest-digest <trusted-manifest-digest>
 ```
 
-Verifier 先比较原始 `manifest.json` bytes 的小写 SHA-256，再解析 manifest 并核对核心文件 bytes、exact Git-derived mode、profile hash/fixed `0600` mode、manifest `0644` mode、release root/release directory/required directories 的 exact `0755` mode、目录闭包和 unexpected entries。所有 mode 都用 `lstat.mode & 0o7777` 的四位八进制值比较，因此 setuid、setgid 或 sticky bit 不会被掩掉。Release 内部被一起重算的 manifest 不具备外部信任；缺少 digest 或 digest 不匹配都 fail closed。安装事务对 link parent、release root 与 backup root 的物理 directory identity 做阶段性复核，覆盖 lock、stage、backup、cutover、readback、rollback 与 owned cleanup；祖先被重定向时停止，而不是沿新的 symlink 拓扑写入。
+Verifier 先比较原始 `manifest.json` bytes 的小写 SHA-256，再解析 manifest 并核对核心文件 bytes、exact Git-derived mode、profile hash/fixed `0600` mode、manifest `0644` mode、release root/release directory/required directories 的 exact `0755` mode、目录闭包和 unexpected entries。v2 verifier 还从 `source_files` 重新计算 runtime surface digest，绝不单独相信声明值。所有 mode 都用 `lstat.mode & 0o7777` 的四位八进制值比较，因此 setuid、setgid 或 sticky bit 不会被掩掉。Release 内部被一起重算的 manifest 不具备外部信任；缺少 digest 或 digest 不匹配都 fail closed。activation 对 link parent、release root 与 backup root 的物理 directory identity 做阶段性复核，覆盖 lock、backup、cutover、readback、rollback 与 owned cleanup；祖先被重定向时停止，而不是沿新的 symlink 拓扑写入。activation 失败保留已验证 staged release，不把它误当成 link-switch 残渣删除。
 
 任何 physical mechanism 无法验证、外部动作没有观察面、runtime 结果格式不完整、success artifact 缺失、命令退出非零或 mutation 越界时，都报告对应 diagnostic 并停止。只有独立 postflight 全绿且无剩余工作时，主会话才能进入 Close。

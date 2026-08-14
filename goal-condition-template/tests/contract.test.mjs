@@ -47,6 +47,56 @@ test('budget is accepted only when its provenance is explicit', () => {
   }), []);
 });
 
+test('execution_permissions is a closed-world Claude-only authorization surface', () => {
+  const execution_permissions = {
+    bash_prefixes: ['npm test', 'git add'],
+    webfetch_domains: ['cloud.langfuse.com'],
+    skills: ['langfuse'],
+    additional_read_roots: ['/opt/goal-condition-example/reference'],
+  };
+  assert.deepEqual(validateContract({ ...valid, runtime: 'claude', execution_permissions }), []);
+
+  const unknown = structuredClone(execution_permissions);
+  unknown.surprise = ['Bash'];
+  assert.ok(validateContract({ ...valid, runtime: 'claude', execution_permissions: unknown })
+    .some((x) => x.code === 'UNKNOWN_FIELD' && x.path.startsWith('execution_permissions.')));
+
+  for (const [field, value] of [
+    ['bash_prefixes', ['']],
+    ['bash_prefixes', ['npm test) Bash(rm -rf /)']],
+    ['webfetch_domains', [42]],
+    ['webfetch_domains', ['safe.example\nWebFetch(domain:evil.example)']],
+    ['skills', 'langfuse'],
+    ['additional_read_roots', ['relative/path']],
+  ]) {
+    const changed = structuredClone(execution_permissions);
+    changed[field] = value;
+    assert.ok(validateContract({ ...valid, runtime: 'claude', execution_permissions: changed })
+      .some((x) => x.path.startsWith(`execution_permissions.${field}`)), field);
+  }
+
+  const codex = validateContract({ ...valid, runtime: 'codex', execution_permissions });
+  assert.ok(codex.some((x) => x.code === 'CLAUDE_EXECUTION_PERMISSIONS_ONLY'));
+
+  // target_roots 只进入 cwd/additionalDirectories，不再插值到 Edit(...) DSL；路径里的括号合法。
+  const parenTarget = structuredClone(valid);
+  parenTarget.runtime = 'claude';
+  parenTarget.target_roots[0] = '/Applications/App (1).app/work';
+  assert.deepEqual(validateContract(parenTarget), []);
+
+  // postflight 不进权限 DSL（V5'）：verifier 可执行路径含括号/空格是合法 contract——hook 用
+  // execFileSync 跑它，不经 claude 权限。validator 若还投影 argv[0] 就是 false-red。
+  const parenVerifier = structuredClone(valid);
+  parenVerifier.runtime = 'claude';
+  parenVerifier.postflight[0].argv = ['/Applications/App (1).app/bin/check', 'a b.txt'];
+  assert.deepEqual(validateContract(parenVerifier), []);
+
+  assert.ok(Object.hasOwn(schema.properties, 'execution_permissions'));
+  assert.equal(schema.$defs.executionPermissions.additionalProperties, false);
+  assert.ok(schema.allOf.some((entry) => entry.if?.required?.includes('execution_permissions')
+    && entry.then?.properties?.runtime?.const === 'claude'));
+});
+
 // ③（re-review round 1）：max_turns 是轮数，小数没有可执行语义。实测 max_turns=0.5 会让 CLI 的
 // --max-turns 被 Math.floor 成 0 **且** Stop hook 的 maxBlocks 同时成 0——零轮直接停机、hook 永不
 // block，两处一起退化成「什么都不做」而不是 fail-closed。在 validate 层拒是唯一不撒谎的处置：
@@ -73,6 +123,39 @@ test('a fractional max_turns is rejected at validation time, and only max_turns'
   // 公开 schema 与本仓 validator 必须对同一条规则口径一致——schema 是 compiler 读的声明，
   // 两边漂了就会出现「照 schema 写的 contract 在 validate 层莫名被拒」。
   assert.equal(schema.$defs.budget.properties.max_turns.type, 'integer');
+});
+
+test('schema constrains execution_permissions specifiers like the validator, not just non-empty strings (V8)', () => {
+  // 公开 schema 曾把三个字符串列声明成裸 nonEmptyString，比 validator 弱：validator 拒括号/换行
+  // （permission-DSL 注入面）与相对 additional_read_roots。installed schema 因此给出 validator 随后
+  // 会拒的假 valid（V8，DeepSeek 独有，与 budget 同款「schema 与 validator 口径一致」判据）。
+  const ep = schema.$defs.executionPermissions.properties;
+  for (const field of ['bash_prefixes', 'webfetch_domains', 'skills']) {
+    const def = schema.$defs[ep[field].items.$ref.split('/').pop()];
+    assert.match(def.pattern ?? '', /\(\)/, `${field} items must forbid permission-DSL delimiters`);
+  }
+  const readRootDef = schema.$defs[ep.additional_read_roots.items.$ref.split('/').pop()];
+  assert.ok((readRootDef.pattern ?? '').startsWith('^/'), 'additional_read_roots must require absolute paths');
+  // 非临时性与路径规范化 JSON Schema 表达不了，仍由 validator 独有承担——schema 只缩小最危险的
+  // gap（括号注入、相对路径），不假装完全覆盖。
+});
+
+test('permissionSafeString anchors at absolute end, not $ (V8\')', () => {
+  // 实证（2026-08-13）：ECMA-262 无 m flag 的 $ 只匹配绝对结尾，'git add\n' 在 JS/ajv 下本来就拒；
+  // 但 schema 是公开发布物，Python/PCRE 系消费者的 $ 默认还匹配「尾部行终止符之前」——同一份
+  // pattern 在那边把 'git add\n' 判 valid，而 validator（value !== value.trim()）随后拒。漂移落在
+  // DSL 注入的分隔字符上。(?![\s\S]) 在两种方言里都是绝对结尾，消除歧义。
+  const pattern = schema.$defs.permissionSafeString.pattern;
+  assert.ok(!pattern.includes('$'), 'must not rely on $ anchors: PCRE/Python consumers accept a trailing line terminator');
+  assert.ok(pattern.includes('(?![\\s\\S])'), 'must assert absolute end-of-input explicitly');
+  // 行为在 JS 语义下回归确认：正常值过、尾行终止符拒（validator 口径）。
+  const re = new RegExp(pattern, 'u');
+  for (const value of ['git add', 'a', 'npm run build']) {
+    assert.ok(re.test(value), `${JSON.stringify(value)} must stay valid`);
+  }
+  for (const value of ['git add\n', 'a\n', 'ab\r', ' git add', 'git add ']) {
+    assert.ok(!re.test(value), `${JSON.stringify(value)} must be rejected`);
+  }
 });
 
 test('content-bound context entries reject temporary paths and duplicate IDs', () => {
@@ -145,7 +228,7 @@ test('canonical preview preserves punctuation without shell interpolation', () =
 function completePreviewContract() {
   return {
     version: 1,
-    runtime: 'codex',
+    runtime: 'claude',
     objective: 'preview-objective-a',
     context_sources: [{
       id: 'CTX-preview-a',
@@ -163,6 +246,12 @@ function completePreviewContract() {
       files: ['/opt/preview/worktree-a/file-a'],
       git: ['commit'],
       external: ['external-a'],
+    },
+    execution_permissions: {
+      bash_prefixes: ['npm test'],
+      webfetch_domains: ['example.com'],
+      skills: ['review'],
+      additional_read_roots: ['/opt/preview/reference-a'],
     },
     budget: {
       user_provided: true,
@@ -198,12 +287,16 @@ test('every material contract field remains visible and hash-bound in preview', 
   const original = completePreviewContract();
   const cases = [
     ['version', (x) => { x.version = 2; }, '"version":2'],
-    ['runtime', (x) => { x.runtime = 'claude'; }, '"runtime":"claude"'],
+    ['runtime', (x) => { x.runtime = 'codex'; }, '"runtime":"codex"'],
     ['objective', (x) => { x.objective = 'preview-objective-b'; }, '"objective":"preview-objective-b"'],
     ['context id', (x) => { x.context_sources[0].id = 'CTX-preview-b'; }, '"id":"CTX-preview-b"'],
     ['context path', (x) => { x.context_sources[0].path = '/opt/preview/worktree-a/context-b.md'; }, '"path":"/opt/preview/worktree-a/context-b.md"'],
     ['context hash', (x) => { x.context_sources[0].sha256 = 'b'.repeat(64); }, `"sha256":"${'b'.repeat(64)}"`],
     ['target_roots', (x) => { x.target_roots[0] = '/opt/preview/worktree-b'; }, '"target_roots":["/opt/preview/worktree-b"]'],
+    ['execution bash', (x) => { x.execution_permissions.bash_prefixes[0] = 'npm run test'; }, '"bash_prefixes":["npm run test"]'],
+    ['execution web', (x) => { x.execution_permissions.webfetch_domains[0] = 'api.example.com'; }, '"webfetch_domains":["api.example.com"]'],
+    ['execution skill', (x) => { x.execution_permissions.skills[0] = 'security-review'; }, '"skills":["security-review"]'],
+    ['execution read root', (x) => { x.execution_permissions.additional_read_roots[0] = '/opt/preview/reference-b'; }, '"additional_read_roots":["/opt/preview/reference-b"]'],
     ['judgment id', (x) => { x.judgment_criteria[0].id = 'J-preview-b'; }, '"id":"J-preview-b"'],
     ['judgment rule', (x) => { x.judgment_criteria[0].rule = 'judgment-rule-b'; }, '"rule":"judgment-rule-b"'],
     ['judgment why', (x) => { x.judgment_criteria[0].why = 'judgment-why-b'; }, '"why":"judgment-why-b"'],

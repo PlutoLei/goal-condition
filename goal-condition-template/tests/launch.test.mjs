@@ -14,13 +14,66 @@ import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import {
   MAX_AUTO_RESUMES, stateDirFor, initStateDir, nextAttempt, AttemptClaimError, classifyPostflightRed,
-  compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, hookRunCount, prepareClaude, runClaudeAttempt,
+  compileResumeDiagnostic, DIAGNOSTICS_MAX_REDS, readControllerJsonNoFollow,
+  writeControllerJsonExclusive,
+} from '../scripts/lib/runner-common.mjs';
+import {
+  hookRunCount, prepareClaude,
+  runClaudeAttempt as runClaudeAttemptImpl,
+  runClaudeCertificationAttempt,
+  runClaudeReadback, claudeTranscriptPath, helpAdvertisesLongOption,
+} from '../scripts/lib/runners/claude.mjs';
+import {
   prepareCodexProbesOnly, runCodexLaunch, runCodexReadback, runCodexResume, runCodexFinalize, runCodexClose,
   POLL_INTERVAL_MS, WALL_CLOCK_DEADLINE_MS, LEASE_TTL_MS, releaseOwnLease, releaseResidualLease,
   MAX_TURNS_PER_ATTEMPT, MAX_TOKENS_PER_ATTEMPT,
-} from '../scripts/launch.mjs';
+} from '../scripts/lib/runners/codex.mjs';
+import { renderCliError } from '../scripts/launch.mjs';
+import { CLAUDE_CANARY_CONDITIONS } from '../scripts/lib/claude-capability.mjs';
 import { GoalRpcClient } from '../scripts/lib/adapters/codex.mjs';
-import { canonicalJson, contractHash } from '../scripts/lib/contract.mjs';
+import { canonicalJson, contractHash, ContractArtifactError } from '../scripts/lib/contract.mjs';
+import { compileClaudeCertificationContract } from '../scripts/lib/claude-certification.mjs';
+
+const TEST_CAPABILITY_SOURCE = Object.freeze({
+  kind: 'git_checkout', root_realpath: '/test/controller/source', commit: 'a'.repeat(40),
+});
+const TEST_CAPABILITY_ENVIRONMENT = Object.freeze({
+  cli_version: '2.1.228', os: 'darwin', arch: 'arm64',
+  auth_mode: 'claude_ai', auth_context_id: 'launch-test',
+});
+const TEST_RUNTIME_SURFACE_DIGEST = '1'.repeat(64);
+const TEST_CAPABILITY_RECEIPT = Object.freeze({
+  schema_version: 1,
+  source: TEST_CAPABILITY_SOURCE,
+  runtime_surface_digest: TEST_RUNTIME_SURFACE_DIGEST,
+  environment: TEST_CAPABILITY_ENVIRONMENT,
+  canary_contract_hash: '2'.repeat(64),
+  baseline_digest: '3'.repeat(64),
+  run_identity: { run_id: 'launch-test', session_id: '11111111-1111-4111-8111-111111111111' },
+  conditions: Object.fromEntries(CLAUDE_CANARY_CONDITIONS.map((id) => [id, true])),
+  evidence_aggregate_hash: '4'.repeat(64),
+  candidate_result_hash: '5'.repeat(64),
+  postflight_report_hash: '6'.repeat(64),
+  certified_at: '2026-08-13T08:00:00.000Z',
+});
+const TEST_CAPABILITY_CONTEXT = Object.freeze({
+  state: {
+    schema_version: 1,
+    mode: 'certified',
+    changed_at: '2026-08-13T08:00:00.000Z',
+    active_source: TEST_CAPABILITY_SOURCE,
+    runtime_surface_digest: TEST_RUNTIME_SURFACE_DIGEST,
+    environment: TEST_CAPABILITY_ENVIRONMENT,
+    canary_receipt: TEST_CAPABILITY_RECEIPT,
+  },
+  source: TEST_CAPABILITY_SOURCE,
+  runtimeSurfaceDigest: TEST_RUNTIME_SURFACE_DIGEST,
+  environment: TEST_CAPABILITY_ENVIRONMENT,
+});
+
+function runClaudeAttempt(options) {
+  return runClaudeAttemptImpl({ capabilityContext: TEST_CAPABILITY_CONTEXT, ...options });
+}
 
 test('nextAttempt is O_EXCL monotonic and refuses beyond 1+MAX_AUTO_RESUMES', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'gc-launch-test-'));
@@ -229,6 +282,8 @@ const stubCollect = async ({ hookScriptPath }) => {
   return {
     claudeVersionRaw: '2.1.223 (Claude Code)\n',
     claudeVersion: '2.1.223',
+    claudeSessionIdFlag: true,
+    claudeSettingSourcesFlag: true,
     hookMode: (st.mode & 0o7777).toString(8).padStart(4, '0'),
     hookSha256: createHash('sha256').update(bytes).digest('hex'),
   };
@@ -270,6 +325,47 @@ test('prepareClaude writes hook (0500), settings (deny normalized path), hook-en
   assert.equal(probes.contractPath, '/does/not/matter/contract.json');
 
   assert.deepEqual(result.probes, probes);
+});
+
+test('prepareClaude compiles execution permissions with realpath-normalized roots', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-launch-permissions-'));
+  const targetReal = join(root, 'target-real');
+  const targetLink = join(root, 'target-link');
+  const referenceReal = join(root, 'reference-real');
+  const referenceLink = join(root, 'reference-link');
+  await mkdir(targetReal);
+  await mkdir(referenceReal);
+  await symlink(targetReal, targetLink);
+  await symlink(referenceReal, referenceLink);
+  const canonicalTargetReal = realpathSync(targetReal);
+  const canonicalReferenceReal = realpathSync(referenceReal);
+  const stateDir = stateDirFor({ stateRoot: root, contractHash: 'e'.repeat(64) });
+  const previousToken = process.env.GC_LAUNCH_TEST_TOKEN;
+  process.env.GC_LAUNCH_TEST_TOKEN = 'secret-value';
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.GC_LAUNCH_TEST_TOKEN;
+    else process.env.GC_LAUNCH_TEST_TOKEN = previousToken;
+  });
+  const contract = makeContract({
+    target_roots: [workDir, targetLink],
+    execution_permissions: {
+      bash_prefixes: ['git add'],
+      webfetch_domains: ['example.com'],
+      skills: ['review'],
+      additional_read_roots: [referenceLink],
+    },
+  });
+
+  const result = await prepareClaude({ contract, stateDir, collect: stubCollect });
+  const settings = JSON.parse(await readFile(result.settingsPath, 'utf8'));
+  assert.deepEqual(settings.permissions.allow, [
+    // makeContract 的 postflight `node -e 'process.exit(0)'` 含括号，无法安全表示为 permission
+    // specifier，V5 起精确命令推导会跳过它（不再 argv[0] 通配成 Bash(node:*)）；执行体授权由显式
+    // execution_permissions 承担。postflight→精确 Bash 的正例见 adapters-claude 的 V5 用例。
+    'Bash(git add:*)', 'WebFetch(domain:example.com)', 'Skill(review)',
+  ]);
+  assert.deepEqual(settings.permissions.additionalDirectories, [canonicalTargetReal, canonicalReferenceReal]);
+  assert.deepEqual(settings.permissions.deny.filter((rule) => rule.includes('/.claude/settings')), []);
 });
 
 test('prepareClaude is reentrant on the same stateDir: a missing-env reject followed by a completed retry succeeds', async (t) => {
@@ -344,6 +440,37 @@ function stubRejecting({ stdout, message = 'claude exited 1' } = {}) {
   return { impl, calls };
 }
 
+// launch 预派 --session-id、resume 走 --resume 指针，且身份交叉核验要求 envelope 回显与控制器
+// 持有值一致——真实 CLI 的行为就是回显（spike S-A 成功路径、S-A run3 resume 路径实测），echo
+// stub 与之同形。fallback 只在 argv 里两个 flag 都不在时生效（那种用例不会走到身份核验）。
+function sessionFromArgs(args, fallback) {
+  const sid = args.indexOf('--session-id');
+  if (sid >= 0) return args[sid + 1];
+  const resume = args.indexOf('--resume');
+  if (resume >= 0) return args[resume + 1];
+  return fallback;
+}
+
+function stubEchoing(fixture) {
+  const calls = [];
+  const impl = async (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    return { stdout: JSON.stringify({ ...fixture, session_id: sessionFromArgs(args, fixture.session_id) }) };
+  };
+  return { impl, calls };
+}
+
+function stubRejectingEchoing(fixture, message = 'claude exited 1') {
+  const calls = [];
+  const impl = async (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    const error = new Error(message);
+    error.stdout = JSON.stringify({ ...fixture, session_id: sessionFromArgs(args, fixture.session_id) });
+    throw error;
+  };
+  return { impl, calls };
+}
+
 async function setupClaudeState(t, { contract = makeContract(), collect = stubCollect } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'gc-launch-attempt-'));
   const hash = contractHash(contract);
@@ -364,9 +491,36 @@ async function setupClaudeState(t, { contract = makeContract(), collect = stubCo
   };
 }
 
+test('Claude Candidate gate runs before settings, attempt, claim, lease, or executor mutation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-claude-candidate-gate-'));
+  const stateDir = join(root, 'state');
+  await mkdir(stateDir, { mode: 0o700 });
+  const settingsPath = join(stateDir, 'settings.json');
+  await writeFile(settingsPath, 'pre-existing-settings', { mode: 0o600 });
+  let executorCalls = 0;
+
+  await assert.rejects(() => runClaudeAttemptImpl({
+    contract: makeContract(),
+    stateDir,
+    binding: { contractHash: 'not-reached' },
+    prompt: 'OBJECTIVE TEXT',
+    kind: 'launch',
+    execFileImpl: async () => { executorCalls += 1; },
+  }), (error) => {
+    assert.equal(error.code, 'CLAUDE_CAPABILITY_UNCERTIFIED');
+    return true;
+  });
+
+  assert.equal(executorCalls, 0);
+  assert.equal(await readFile(settingsPath, 'utf8'), 'pre-existing-settings');
+  for (const name of ['attempts', 'thread.json', 'claude-attempt.lock']) {
+    assert.equal(existsSync(join(stateDir, name)), false, name);
+  }
+});
+
 test('runClaudeAttempt(kind=launch) on a green probe set produces a candidate and calls execFileImpl once', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -376,55 +530,65 @@ test('runClaudeAttempt(kind=launch) on a green probe set produces a candidate an
   assert.deepEqual(result.candidate, {
     subtype: 'success', is_error: false, terminal_reason: 'completed', permission_denials: [],
   });
-  assert.equal(result.sessionId, claudeResultFixture.session_id);
+  assert.equal(result.budgetExhausted, false);
 
   assert.equal(stub.calls.length, 1);
   assert.equal(stub.calls[0].cmd, 'claude');
   assert.ok(stub.calls[0].args.includes('-p'));
   assert.ok(stub.calls[0].args.includes('OBJECTIVE TEXT'));
   assert.ok(stub.calls[0].args.includes('--settings'));
-  assert.equal(stub.calls[0].options.cwd, workDir);
+  assert.equal(stub.calls[0].options.cwd, realpathSync(workDir));
   assert.equal(stub.calls[0].options.maxBuffer, 32 * 1024 * 1024);
+
+  // 会话身份由控制器预派：argv 里的 --session-id 是 UUID，返回体与指针都必须是同一个值。
+  const sidIndex = stub.calls[0].args.indexOf('--session-id');
+  assert.ok(sidIndex >= 0);
+  const issued = stub.calls[0].args[sidIndex + 1];
+  assert.match(issued, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(result.sessionId, issued);
 
   const candidateOnDisk = JSON.parse(await readFile(join(stateDir, 'candidate.json'), 'utf8'));
   assert.deepEqual(candidateOnDisk, result.candidate);
   const threadOnDisk = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
-  assert.equal(threadOnDisk.sessionId, claudeResultFixture.session_id);
+  assert.equal(threadOnDisk.sessionId, issued);
+  assert.equal(threadOnDisk.cwd, realpathSync(workDir));
+  assert.equal(threadOnDisk.promptSha256, createHash('sha256').update('OBJECTIVE TEXT', 'utf8').digest('hex'));
+  assert.ok(threadOnDisk.transcriptPath.endsWith(`/${issued}.jsonl`));
   const rawOnDisk = JSON.parse(await readFile(join(stateDir, 'attempts', '1-result.json'), 'utf8'));
-  assert.deepEqual(rawOnDisk, claudeResultFixture);
+  assert.deepEqual(rawOnDisk, { ...claudeResultFixture, session_id: issued });
 });
 
 test('runClaudeAttempt: resume reads sessionId from thread.json, builds --resume/--settings argv, and advances the attempt number', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const launchStub = stubResolving(JSON.stringify(claudeResultFixture));
-  await runClaudeAttempt({
+  const launchStub = stubEchoing(claudeResultFixture);
+  const launched = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: launchStub.impl,
   });
 
-  const resumedResult = { ...claudeResultFixture, session_id: 'sid-resumed' };
-  const resumeStub = stubResolving(JSON.stringify(resumedResult));
+  const resumeStub = stubEchoing(claudeResultFixture);
   const result = await runClaudeAttempt({
     contract, stateDir, binding, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: resumeStub.impl,
   });
 
   assert.equal(result.outcome, 'candidate');
-  assert.equal(result.sessionId, 'sid-resumed');
+  assert.equal(result.sessionId, launched.sessionId);
   assert.equal(resumeStub.calls.length, 1);
   const resumeArgs = resumeStub.calls[0].args;
   assert.ok(resumeArgs.includes('--resume'));
-  assert.equal(resumeArgs[resumeArgs.indexOf('--resume') + 1], claudeResultFixture.session_id);
+  assert.equal(resumeArgs[resumeArgs.indexOf('--resume') + 1], launched.sessionId);
   assert.ok(resumeArgs.includes('--settings'));
   assert.ok(resumeArgs.includes('fix pf-test'));
 
+  // 指针是控制器写的，resume 的回显不反向覆写它——launch 前落盘的形态原样保留。
   const threadOnDisk = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
-  assert.equal(threadOnDisk.sessionId, 'sid-resumed');
+  assert.equal(threadOnDisk.sessionId, launched.sessionId);
   await assert.doesNotReject(() => stat(join(stateDir, 'attempts', '2-result.json')));
 });
 
 test('runClaudeAttempt: assertLaunchable red never calls execFileImpl and burns no attempt slot', async (t) => {
   const belowFloorCollect = async (args) => ({ ...(await stubCollect(args)), claudeVersion: '2.0.0' });
   const { stateDir, contract, binding } = await setupClaudeState(t, { collect: belowFloorCollect });
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -446,7 +610,7 @@ for (const [label, mutate] of [
   test(`runClaudeAttempt: structurally valid but unfinished result (${label}) is a faithful candidate, not a terminal report`, async (t) => {
     const { stateDir, contract, binding } = await setupClaudeState(t);
     const variant = mutate(claudeResultFixture);
-    const stub = stubResolving(JSON.stringify(variant));
+    const stub = stubEchoing(variant);
 
     const result = await runClaudeAttempt({
       contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -474,16 +638,55 @@ test('runClaudeAttempt: non-JSON stdout on a normal exit is a terminal report (e
 
 test('runClaudeAttempt: execFile throw recovers the result JSON from error.stdout', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubRejecting({
-    stdout: JSON.stringify(claudeResultFixture), message: 'Command failed with exit code 1',
-  });
+  const stub = stubRejectingEchoing(claudeResultFixture, 'Command failed with exit code 1');
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
   });
 
   assert.equal(result.outcome, 'candidate');
-  assert.equal(result.sessionId, claudeResultFixture.session_id);
+  const args = stub.calls[0].args;
+  assert.equal(result.sessionId, args[args.indexOf('--session-id') + 1]);
+});
+
+test('runClaudeCertificationAttempt turns a normalized 429 envelope into blocked without persisting a candidate', async (t) => {
+  const root = await mkdtemp(join(process.cwd(), '.gc-state-test-provider-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const targetRoot = join(root, 'target');
+  const stateRoot = join(root, 'state');
+  await mkdir(targetRoot);
+  await mkdir(stateRoot);
+  const compiled = compileClaudeCertificationContract({
+    source: TEST_CAPABILITY_SOURCE,
+    runtimeSurfaceDigest: TEST_RUNTIME_SURFACE_DIGEST,
+    targetRoot: realpathSync(targetRoot),
+    stateRoot: realpathSync(stateRoot),
+    authMode: 'claude_ai',
+    authContextId: 'launch-test',
+    sentinelSha256: '7'.repeat(64),
+    maxTurns: 5,
+  });
+  const hash = contractHash(compiled.contract);
+  const stateDir = stateDirFor({ stateRoot, controller: 'claude-certification', contractHash: hash });
+  await prepareClaude({ contract: compiled.contract, stateDir, collect: stubCollect });
+  const binding = { contractHash: hash, baselineDigest: 'b'.repeat(64), runId: 'cert-provider' };
+  const providerResult = { ...claudeResultFixture, api_error_status: 429, is_error: true };
+
+  const result = await runClaudeCertificationAttempt({
+    compiled,
+    contract: compiled.contract,
+    stateDir,
+    binding,
+    prompt: compiled.contract.objective,
+    kind: 'launch',
+    execFileImpl: stubRejectingEchoing(providerResult, 'Claude exited after provider error').impl,
+  });
+
+  assert.equal(result.outcome, 'blocked');
+  assert.equal(result.provider_error, true);
+  assert.equal(result.api_error_status, 429);
+  assert.equal('candidate' in result, false);
+  await assert.rejects(() => readFile(join(stateDir, 'candidate.json')));
 });
 
 test('runClaudeAttempt: execFile throw without a parseable stdout is a process-failure terminal report', async (t) => {
@@ -498,9 +701,771 @@ test('runClaudeAttempt: execFile throw without a parseable stdout is a process-f
   assert.ok(result.reasons.some((reason) => reason.includes('spawn claude ENOENT')));
 });
 
+// ---------------------------------------------------------------------------
+// claim-before-dispatch（D4）：指针先于 spawn 存在，是 resume 死锁的根治。2026-08-10 与
+// 08-12 两次真实 run 里，max-turns 硬停的 error envelope 过不了单锚，thread.json 永不落盘，
+// 「预算耗尽走 resume 续跑」在最需要它的形态下结构性不通。
+// ---------------------------------------------------------------------------
+
+test('runClaudeAttempt writes the session pointer before spawning the executor', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  let pointerAtSpawn = null;
+  const calls = [];
+  const impl = async (cmd, args, options) => {
+    calls.push({ cmd, args, options });
+    // spawn 时刻指针必须已在盘上，且与 argv 里预派的 --session-id 同值。
+    pointerAtSpawn = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
+    return { stdout: JSON.stringify({ ...claudeResultFixture, session_id: sessionFromArgs(args) }) };
+  };
+
+  const result = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: impl,
+  });
+
+  assert.equal(result.outcome, 'candidate');
+  assert.equal(pointerAtSpawn.sessionId, sessionFromArgs(calls[0].args));
+  assert.equal(pointerAtSpawn.cwd, realpathSync(workDir));
+  assert.equal(typeof pointerAtSpawn.promptSha256, 'string');
+  assert.equal(typeof pointerAtSpawn.transcriptPath, 'string');
+});
+
+test('runClaudeAttempt refuses a second launch instead of replacing the claimed session', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const stub = stubEchoing(claudeResultFixture);
+  const launched = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+  const pointerBefore = await readFile(join(stateDir, 'thread.json'), 'utf8');
+
+  const repeated = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+
+  assert.equal(repeated.outcome, 'terminal_report');
+  assert.equal(repeated.attemptNumber, null);
+  assert.ok(repeated.reasons.some((reason) => reason.includes('already claimed')));
+  assert.equal(stub.calls.length, 1);
+  assert.equal(await readFile(join(stateDir, 'thread.json'), 'utf8'), pointerBefore);
+  assert.deepEqual(await readdir(join(stateDir, 'attempts')), ['1', '1-result.json']);
+  assert.equal(launched.sessionId, JSON.parse(pointerBefore).sessionId);
+});
+
+test('runClaudeAttempt fails closed on a dangling thread pointer without following or replacing it', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const victimDir = await mkdtemp(join(tmpdir(), 'gc-thread-pointer-victim-'));
+  t.after(() => rm(victimDir, { recursive: true, force: true }));
+  const victim = join(victimDir, 'must-not-be-created.json');
+  const pointerPath = join(stateDir, 'thread.json');
+  await symlink(victim, pointerPath);
+  assert.equal(existsSync(pointerPath), false, 'the setup must be a dangling symlink');
+
+  const stub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch',
+    execFileImpl: stub.impl,
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.equal(result.attemptNumber, null);
+  assert.ok(result.reasons.some((reason) => reason.includes('invalid')));
+  assert.equal(stub.calls.length, 0);
+  assert.equal(existsSync(victim), false);
+  assert.equal((await lstat(pointerPath)).isSymbolicLink(), true);
+});
+
+test('runClaudeAttempt fails closed on malformed launch and resume pointers without spawning', async (t) => {
+  for (const [kind, contents] of [
+    ['launch', '{broken json'],
+    ['launch', JSON.stringify({ sessionId: '' })],
+    ['resume', JSON.stringify({ sessionId: 'not-a-uuid' })],
+  ]) {
+    const { stateDir, contract, binding } = await setupClaudeState(t);
+    await writeFile(join(stateDir, 'thread.json'), contents);
+    const stub = stubEchoing(claudeResultFixture);
+    const result = await runClaudeAttempt({
+      contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', diagnosticText: 'continue', kind,
+      execFileImpl: stub.impl,
+    });
+    assert.equal(result.outcome, 'terminal_report', kind);
+    assert.equal(result.attemptNumber, null, kind);
+    assert.ok(result.reasons.some((reason) => reason.includes('invalid')), kind);
+    assert.equal(stub.calls.length, 0, kind);
+  }
+});
+
+test('a legacy six-field Claude pointer gets an actionable migration diagnostic', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const target = realpathSync(contract.target_roots[0]);
+  await writeFile(join(stateDir, 'thread.json'), JSON.stringify({
+    sessionId: '11111111-1111-4111-8111-111111111111',
+    cwd: target,
+    promptSha256: 'a'.repeat(64),
+    transcriptPath: join(stateDir, 'legacy.jsonl'),
+    targetRoots: [target],
+    additionalReadRoots: [],
+  }));
+  const stub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume', execFileImpl: stub.impl,
+  });
+  assert.equal(result.outcome, 'terminal_report');
+  assert.equal(result.attemptNumber, null);
+  assert.ok(result.reasons.some((reason) => reason.includes('legacy pointer schema')));
+  assert.ok(result.reasons.some((reason) => reason.includes('fresh controller')));
+  assert.ok(result.reasons.every((reason) => !reason.includes('re-run prepare')));
+  assert.equal(stub.calls.length, 0);
+});
+
+test('runClaudeAttempt uses the canonical cwd even if the lexical target symlink is retargeted before dispatch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-canonical-cwd-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const targetA = join(root, 'target-a');
+  const targetB = join(root, 'target-b');
+  const linked = join(root, 'linked-target');
+  await mkdir(targetA);
+  await mkdir(targetB);
+  await symlink(targetA, linked);
+  const contract = makeContract({ target_roots: [linked] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+    beforeDispatch: async () => {
+      await rm(linked);
+      await symlink(targetB, linked);
+    },
+  });
+
+  assert.equal(result.outcome, 'candidate');
+  const canonicalA = realpathSync(targetA);
+  assert.equal(stub.calls[0].options.cwd, canonicalA);
+  const sources = stub.calls[0].args.indexOf('--setting-sources');
+  assert.equal(stub.calls[0].args[sources + 1], '');
+});
+
+test('runClaudeAttempt rechecks canonical target identity immediately before dispatch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-target-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  const moved = join(root, 'target-old');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+    beforeDispatch: async () => {
+      const { rename } = await import('node:fs/promises');
+      await rename(target, moved);
+      await mkdir(target);
+    },
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('identity changed')));
+  assert.equal(stub.calls.length, 0);
+});
+
+test('prepareClaude permits target roots with permission-DSL delimiters when they are not interpolated', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-v7-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const badTarget = join(root, 'has(paren)');
+  await mkdir(badTarget);
+  const stateDir = stateDirFor({ stateRoot: root, contractHash: 'a'.repeat(64) });
+  const previousToken = process.env.GC_LAUNCH_TEST_TOKEN;
+  process.env.GC_LAUNCH_TEST_TOKEN = 'secret-value';
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.GC_LAUNCH_TEST_TOKEN;
+    else process.env.GC_LAUNCH_TEST_TOKEN = previousToken;
+  });
+  const contract = makeContract({ target_roots: [badTarget] });
+  await assert.doesNotReject(
+    () => prepareClaude({ contract, contractPath: '/x', stateDir, collect: stubCollect }),
+  );
+});
+
+test('prepareClaude wraps only PermissionSpecifierError; genuine TypeErrors surface raw (V7\')', async (t) => {
+  // instanceof TypeError 仍会吞掉最常见的程序错误。只有 assertPermissionSpecifier 的专用错误类型
+  // 才能改写成 contract 诊断；普通 TypeError 必须保持身份原样上浮。
+  const root = await mkdtemp(join(tmpdir(), 'gc-v7-rethrow-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const stateDir = stateDirFor({ stateRoot: root, contractHash: 'a'.repeat(64) });
+  const boom = new TypeError('genuine buildSettings bug');
+  const contract = makeContract({
+    postflight: [{ id: 'pf', type: 'command', cwd: workDir, argv: ['node', '-e', 'process.exit(0)'] }],
+    execution_permissions: {
+      additional_read_roots: [],
+      get webfetch_domains() { throw boom; },
+    },
+  });
+  await assert.rejects(
+    () => prepareClaude({ contract, contractPath: '/x', stateDir, collect: stubCollect }),
+    (error) => error === boom,
+  );
+});
+
+test('runClaudeAttempt does not misreport a programmer TypeError as a bad permission specifier', async (t) => {
+  const contract = makeContract();
+  const setup = await setupClaudeState(t, { contract });
+  const boom = new TypeError('genuine launch-time buildSettings bug');
+  const poisoned = {
+    ...contract,
+    execution_permissions: {
+      get webfetch_domains() { throw boom; },
+    },
+  };
+  await assert.rejects(
+    () => runClaudeAttempt({
+      ...setup, contract: poisoned, prompt: 'OBJECTIVE TEXT', kind: 'launch',
+      execFileImpl: stubEchoing(claudeResultFixture).impl,
+    }),
+    (error) => error === boom,
+  );
+});
+
+test('the CLI error path renders ContractArtifactError guidance, not just code+path (V7\')', () => {
+  // ContractArtifactError 的 message 只有 code+path，而 launch CLI 只打 message——observed/expected/
+  // next 承诺了却从不到达操作员（validate-contract.mjs 会渲染，launch 这边是盲区）。单点渲染函数
+  // 两边同一格式。
+  const error = new ContractArtifactError({
+    code: 'PERMISSION_SPECIFIER_UNREPRESENTABLE',
+    path: 'target_roots/execution_permissions',
+    observed: 'observed-o', expected: 'expected-e', next: 'next-n',
+  });
+  const rendered = renderCliError(error);
+  assert.ok(rendered.includes('PERMISSION_SPECIFIER_UNREPRESENTABLE target_roots/execution_permissions'), rendered);
+  assert.ok(rendered.includes('observed="observed-o"'), rendered);
+  assert.ok(rendered.includes('expected="expected-e"'), rendered);
+  assert.ok(rendered.includes('next="next-n"'), rendered);
+  // 三件套之外的错误照旧只打 message，不硬造格式。
+  assert.equal(renderCliError(new Error('plain message')), 'plain message');
+});
+
+test('readControllerJsonNoFollow keeps the missing signal when O_NOFOLLOW is unavailable (V3)', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'gc-nofollow-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const p = join(dir, 'thread.json');
+  // 无 O_NOFOLLOW 平台（注入 undefined 模拟）：不存在的 pointer 必须报 missing:true，不能误报成
+  // 「存在但损坏」——否则首次 launch 在该平台永久拒绝并把操作员引向一个不存在的损坏文件（V3）。
+  // null 而非 undefined：显式 undefined 会触发默认参数 constants.O_NOFOLLOW，注入失效。生产在真
+  // 无 O_NOFOLLOW 的平台上，默认值本身就是 undefined→同样落 fallback，语义一致。
+  assert.deepEqual(await readControllerJsonNoFollow(p, null), { ok: false, missing: true });
+  // 存在但缺 no-follow 原语时 fail-closed：显式 invalid（ok:false, missing:false），且绝不落到读内容。
+  await writeFile(p, JSON.stringify({ any: 'thing' }));
+  const present = await readControllerJsonNoFollow(p, null);
+  assert.equal(present.ok, false);
+  assert.equal(present.missing, false);
+  assert.ok(!('value' in present));
+});
+
+test('writeControllerJsonExclusive removes a partial file after an owned post-open write failure', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-exclusive-json-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pathname = join(root, 'thread.json');
+  await assert.rejects(
+    () => writeControllerJsonExclusive(pathname, { schemaVersion: 2 }, {
+      writeImpl: async (handle) => {
+        await handle.writeFile('{');
+        throw new Error('fault after exclusive open');
+      },
+    }),
+    /fault after exclusive open/,
+  );
+  assert.equal(existsSync(pathname), false, 'an owned partial pointer must not poison later launches');
+});
+
+test('failed controller JSON publication never deletes a foreign final-path replacement', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-exclusive-json-replace-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pathname = join(root, 'thread.json');
+  await assert.rejects(
+    () => writeControllerJsonExclusive(pathname, { schemaVersion: 2 }, {
+      writeImpl: async (handle) => {
+        await handle.writeFile('{');
+        await writeFile(pathname, 'foreign replacement', { flag: 'wx' });
+        throw new Error('fault after foreign replacement');
+      },
+    }),
+  );
+  assert.equal(await readFile(pathname, 'utf8'), 'foreign replacement');
+});
+
+test('help capability probes require the exact long option token', () => {
+  assert.equal(helpAdvertisesLongOption('  --setting-sources <sources>  select sources\n', '--setting-sources'), true);
+  assert.equal(helpAdvertisesLongOption('  --setting-sources=<sources>\n', '--setting-sources'), true);
+  assert.equal(helpAdvertisesLongOption('  --setting-sources-file <path>\n', '--setting-sources'), false);
+  assert.equal(helpAdvertisesLongOption('text mentions --setting-sources-compatible only\n', '--setting-sources'), false);
+});
+
+test('resume refuses when the target root canonical path changed since launch (V2)', async (t) => {
+  // resume 曾只取 sessionId、用当前 contract 重算 cwd，不核 pointer 记录的 launch-time cwd。
+  // symlink target root 在 launch 后被重定向时，resume 会在新目录里复活旧会话——settings/deny
+  // 面（当前根）与 spawn cwd（旧会话根）分叉，wrong result 无 red（V2，Codex P1 + DeepSeek 收敛）。
+  const root = await mkdtemp(join(tmpdir(), 'gc-resume-cwd-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const targetA = join(root, 'a');
+  const targetB = join(root, 'b');
+  const linked = join(root, 'linked');
+  await mkdir(targetA);
+  await mkdir(targetB);
+  await symlink(targetA, linked);
+  const contract = makeContract({ target_roots: [linked] });
+  const setup = await setupClaudeState(t, { contract });
+
+  const launchStub = stubEchoing(claudeResultFixture);
+  const launched = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: launchStub.impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+
+  await rm(linked);
+  await symlink(targetB, linked);   // launch 之后把 target root 重定向到别处
+
+  const resumeStub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    ...setup, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: resumeStub.impl,
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('since launch')));
+  assert.equal(resumeStub.calls.length, 0);   // 绝不在重定向后的目录里 spawn 续跑
+});
+
+test('resume refuses when secondary target roots or read roots changed since launch (V2\')', async (t) => {
+  // pointer 曾只记 target_roots[0]（cwd）：第二 target root / additional read root 在 attempt 之间
+  // 被 symlink 重定向时，resume 用重算的当前值照常起跑，settings 的授权面（additionalDirectories）
+  // 与 launch 时不再一致——cwd 检查对它们是盲的。pointer 记录全部 launch-time canonical roots，
+  // resume 逐一核对，任何一根漂移都拒绝。
+  const root = await mkdtemp(join(tmpdir(), 'gc-resume-roots-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const primary = join(root, 'primary');
+  const secondA = join(root, 'second-a');
+  const secondB = join(root, 'second-b');
+  const linked = join(root, 'linked-second');
+  await mkdir(primary);
+  await mkdir(secondA);
+  await mkdir(secondB);
+  await symlink(secondA, linked);
+  const contract = makeContract({ target_roots: [primary, linked] });
+  const setup = await setupClaudeState(t, { contract });
+
+  const launched = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stubEchoing(claudeResultFixture).impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+
+  await rm(linked);
+  await symlink(secondB, linked);   // launch 之后重定向第二 target root——cwd（primary）纹丝不动
+
+  const resumeStub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    ...setup, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: resumeStub.impl,
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('since launch')));
+  assert.equal(resumeStub.calls.length, 0);
+});
+
+test('resume refuses when a root is replaced at the same canonical path since launch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-resume-root-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  const oldTarget = join(root, 'target-old');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+
+  const launched = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stubEchoing(claudeResultFixture).impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+
+  const { rename } = await import('node:fs/promises');
+  await rename(target, oldTarget);
+  await mkdir(target); // canonical string unchanged, device/inode changed
+
+  const resumeStub = stubEchoing(claudeResultFixture);
+  const result = await runClaudeAttempt({
+    ...setup, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: resumeStub.impl,
+  });
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('identity changed since launch')));
+  assert.equal(resumeStub.calls.length, 0);
+});
+
+test('runClaudeAttempt excludes ambient project settings and launches only with flag settings (V4)', async (t) => {
+  // 项目 settings 即使含扩权 permissions 也不再是加载源；argv 用 --setting-sources "" 关闭
+  // user/project/local，只保留 Controller 通过 --settings 提供的 flagSettings（以及不可关闭的 policy）。
+  const root = await mkdtemp(join(tmpdir(), 'gc-v4-preexisting-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  await mkdir(join(target, '.claude'), { recursive: true });
+  await writeFile(join(target, '.claude', 'settings.local.json'), JSON.stringify({ permissions: { allow: ['Bash(*)'] } }));
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+
+  assert.equal(result.outcome, 'candidate');
+  assert.equal(stub.calls.length, 1);
+  const sources = stub.calls[0].args.indexOf('--setting-sources');
+  assert.ok(sources >= 0);
+  assert.equal(stub.calls[0].args[sources + 1], '');
+});
+
+test('runClaudeAttempt rechecks additional_read_roots identity before dispatch (V6)', async (t) => {
+  // target root 有 spawn 前 device/inode 复核防 symlink 重定向；additional_read_roots 进了
+  // settings.additionalDirectories 却没有同等复核（V6，Codex 独有 P1）。替换 read-root 目录能把
+  // 授权的读路径重定向到无关数据，且不触发任何前置检查。
+  const root = await mkdtemp(join(tmpdir(), 'gc-arr-identity-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  const readRoot = join(root, 'readable');
+  const moved = join(root, 'readable-old');
+  await mkdir(target);
+  await mkdir(readRoot);
+  const contract = makeContract({
+    target_roots: [target],
+    execution_permissions: { additional_read_roots: [readRoot] },
+  });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+    beforeDispatch: async () => {
+      const { rename } = await import('node:fs/promises');
+      await rename(readRoot, moved);
+      await mkdir(readRoot);
+    },
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('identity changed')));
+  assert.equal(stub.calls.length, 0);
+});
+
+test('a failed pre-spawn recheck releases the fresh pointer so retry launches are not poisoned (PR2-3)', async (t) => {
+  // identity 复核必须贴着 spawn（挪到写 pointer 之前会重开 claim→spawn 的 TOCTOU 窗口），这个
+  // 位置是 deliberate；但复核失败时没有 spawn 任何会话，pointer 指向一个从未存在的 session。
+  // 留着它，下一次 launch 被「already claimed」拒、resume 指向不存在的会话——正常 retry 路径
+  // 被毒化。没有调用执行器的失败既要释放 pointer，也要释放本进程刚占的 attempt slot；配额定义的
+  // 是真实 dispatch，不是前置闸撞了几次。
+  const root = await mkdtemp(join(tmpdir(), 'gc-pr23-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  const moved = join(root, 'target-moved');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  const failed = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+    beforeDispatch: async () => {
+      const { rename } = await import('node:fs/promises');
+      await rename(target, moved);
+      await mkdir(target);   // 同路径、新 inode：canonical 不变，identity 复核红
+    },
+  });
+  assert.equal(failed.outcome, 'terminal_report');
+  assert.ok(failed.reasons.some((reason) => reason.includes('identity changed')));
+  assert.equal(stub.calls.length, 0);
+  assert.ok(!existsSync(join(setup.stateDir, 'thread.json')), 'the unspawned pointer must be released');
+  assert.deepEqual(await readdir(join(setup.stateDir, 'attempts')), [], 'no dispatch means no spent attempt');
+
+  // retry 不被毒化：换回稳定的 target root 后，同一 state dir 的下一次 launch 正常起飞。
+  const retryStub = stubEchoing(claudeResultFixture);
+  const retry = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: retryStub.impl,
+  });
+  assert.equal(retry.outcome, 'candidate');
+  assert.equal(retry.attemptNumber, 1);
+  assert.equal(retryStub.calls.length, 1);
+});
+
+test('three throwing beforeDispatch hooks spend no attempts and do not poison a later launch', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'gc-before-dispatch-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const target = join(root, 'target');
+  await mkdir(target);
+  const contract = makeContract({ target_roots: [target] });
+  const setup = await setupClaudeState(t, { contract });
+  const stub = stubEchoing(claudeResultFixture);
+
+  for (let round = 0; round < 3; round += 1) {
+    const result = await runClaudeAttempt({
+      ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+      beforeDispatch: async () => { throw new Error('pre-dispatch fixture failure'); },
+    });
+    assert.equal(result.outcome, 'terminal_report');
+    assert.equal(stub.calls.length, 0);
+    assert.equal(existsSync(join(setup.stateDir, 'thread.json')), false);
+    assert.deepEqual(await readdir(join(setup.stateDir, 'attempts')), []);
+  }
+
+  const launched = await runClaudeAttempt({
+    ...setup, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+  assert.equal(launched.attemptNumber, 1);
+  assert.equal(stub.calls.length, 1);
+});
+
+test('a Claude attempt lease blocks a concurrent resume and preserves the retry budget', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const launchStub = stubEchoing(claudeResultFixture);
+  const launched = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: launchStub.impl,
+  });
+  assert.equal(launched.outcome, 'candidate');
+
+  let markEntered;
+  let releaseBarrier;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+  const firstResume = runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume',
+    execFileImpl: stubEchoing(claudeResultFixture).impl,
+    beforeDispatch: async () => {
+      markEntered();
+      await barrier;
+      throw new Error('fault before dispatch');
+    },
+  });
+  await entered;
+  const settingsPath = join(stateDir, 'settings.json');
+  const settingsBefore = await readFile(settingsPath, 'utf8');
+  const settingsInodeBefore = (await lstat(settingsPath)).ino;
+
+  await assert.rejects(
+    () => runClaudeAttempt({
+      contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume',
+      execFileImpl: stubEchoing(claudeResultFixture).impl,
+    }),
+    /CLAUDE_ATTEMPT_IN_PROGRESS/,
+  );
+  assert.equal(await readFile(settingsPath, 'utf8'), settingsBefore);
+  assert.equal((await lstat(settingsPath)).ino, settingsInodeBefore,
+    'a blocked concurrent invocation must not republish the active attempt settings');
+  releaseBarrier();
+  const failed = await firstResume;
+  assert.equal(failed.outcome, 'terminal_report');
+  assert.equal(failed.attemptNumber, null);
+
+  const retryStub = stubEchoing(claudeResultFixture);
+  const retried = await runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'continue', kind: 'resume', execFileImpl: retryStub.impl,
+  });
+  assert.equal(retried.outcome, 'candidate');
+  assert.equal(retried.attemptNumber, 2);
+  assert.equal(retryStub.calls.length, 1);
+});
+
+test('an error_max_turns hard stop keeps the pointer and resumes without surgery', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  const errorFixture = JSON.parse(
+    await readFile(new URL('./fixtures/claude-result-17key-error-max-turns.json', import.meta.url), 'utf8'),
+  );
+  // 真实 CLI 在 max-turns 硬停时非零退出、stdout 仍是 error 形态 envelope（S-B 实测）。
+  const launchStub = stubRejectingEchoing(errorFixture, 'Command failed with exit code 1');
+
+  const launched = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: launchStub.impl,
+  });
+
+  // 「没干完」是未达标候选不是协议漂移：budgetExhausted 让控制器把它路由到可续分流。
+  assert.equal(launched.outcome, 'candidate');
+  assert.equal(launched.budgetExhausted, true);
+  assert.equal(launched.hookExpected, false);
+  assert.equal(launched.candidate.subtype, 'error_max_turns');
+
+  // 指针在（launch 前落盘），resume 直接可用——这正是 2026-08-10 死锁形态的绿路径。
+  const pointer = JSON.parse(await readFile(join(stateDir, 'thread.json'), 'utf8'));
+  assert.equal(pointer.sessionId, launched.sessionId);
+  const resumeStub = stubEchoing(claudeResultFixture);
+  const resumed = await runClaudeAttempt({
+    contract, stateDir, binding, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: resumeStub.impl,
+  });
+  assert.equal(resumed.outcome, 'candidate');
+  assert.equal(resumed.budgetExhausted, false);
+  assert.equal(resumed.hookExpected, true);
+  assert.equal(resumed.sessionId, launched.sessionId);
+});
+
+test('a session_id echo mismatch is a terminal report, never a candidate', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  // 回显一个别的会话：候选归属不成立，fail closed。
+  const stub = stubResolving(JSON.stringify({ ...claudeResultFixture, session_id: 'sid-foreign' }));
+
+  const result = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('session_id')));
+  await assert.rejects(() => readFile(join(stateDir, 'candidate.json')));
+});
+
+test('a pre-probe state dir (no claudeSessionIdFlag) is refused before spawn and burns no slot', async (t) => {
+  const { stateDir, contract, binding } = await setupClaudeState(t);
+  // 模拟旧 state 目录：prepare 落盘的 probes.json 没有能力探测值。
+  const probesPath = join(realpathSync(stateDir), 'probes.json');
+  const probes = JSON.parse(await readFile(probesPath, 'utf8'));
+  delete probes.claudeSessionIdFlag;
+  await writeFile(probesPath, JSON.stringify(probes, null, 2));
+  const stub = stubEchoing(claudeResultFixture);
+
+  const result = await runClaudeAttempt({
+    contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
+  });
+
+  assert.equal(result.outcome, 'terminal_report');
+  assert.ok(result.reasons.some((reason) => reason.includes('--session-id')));
+  assert.equal(stub.calls.length, 0);
+  assert.deepEqual(await readdir(join(stateDir, 'attempts')), []);
+});
+
+// ---------------------------------------------------------------------------
+// readback（D6）：控制器自有观测通道，只读、fail-open、零 transcript 字节出境。
+// ---------------------------------------------------------------------------
+
+async function plantReadbackState({ pointer, transcriptLines }) {
+  const stateDir = await mkdtemp(join(tmpdir(), 'gc-readback-'));
+  let transcriptPath = pointer?.transcriptPath;
+  if (transcriptLines !== undefined) {
+    transcriptPath = join(stateDir, 'fake-transcript.jsonl');
+    await writeFile(transcriptPath, transcriptLines.map((line) => JSON.stringify(line)).join('\n') + '\n');
+  }
+  if (pointer !== null) {
+    await writeFile(join(stateDir, 'thread.json'), JSON.stringify({ ...pointer, transcriptPath }, null, 2));
+  }
+  return { stateDir, transcriptPath };
+}
+
+const READBACK_UUID_1 = '11111111-1111-4111-8111-111111111111';
+const READBACK_UUID_2 = '22222222-2222-4222-8222-222222222222';
+const READBACK_UUID_3 = '33333333-3333-4333-8333-333333333333';
+
+test('runClaudeReadback reports liveness and prompt attribution without leaking transcript bytes or coordinates', async () => {
+  const prompt = 'SECRET OBJECTIVE do not leak';
+  const promptSha256 = createHash('sha256').update(prompt, 'utf8').digest('hex');
+  const { stateDir } = await plantReadbackState({
+    pointer: {
+      schemaVersion: 2,
+      sessionId: READBACK_UUID_1, cwd: '/work/root', promptSha256,
+      targetRoots: ['/work/root'], additionalReadRoots: [],
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
+    },
+    transcriptLines: [
+      { type: 'queue-operation' },
+      { type: 'user', message: { content: prompt } },                       // string 形态（S-C 实测）
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'SECRET REPLY' }] } },
+    ],
+  });
+
+  const report = await runClaudeReadback({ stateDir });
+  assert.equal(report.available, true);
+  assert.equal(report.lineCount, 3);
+  assert.equal(report.lastEntryType, 'assistant');
+  assert.equal(report.promptAttribution, 'match');
+  assert.equal(typeof report.mtimeMs, 'number');
+  // 零字节出境：报告体里不允许出现 transcript 的任何内容。
+  const serialized = JSON.stringify(report);
+  assert.ok(!serialized.includes('SECRET'));
+  assert.ok(!serialized.includes(READBACK_UUID_1));
+  assert.ok(!serialized.includes(stateDir));
+  assert.equal(Object.hasOwn(report, 'sessionId'), false);
+  assert.equal(Object.hasOwn(report, 'transcriptPath'), false);
+});
+
+test('runClaudeReadback maps an arbitrary transcript type to a fixed privacy-safe enum', async () => {
+  const { stateDir } = await plantReadbackState({
+    pointer: {
+      schemaVersion: 2,
+      sessionId: READBACK_UUID_1, cwd: '/work/root', promptSha256: 'a'.repeat(64),
+      targetRoots: ['/work/root'], additionalReadRoots: [],
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
+    },
+    transcriptLines: [{ type: 'SECRET TYPE BYTES must not escape' }],
+  });
+  const report = await runClaudeReadback({ stateDir });
+  assert.equal(report.available, true);
+  assert.equal(report.lastEntryType, 'unknown');
+  assert.ok(!JSON.stringify(report).includes('SECRET'));
+});
+
+test('runClaudeReadback handles array-form user content and flags a mismatched prompt', async () => {
+  const { stateDir } = await plantReadbackState({
+    pointer: {
+      schemaVersion: 2,
+      sessionId: READBACK_UUID_2, cwd: '/w', promptSha256: 'a'.repeat(64),
+      targetRoots: ['/w'], additionalReadRoots: [],
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
+    },
+    transcriptLines: [{ type: 'user', message: { content: [{ type: 'text', text: 'something else' }] } }],
+  });
+  const report = await runClaudeReadback({ stateDir });
+  assert.equal(report.available, true);
+  assert.equal(report.promptAttribution, 'mismatch');
+});
+
+test('runClaudeReadback fails open on every unavailable shape', async () => {
+  // 无 thread.json。
+  const empty = await mkdtemp(join(tmpdir(), 'gc-readback-empty-'));
+  assert.equal((await runClaudeReadback({ stateDir: empty })).available, false);
+  // codex 指针。
+  const codex = await plantReadbackState({ pointer: { threadId: 'thread-1', cwd: '/w' }, transcriptLines: [] });
+  const codexReport = await runClaudeReadback({ stateDir: codex.stateDir });
+  assert.equal(codexReport.available, false);
+  assert.ok(codexReport.reasons.some((reason) => reason.includes('codex')));
+  // 旧形态指针（只有 sessionId）。
+  const old = await plantReadbackState({ pointer: { sessionId: 'sid-old' } });
+  assert.equal((await runClaudeReadback({ stateDir: old.stateDir })).available, false);
+  // 指针形态齐全但 transcript 不在（slug 规则漂移或会话未起）。
+  const gone = await plantReadbackState({
+    pointer: {
+      schemaVersion: 2,
+      sessionId: READBACK_UUID_3, cwd: '/w', promptSha256: 'a'.repeat(64),
+      targetRoots: ['/w'], additionalReadRoots: [], transcriptPath: join(empty, 'nope.jsonl'),
+      targetRootIdentities: [{ dev: '1', ino: '2' }], additionalReadRootIdentities: [],
+    },
+  });
+  const goneReport = await runClaudeReadback({ stateDir: gone.stateDir });
+  assert.equal(goneReport.available, false);
+  assert.ok(goneReport.reasons.length > 0);
+});
+
+test('runClaudeReadback keeps filesystem error details and paths out of unavailable reports', async () => {
+  const { stateDir, transcriptPath } = await plantReadbackState({
+    pointer: { sessionId: 'sid-private', cwd: '/w', promptSha256: 'a'.repeat(64) },
+    transcriptLines: [{ type: 'user', message: { content: 'private prompt' } }],
+  });
+  await chmod(transcriptPath, 0o000);
+
+  const report = await runClaudeReadback({ stateDir });
+  await chmod(transcriptPath, 0o600);
+  assert.equal(report.available, false);
+  const serialized = JSON.stringify(report);
+  assert.ok(!serialized.includes(transcriptPath));
+  assert.ok(!serialized.includes('sid-private'));
+});
+
+test('claudeTranscriptPath applies the measured slug rule', () => {
+  // S-C 实测：绝对路径中非 [A-Za-z0-9-] 的字符（含 / . _ 与非 ASCII）一律替换为 '-'。
+  const path = claudeTranscriptPath({ cwd: '/work/my.repo/子目录_x', sessionId: 'sid-9' });
+  assert.ok(path.endsWith(join('.claude', 'projects', '-work-my-repo-----x', 'sid-9.jsonl')), path);
+});
+
 test('runClaudeAttempt: resume without a prior thread.json is a terminal report and never calls execFileImpl', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: stub.impl,
@@ -513,7 +1478,7 @@ test('runClaudeAttempt: resume without a prior thread.json is a terminal report 
 
 test('runClaudeAttempt: a missing runBinding is a terminal report and never calls execFileImpl', async (t) => {
   const { stateDir, contract } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -527,7 +1492,7 @@ test('runClaudeAttempt: a missing runBinding is a terminal report and never call
 test('runClaudeAttempt: runBinding.contractHash not matching the state dir it was prepared under is a terminal report', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
   const mismatchedBinding = { ...binding, contractHash: 'f'.repeat(64) };
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding: mismatchedBinding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -541,7 +1506,7 @@ test('runClaudeAttempt: runBinding.contractHash not matching the state dir it wa
 test('runClaudeAttempt: a baselineDigest that is not 64-hex is a terminal report and never calls execFileImpl', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
   const badDigestBinding = { ...binding, baselineDigest: 'not-a-real-digest' };
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding: badDigestBinding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -558,7 +1523,7 @@ test('runClaudeAttempt: a baselineDigest that is not 64-hex is a terminal report
 // 不占号，笔误改对之后首发仍是 attempt 1。
 test('N-2 regression: three launches refused for a mistyped binding leave the attempt budget intact', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
   const mistypedBinding = { ...binding, contractHash: 'f'.repeat(64) };
 
   for (let tryIndex = 1; tryIndex <= 1 + MAX_AUTO_RESUMES; tryIndex += 1) {
@@ -584,7 +1549,7 @@ test('N-2 regression: three launches refused for a mistyped binding leave the at
 // 占号的时刻必须紧贴 spawn：resume 读不回 thread.json 是最后一道前置闸，它之后才是执行器。
 test('runClaudeAttempt: a resume with no thread.json burns no attempt slot either', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, diagnosticText: 'fix pf-test', kind: 'resume', execFileImpl: stub.impl,
@@ -600,7 +1565,7 @@ test('runClaudeAttempt: a resume with no thread.json burns no attempt slot eithe
 // 少了这条，「不占号」可以靠彻底删掉 nextAttempt 调用来假装通过。
 test('runClaudeAttempt: attempts that do spawn still take monotonic O_EXCL slots up to the ceiling', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   for (let round = 1; round <= 1 + MAX_AUTO_RESUMES; round += 1) {
     const result = await runClaudeAttempt({
@@ -659,18 +1624,18 @@ async function plantTamperedProbes(stateDir, { removeRealHook = false } = {}) {
   return { evilDir, evilHookPath };
 }
 
-// M6：spec §5 与 claude.md:44 承诺控制器 postflight 校验「hook 运行次数 ≥ attempt 轮数」，
-// 但 runClaudeAttempt 的返回体两个数都不给，主会话拿不到对账所需的任何一半（hookRunCount 有
-// 单测、无生产调用者）。这条钉住两个数都在返回体里、且真的跟着磁盘现状走。
+// M6：控制器按 hookExpected=true 的候选轮次对账 hook 出席。runClaudeAttempt 必须同时给出
+// attemptNumber、hookRuns 与本轮期望位，且计数真的跟着磁盘现状走。
 test('runClaudeAttempt returns attemptNumber and hookRuns so the main session can reconcile hook attendance', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const first = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
   });
   assert.equal(first.attemptNumber, 1);
   assert.equal(first.hookRuns, 0);          // stub 的 claude 没真跑，hook 一次都没执行
+  assert.equal(first.hookExpected, true);
 
   // 补一条 hook 运行留痕，再跑一轮 resume：轮数与运行次数各自前进，对账才有意义。
   await writeFile(join(realpathSync(stateDir), 'hook-runs.jsonl'),
@@ -680,6 +1645,7 @@ test('runClaudeAttempt returns attemptNumber and hookRuns so the main session ca
   });
   assert.equal(second.attemptNumber, 2);
   assert.equal(second.hookRuns, 2);
+  assert.equal(second.hookExpected, true);
 
   // 终局报告同样带这两个数——「hook 缺席」最需要被看见的恰恰是失败那一轮。前置闸拒绝时
   // attemptNumber 是显式的 null（没有轮次可对账），不是缺字段：JSON.stringify 会把 undefined
@@ -696,7 +1662,7 @@ test('runClaudeAttempt returns attemptNumber and hookRuns so the main session ca
 // M1 的落地端：contract.budget 必须真的走到 argv，adapter 单测只能证明纯函数会算。
 test('runClaudeAttempt puts the contract budget max_turns into the actual argv', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);   // makeContract: max_turns 5
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -706,10 +1672,33 @@ test('runClaudeAttempt puts the contract budget max_turns into the actual argv',
   assert.equal(args[args.indexOf('--max-turns') + 1], '5');
 });
 
+test('runClaudeAttempt accepts max_turns 200 and refuses 201 before spawn', async (t) => {
+  const allowedContract = makeContract({ budget: { user_provided: true, max_turns: 200 } });
+  const allowed = await setupClaudeState(t, { contract: allowedContract });
+  const allowedStub = stubEchoing(claudeResultFixture);
+  const candidate = await runClaudeAttempt({
+    ...allowed, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: allowedStub.impl,
+  });
+  assert.equal(candidate.outcome, 'candidate');
+  const args = allowedStub.calls[0].args;
+  assert.equal(args[args.indexOf('--max-turns') + 1], '200');
+
+  const refusedContract = makeContract({ budget: { user_provided: true, max_turns: 201 } });
+  const refused = await setupClaudeState(t, { contract: refusedContract });
+  const refusedStub = stubEchoing(claudeResultFixture);
+  const report = await runClaudeAttempt({
+    ...refused, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: refusedStub.impl,
+  });
+  assert.equal(report.outcome, 'terminal_report');
+  assert.equal(report.attemptNumber, null);
+  assert.equal(refusedStub.calls.length, 0);
+  assert.ok(report.reasons.some((reason) => reason.includes('200')));
+});
+
 test('runClaudeAttempt ignores a tampered probes.json: the real hook and the real settings are what launch uses', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
   const { evilDir, evilHookPath } = await plantTamperedProbes(stateDir);
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -729,7 +1718,7 @@ test('runClaudeAttempt ignores a tampered probes.json: the real hook and the rea
 test('runClaudeAttempt fails closed when tampered probes.json masks a destroyed real hook (execFileImpl never called)', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
   await plantTamperedProbes(stateDir, { removeRealHook: true });
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
 
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
@@ -754,7 +1743,7 @@ test('runClaudeAttempt rewrites settings.json each attempt so on-disk tampering 
   const generated = JSON.parse(await readFile(settingsPath, 'utf8'));
   await writeFile(settingsPath, JSON.stringify({ ...generated, permissions: { deny: [] } }, null, 2));
 
-  const stub = stubResolving(JSON.stringify(claudeResultFixture));
+  const stub = stubEchoing(claudeResultFixture);
   const result = await runClaudeAttempt({
     contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
   });
@@ -809,7 +1798,7 @@ for (const kind of ['symlink', 'hardlink']) {
     const settingsPath = join(realStateDir, 'settings.json');
     const victim = await plantVictimAt(settingsPath, kind);
 
-    const stub = stubResolving(JSON.stringify(claudeResultFixture));
+    const stub = stubEchoing(claudeResultFixture);
     const result = await runClaudeAttempt({
       contract, stateDir, binding, prompt: 'OBJECTIVE TEXT', kind: 'launch', execFileImpl: stub.impl,
     });
@@ -3323,6 +4312,7 @@ test('runCodexLaunch keeps a candidate outcome free of notification noise', asyn
 
 const execFileAsync = promisify(execFileCallback);
 const launchScriptPath = fileURLToPath(new URL('../scripts/launch.mjs', import.meta.url));
+const codexRunnerScriptPath = fileURLToPath(new URL('../scripts/lib/runners/codex.mjs', import.meta.url));
 
 // timeout 是刻意的：被测的失效形态里有好几种「进程该死却没死」。没有超时的话，回归会表现成
 // 整个测试文件挂死——那不是红，是测试说谎。超时后子进程被 SIGKILL，断言照常判红。
@@ -3435,7 +4425,7 @@ async function waitFor(predicate, timeoutMs, what) {
 async function writeSignalScript(dir) {
   const scriptPath = join(dir, 'signal-probe.mjs');
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const goal = { threadId: "t-fake", objective: "o", status: "active", tokensUsed: 0,',
@@ -3511,7 +4501,7 @@ test('N-1 in place: a missing codex binary is a connection-stage terminal report
 async function writeEscapeScript(dir, mode) {
   const scriptPath = join(dir, `escape-${mode}.mjs`);
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const clientFactory = () => ({',
@@ -3774,7 +4764,7 @@ test('runCodexClose refuses to release the lease of a still-running holder, keep
 async function writeHungClientScript(dir) {
   const scriptPath = join(dir, 'hung-client.mjs');
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const goal = { threadId: "t-fake", objective: "o", status: "active", tokensUsed: 0,',
@@ -3821,7 +4811,7 @@ test('M-1 process-exit net: an event loop that simply runs dry still cleans up t
 async function writeCleanupThrowScript(dir) {
   const scriptPath = join(dir, 'cleanup-throw.mjs');
   await writeFile(scriptPath, [
-    `import { runCodexLaunch } from ${JSON.stringify(launchScriptPath)};`,
+    `import { runCodexLaunch } from ${JSON.stringify(codexRunnerScriptPath)};`,
     "import { chmodSync, readFileSync } from 'node:fs';",
     'const [stateDir, authSource, contractPath, bindingPath] = process.argv.slice(2);',
     'const clientFactory = ({ codexHome }) => ({',

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile as execFileCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile,
@@ -8,7 +8,10 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { promisify } from 'node:util';
 import test from 'node:test';
-import { installRelease, verifyRelease, REQUIRED_CORE_FILES } from '../scripts/lib/installer.mjs';
+import {
+  activateRelease, installRelease, stageRelease, verifyRelease, REQUIRED_CORE_FILES,
+} from '../scripts/lib/installer.mjs';
+import { inspectRuntimeSource } from '../scripts/lib/runtime-surfaces.mjs';
 
 const execFile = promisify(execFileCallback);
 
@@ -65,6 +68,23 @@ async function createSourceRepository(t) {
   return { root, repo, incompleteCommit, oldCommit, newCommit };
 }
 
+async function createCurrentSourceRepository(t) {
+  const root = await mkdtemp(join(tmpdir(), 'goal-current-installer-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const repo = join(root, 'source');
+  await mkdir(repo);
+  await git(repo, ['init', '--initial-branch=main']);
+  await git(repo, ['config', 'user.name', 'Installer Test']);
+  await git(repo, ['config', 'user.email', 'installer-test@example.invalid']);
+  for (const relativePath of REQUIRED_CORE_FILES) {
+    const content = await readFile(join(new URL('..', import.meta.url).pathname, relativePath));
+    await writeSourceFile(repo, relativePath, content);
+  }
+  await git(repo, ['add', '.']);
+  await git(repo, ['commit', '-m', 'current release core']);
+  return { root, repo, commit: (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim() };
+}
+
 test('materializes an immutable release from the requested commit without profile leakage', async (t) => {
   const { root, repo, oldCommit } = await createSourceRepository(t);
   const profile = join(root, 'private-profile.md');
@@ -91,8 +111,12 @@ test('materializes an immutable release from the requested commit without profil
 
   const manifestText = await readFile(join(result.releaseDir, 'manifest.json'), 'utf8');
   const manifest = JSON.parse(manifestText);
+  assert.equal(manifest.schema_version, 2);
   assert.equal(manifest.commit, oldCommit);
   assert.match(manifest.profile_sha256, /^[0-9a-f]{64}$/);
+  assert.deepEqual(Object.keys(manifest.runtime_surfaces).sort(), ['claude', 'codex']);
+  assert.match(manifest.runtime_surfaces.claude, /^[0-9a-f]{64}$/);
+  assert.match(manifest.runtime_surfaces.codex, /^[0-9a-f]{64}$/);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('anchors-and-rules')), false);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('tests/')), false);
   assert.equal(manifest.source_files.some((entry) => entry.path.includes('README')), false);
@@ -137,6 +161,27 @@ test('materializes an immutable release from the requested commit without profil
   assert.deepEqual(await verifyRelease(result.releaseDir, {
     expectedManifestDigest: result.manifestDigest,
   }), { ok: true, drift: [], manifestDigest: result.manifestDigest });
+  assert.deepEqual(inspectRuntimeSource({
+    root: result.releaseDir,
+    runtime: 'claude',
+    expectedManifestDigest: result.manifestDigest,
+  }), {
+    source: {
+      kind: 'immutable_release',
+      root_realpath: result.releaseDir,
+      manifest_digest: result.manifestDigest,
+    },
+    releaseManifestDigest: result.manifestDigest,
+    runtimeSurfaceDigest: manifest.runtime_surfaces.claude,
+  });
+  assert.throws(
+    () => inspectRuntimeSource({
+      root: result.releaseDir,
+      runtime: 'claude',
+      expectedManifestDigest: '0'.repeat(64),
+    }),
+    (error) => error.code === 'RELEASE_MANIFEST_DIGEST_MISMATCH',
+  );
 
   const again = await installRelease({
     repo,
@@ -147,6 +192,104 @@ test('materializes an immutable release from the requested commit without profil
   });
   assert.equal(again.releaseDir, result.releaseDir);
   assert.equal(again.manifestDigest, result.manifestDigest);
+});
+
+test('stage creates and verifies one immutable release without switching runtime links', async (t) => {
+  const { root, repo, oldCommit } = await createSourceRepository(t);
+  const profile = join(root, 'private-profile.md');
+  const releaseRoot = join(root, 'releases');
+  const claudeLink = join(root, 'claude-skill');
+  const codexLink = join(root, 'codex-skill');
+  await writeFile(profile, '# private project anchors\n');
+
+  const staged = await stageRelease({ repo, ref: oldCommit, profile, releaseRoot });
+
+  assert.equal(staged.commit, oldCommit);
+  assert.deepEqual(staged.runtimeSurfaces, staged.manifest.runtime_surfaces);
+  assert.equal((await verifyRelease(staged.releaseDir, {
+    expectedManifestDigest: staged.manifestDigest,
+  })).ok, true);
+  await assert.rejects(realpath(claudeLink), { code: 'ENOENT' });
+  await assert.rejects(realpath(codexLink), { code: 'ENOENT' });
+});
+
+test('installed Codex controller requires external manifest trust inside the safe CLI error boundary', async (t) => {
+  const { root, repo, commit } = await createCurrentSourceRepository(t);
+  const profile = join(root, 'private-profile.md');
+  await writeFile(profile, '# private project anchors\n');
+  const { releaseDir, manifestDigest } = await stageRelease({
+    repo, ref: commit, profile, releaseRoot: join(root, 'releases'),
+  });
+  const stateRoot = await mkdtemp(join(process.cwd(), '.gc-installed-cli-'));
+  t.after(() => rm(stateRoot, { recursive: true, force: true }));
+  const input = join(stateRoot, 'mode.json');
+  await writeFile(input, `${JSON.stringify({
+    action: 'get', next: null, changed_at: null, canary_session_id: null,
+  })}\n`, { mode: 0o600 });
+  const cli = join(releaseDir, 'codex-controller', 'src', 'cli.mjs');
+  const untrustedEnv = { ...process.env };
+  delete untrustedEnv.GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST;
+  const missing = spawnSync(process.execPath, [
+    cli, 'mode', '--state-root', join(stateRoot, 'controller'), '--input', input,
+  ], { encoding: 'utf8', env: untrustedEnv });
+  assert.equal(missing.status, 1);
+  assert.equal(missing.stdout, '');
+  assert.deepEqual(JSON.parse(missing.stderr), {
+    ok: false, code: 'RELEASE_MANIFEST_DIGEST_REQUIRED',
+  });
+
+  const trusted = spawnSync(process.execPath, [
+    cli, 'mode', '--state-root', join(stateRoot, 'controller'), '--input', input,
+  ], {
+    encoding: 'utf8',
+    env: { ...untrustedEnv, GOAL_CONDITION_EXPECTED_MANIFEST_DIGEST: manifestDigest },
+  });
+  assert.equal(trusted.status, 0, trusted.stderr);
+  const result = JSON.parse(trusted.stdout);
+  assert.equal(result.release_manifest_digest, manifestDigest);
+  assert.match(result.runtime_surface_digest, /^[0-9a-f]{64}$/);
+});
+
+test('activate requires the exact staged root and manifest digest before switching links', async (t) => {
+  const { root, repo, oldCommit } = await createSourceRepository(t);
+  const profile = join(root, 'private-profile.md');
+  const releaseRoot = join(root, 'releases');
+  const links = {
+    claude: join(root, 'claude-skill'),
+    codex: join(root, 'codex-skill'),
+  };
+  await writeFile(profile, '# private project anchors\n');
+  const staged = await stageRelease({ repo, ref: oldCommit, profile, releaseRoot });
+
+  await assert.rejects(
+    activateRelease({
+      releaseDir: staged.releaseDir,
+      expectedManifestDigest: '0'.repeat(64),
+      links,
+    }),
+    (error) => error.code === 'RELEASE_DRIFT',
+  );
+  await assert.rejects(realpath(links.claude), { code: 'ENOENT' });
+  await assert.rejects(realpath(links.codex), { code: 'ENOENT' });
+
+  const activated = await activateRelease({
+    releaseDir: staged.releaseDir,
+    expectedManifestDigest: staged.manifestDigest,
+    links,
+  });
+  assert.equal(activated.releaseDir, staged.releaseDir);
+  assert.equal(activated.manifestDigest, staged.manifestDigest);
+  assert.equal(await realpath(links.claude), staged.releaseDir);
+  assert.equal(await realpath(links.codex), staged.releaseDir);
+});
+
+test('installer CLI exposes separate stage and exact-digest activate commands', async () => {
+  const { stdout, stderr } = await execFile(process.execPath, [
+    'goal-condition-template/scripts/install.mjs', '--help',
+  ], { cwd: process.cwd(), encoding: 'utf8' });
+  assert.equal(stderr, '');
+  assert.match(stdout, /install\.mjs stage --repo PATH --ref REF --profile FILE --release-root PATH/);
+  assert.match(stdout, /install\.mjs activate --release PATH --expected-manifest-digest DIGEST --link NAME=PATH/);
 });
 
 test('reports release drift after a core file is modified', async (t) => {
@@ -640,7 +783,11 @@ test('fails closed when a link-parent ancestor is repointed after locks are acqu
   }
   assert.equal(await readFile(profile, 'utf8'), '# private project anchors\n');
   assert.equal((await git(repo, ['rev-parse', 'HEAD'])).stdout.trim(), sourceHeadBeforeRace);
-  await assert.rejects(lstat(join(releaseRoot, oldCommit)), { code: 'ENOENT' });
+  const stagedRelease = join(releaseRoot, oldCommit);
+  const stagedManifest = JSON.parse(await readFile(join(stagedRelease, 'manifest.json'), 'utf8'));
+  const stagedDigest = createHash('sha256')
+    .update(`${JSON.stringify(stagedManifest, null, 2)}\n`).digest('hex');
+  assert.equal((await verifyRelease(stagedRelease, { expectedManifestDigest: stagedDigest })).ok, true);
   await assert.rejects(lstat(backupRoot), { code: 'ENOENT' });
 });
 
@@ -672,7 +819,11 @@ test('fails closed when the release-root ancestor is repointed after locks are a
   );
 
   await assert.rejects(lstat(join(repo, 'releases')), { code: 'ENOENT' });
-  await assert.rejects(lstat(join(displacedParent, 'releases')), { code: 'ENOENT' });
+  const displacedRelease = join(displacedParent, 'releases', oldCommit);
+  const displacedManifest = JSON.parse(await readFile(join(displacedRelease, 'manifest.json'), 'utf8'));
+  const displacedDigest = createHash('sha256')
+    .update(`${JSON.stringify(displacedManifest, null, 2)}\n`).digest('hex');
+  assert.equal((await verifyRelease(displacedRelease, { expectedManifestDigest: displacedDigest })).ok, true);
   await assert.rejects(lstat(join(root, 'claude-skill')), { code: 'ENOENT' });
   await assert.rejects(lstat(join(root, 'codex-skill')), { code: 'ENOENT' });
 });
@@ -708,5 +859,9 @@ test('fails closed when the backup-root ancestor is repointed after locks are ac
 
   assert.equal(await readFile(join(root, 'claude-skill', 'keep.txt'), 'utf8'), 'recover me\n');
   await assert.rejects(lstat(join(repo, 'backups')), { code: 'ENOENT' });
-  await assert.rejects(lstat(join(root, 'releases', oldCommit)), { code: 'ENOENT' });
+  const stagedRelease = join(root, 'releases', oldCommit);
+  const stagedManifest = JSON.parse(await readFile(join(stagedRelease, 'manifest.json'), 'utf8'));
+  const stagedDigest = createHash('sha256')
+    .update(`${JSON.stringify(stagedManifest, null, 2)}\n`).digest('hex');
+  assert.equal((await verifyRelease(stagedRelease, { expectedManifestDigest: stagedDigest })).ok, true);
 });
