@@ -68,6 +68,34 @@ function evaluate(state = certifiedState(), overrides = {}) {
   });
 }
 
+// G4（2026-08-14）：命令行少传 capability flag 时，旧实现让 context 塌成 undefined，诊断只剩四条
+// 与 flag 无关的泛化原因（source 无效 / surface 无效 / environment 无效 / state 缺失），操作员看不出
+// 该补哪个参数。缺 flag 现在单独成一条指路诊断，且不与「flag 齐但内容不合格」混在一起。
+test('missing capability flags are named instead of collapsing into the generic reasons', () => {
+  const verdict = evaluateClaudeCapability({ missingFlags: ['--source', '--capability-state'] });
+  assert.equal(verdict.mode, 'candidate');
+  assert.deepEqual(verdict.reasons, [
+    'Claude capability flags are missing from this command: --source --capability-state',
+  ]);
+  // 泛化原因必须让位，否则「补哪个参数」照旧淹没在四条噪声里。
+  for (const generic of ['identity is invalid', 'surface digest is invalid', 'environment is invalid', 'state is missing']) {
+    assert.ok(!verdict.reasons.join(' ').includes(generic), `generic reason leaked: ${generic}`);
+  }
+  let thrown;
+  try {
+    assertClaudeCertified({ missingFlags: ['--auth-mode'] });
+  } catch (error) {
+    thrown = error;
+  }
+  assert.ok(thrown, 'assertClaudeCertified must fail closed when capability flags are missing');
+  assert.equal(thrown.code, 'CLAUDE_CAPABILITY_UNCERTIFIED');
+  assert.match(thrown.message, /--auth-mode/);
+  // 闭世界：不是本模块声明的 flag 一律不进诊断文本，也不得因此吞掉真实评估。
+  const forged = evaluateClaudeCapability({ missingFlags: ['--not-a-real-flag'] });
+  assert.ok(!forged.reasons.join(' ').includes('--not-a-real-flag'));
+  assert.ok(forged.reasons.length > 1, 'forged flag names must not short-circuit the real evaluation');
+});
+
 test('exact matching certified state evaluates certified', () => {
   assert.deepEqual(evaluate(), { mode: 'certified', reasons: [] });
   assert.doesNotThrow(() => assertClaudeCertified({

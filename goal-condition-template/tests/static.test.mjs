@@ -81,6 +81,21 @@ test('core skill has the exact public identity and stays compact', () => {
   assert.ok(skill.split('\n').length <= 201, 'SKILL.md must contain at most 200 lines');
 });
 
+// G4（2026-08-14）：launch/resume 实际接受五个认证 flag，缺任一就 UNCERTIFIED，而 usage 一行没列，
+// 操作员对着四条泛化红无从下手。usage 与 COMMANDS 的 allowed 表必须同步，否则文档又会悄悄落后。
+test('launcher usage documents the capability flags that launch and resume actually accept', () => {
+  const launcher = read(join(templateRoot, 'scripts/launch.mjs'));
+  const usageBlock = launcher.slice(launcher.indexOf('function usage()'), launcher.indexOf('export function parseArgs'));
+  assert.ok(usageBlock.length > 0, 'launcher usage block not found');
+  for (const flag of [
+    '--source', '--auth-mode', '--auth-context-id', '--capability-state', '--expected-manifest-digest',
+  ]) {
+    assert.ok(usageBlock.includes(flag), `usage does not document ${flag}`);
+  }
+  // 缺 flag 不静默降级这件事也要写在 usage 里：它决定操作员看到 UNCERTIFIED 时的第一反应。
+  assert.ok(usageBlock.includes('CLAUDE_CAPABILITY_UNCERTIFIED'), 'usage does not state the uncertified failure mode');
+});
+
 test('core skill exposes every required reference and every relative Markdown link resolves', () => {
   const required = [
     'references/run-contract.md',
