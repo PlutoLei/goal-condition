@@ -46,6 +46,21 @@ function driftHint(table) {
     + `re-check the new version's result envelope, then update ${table}`;
 }
 
+// 已锚定的 error 形态不能共用 driftHint：subtype=error_max_turns 命中的是实测 17-key 锚，此时
+// 拒收通常意味着「这一轮没干完」而不是「协议变了」。2026-08-13 真实排障里那句漂移话术把方向带偏
+// 一小时，而当天 envelope 与锚定逐 key 一致。改为回显命中的锚与判别用的闭集值，让操作员自己分辨
+// 两类事。隐私纪律不变：subtype 由分支条件恒定，terminal_reason 只回显闭集成员，其余一律折叠。
+const RECOGNIZED_TERMINAL_REASONS = Object.freeze(['api_error', 'completed', 'max_turns']);
+
+function anchoredShapeHint(raw) {
+  const terminalReason = RECOGNIZED_TERMINAL_REASONS.includes(raw.terminal_reason)
+    ? raw.terminal_reason : 'unrecognized';
+  return 'the envelope declares the anchored error shape subtype=error_max_turns '
+    + `terminal_reason=${terminalReason}; compare it key-by-key against `
+    + 'CLAUDE_ERROR_MAX_TURNS_KEYS — a mismatch on this anchor usually means the run did not '
+    + 'finish, not that the protocol changed';
+}
+
 export function normalizeTerminal(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, reasons: ['Claude result must be an object'] };
@@ -59,12 +74,12 @@ export function normalizeTerminal(raw) {
     && raw.terminal_reason === 'max_turns';
   const anchor = usesMaxTurnsAnchor ? CLAUDE_ERROR_MAX_TURNS_KEYS : CLAUDE_RESULT_KEYS;
   const anchorSet = usesMaxTurnsAnchor ? ERROR_MAX_TURNS_KEYS : EXPECTED_KEYS;
-  const table = usesMaxTurnsAnchor ? 'CLAUDE_ERROR_MAX_TURNS_KEYS' : 'CLAUDE_RESULT_KEYS';
+  const hint = usesMaxTurnsAnchor ? anchoredShapeHint(raw) : driftHint('CLAUDE_RESULT_KEYS');
   const missing = anchor.filter((key) => !Object.hasOwn(raw, key));
   const unknown = Object.keys(raw).filter((key) => !anchorSet.has(key));
   const reasons = [];
-  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${driftHint(table)}`);
-  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${driftHint(table)}`);
+  if (missing.length) reasons.push(`Claude result is missing ${missing.length} required key(s); ${hint}`);
+  if (unknown.length) reasons.push(`Claude result contains ${unknown.length} unknown key(s); ${hint}`);
   if (usesMaxTurnsAnchor && !budgetExhausted) {
     reasons.push('Claude error_max_turns result does not match the measured discriminator tuple');
   }
