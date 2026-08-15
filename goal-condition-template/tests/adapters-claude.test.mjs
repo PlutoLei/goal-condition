@@ -118,6 +118,36 @@ test('the error anchor is exhaustive: every key removed or added fails closed', 
   assert.ok(extra.reasons.every((reason) => !reason.includes('surprise_key')));
 });
 
+// G5（2026-08-14）：诊断话术分流。旧实现对任何 key 集不符都说「可能是升版漂移，去更新 key 表」，
+// 但已锚定的 error 形态被拒时真实原因通常是「没干完」——2026-08-13 那次排障因此被带偏一小时，
+// 而当天 envelope 与锚定逐 key 一致。已知形态回显闭集判别值，未知形态才保留升版提示。
+test('an anchored error shape is diagnosed by its closed-set values, never as version drift', () => {
+  const missingOneKey = { ...errorMaxTurnsResult };
+  delete missingOneKey.usage;
+  const normalized = normalizeTerminal(missingOneKey);
+  assert.equal(normalized.ok, false);
+  const text = normalized.reasons.join(' ');
+  assert.ok(!/drift|upgrade/i.test(text), `anchored shape must not claim version drift: ${text}`);
+  assert.match(text, /subtype=error_max_turns/);
+  assert.match(text, /terminal_reason=max_turns/);
+  assert.ok(text.includes('CLAUDE_ERROR_MAX_TURNS_KEYS'));
+  // 隐私：只回显闭集枚举值与计数，缺失的 key 名不得出现。
+  assert.ok(!text.includes('usage'), `diagnostic must not echo key names: ${text}`);
+  // terminal_reason 漂出闭集时折叠为 unrecognized，不原样回显 envelope 内容。
+  const oddReason = normalizeTerminal({ ...missingOneKey, terminal_reason: 'something_new_from_upstream' });
+  const oddText = oddReason.reasons.join(' ');
+  assert.match(oddText, /terminal_reason=unrecognized/);
+  assert.ok(!oddText.includes('something_new_from_upstream'));
+});
+
+test('an unrecognized envelope shape keeps the upgrade-drift hint', () => {
+  const unknownShape = normalizeTerminal({ subtype: 'error_unknown_future_shape', is_error: true });
+  assert.equal(unknownShape.ok, false);
+  const text = unknownShape.reasons.join(' ');
+  assert.match(text, /drifting the result envelope/);
+  assert.ok(text.includes('CLAUDE_RESULT_KEYS'));
+});
+
 test('cross-shape confusion fails closed in both directions and hints the right table', () => {
   // 成功形态谎报 error_max_turns：按 error 锚判，多 5 缺 1，红。
   const successBody = normalizeTerminal({ ...realResult, subtype: 'error_max_turns' });

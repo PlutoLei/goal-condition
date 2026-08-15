@@ -144,9 +144,47 @@ function sameValue(left, right) {
   return canonicalJson(left) === canonicalJson(right);
 }
 
+// capability context 的四个必需 flag。清单在这里定义、由 launcher 引用，避免两处各写一份漂移。
+export const CLAUDE_CAPABILITY_FLAGS = Object.freeze([
+  '--source', '--auth-mode', '--auth-context-id', '--capability-state',
+]);
+
+// state 读取失败时那些精确原因（目录不是 0700、文件跟了 symlink、不是合法 UTF-8 JSON、schema 违规
+// 等 15 条）本来被调用方丢弃，只剩一句泛化的「state is missing」——操作员被告知去补一个其实存在
+// 但不安全的文件，正是本轮要消灭的那类模糊诊断（2026-08-15 并行审 Codex + DeepSeek 收敛命中）。
+// 这些原因全是无插值的字面常量，可安全回显；但通道本身要挡住调用方塞进路径或内容片段，所以按
+// 隐私不变式做字符白名单，而不是枚举闭集——枚举会在有人加第 16 条原因时静默失效。
+// 判据是「拒绝路径与结构化内容」，不是「只允许某个字符集」：后者会把本模块自己的合法原因误杀——
+// schema 违规那条写作 `schema_version/mode/source/...`，字符白名单因为里面有 `/` 直接把它吃掉，
+// 于是最常见的失败又塌回泛化诊断，而测试恰好选了条能过白名单的原因所以照样全绿
+// （2026-08-15 并行审实测命中）。这里只拦真正会泄密的形状：引号、花括号、反斜杠，以及出现在
+// 词首的 `/`、`~` 或 `../` 这类路径 token。
+const UNSAFE_REASON = /[{}"'`\\]|(?:^|\s)[~/]|\.\.\//;
+
+function safeReasons(reasons) {
+  return Array.isArray(reasons)
+    ? reasons.filter((reason) => typeof reason === 'string' && reason.length > 0
+      && !UNSAFE_REASON.test(reason))
+    : [];
+}
+
 export function evaluateClaudeCapability({
-  state, source, runtimeSurfaceDigest, environment,
+  state, source, runtimeSurfaceDigest, environment, missingFlags, stateReasons,
 }) {
+  // 「命令行少传了 flag」和「flag 都在但认证内容不合格」是两类事，前者只需补参数、后者要查认证
+  // 状态。旧实现让两者都落到下面四条与 flag 无关的泛化原因上，操作员看不出该干什么（G4）。
+  // 只接受本模块自己声明的闭集成员，调用方传进来的其他字符串一律忽略，不进诊断文本。
+  const namedFlags = Array.isArray(missingFlags)
+    ? CLAUDE_CAPABILITY_FLAGS.filter((flag) => missingFlags.includes(flag))
+    : [];
+  if (namedFlags.length > 0) {
+    return {
+      mode: 'candidate',
+      reasons: [`Claude capability flags are missing from this command: ${namedFlags.join(' ')}`],
+    };
+  }
+  const readReasons = safeReasons(stateReasons);
+  if (readReasons.length > 0) return { mode: 'candidate', reasons: [...new Set(readReasons)] };
   const reasons = [];
   if (!validSource(source)) reasons.push('current Claude source identity is invalid or unverified');
   if (!HEX64.test(runtimeSurfaceDigest ?? '')) reasons.push('current Claude runtime surface digest is invalid');

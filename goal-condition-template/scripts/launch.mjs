@@ -66,12 +66,18 @@ function usage() {
     'Usage:',
     '  node scripts/launch.mjs prepare --contract FILE --state-root PATH [--controller NAME]',
     '  node scripts/launch.mjs launch --contract FILE --state DIR --prompt-file FILE --binding-file FILE',
+    '      --source ROOT --auth-mode MODE --auth-context-id ID --capability-state FILE [--expected-manifest-digest DIGEST]',
     '  node scripts/launch.mjs resume --contract FILE --state DIR --diagnostics-file FILE --binding-file FILE [--raise-token-budget N]',
+    '      --source ROOT --auth-mode MODE --auth-context-id ID --capability-state FILE [--expected-manifest-digest DIGEST]',
     '  node scripts/launch.mjs finalize --state DIR --binding-file FILE',
     '  node scripts/launch.mjs close --state DIR',
     '  node scripts/launch.mjs readback --state DIR',
     '  node scripts/launch.mjs certify-claude-prepare --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --out CONTRACT [--expected-manifest-digest DIGEST]',
     '  node scripts/launch.mjs certify-claude-run --source ROOT --target DIR --state-root DIR --auth-mode MODE --auth-context-id ID --sentinel-sha256 DIGEST --max-turns N --contract CONTRACT --confirmed-hash DIGEST [--expected-manifest-digest DIGEST]',
+    '',
+    'launch/resume 第二行那四个 flag 是 capability gate 的输入，缺任何一个都不会静默降级——命令会',
+    '以 CLAUDE_CAPABILITY_UNCERTIFIED 停下并点名缺的是哪几个。--expected-manifest-digest 只在 source',
+    '是 immutable release 时需要。',
     '',
     'readback 是 claude 线的只读观测（transcript 活性、prompt 归因），恒 exit 0：available:false',
     '表示观测不可用，不代表 run 出事；它的结论不进任何证据通道，处置留给人工。',
@@ -201,13 +207,19 @@ async function currentClaudeEnvironment(values) {
 }
 
 async function currentClaudeCapabilityContext(values) {
-  const required = ['--source', '--auth-mode', '--auth-context-id', '--capability-state'];
-  if (required.some((flag) => typeof values[flag] !== 'string' || values[flag].length === 0)) return undefined;
+  const { readClaudeCapabilityState, CLAUDE_CAPABILITY_FLAGS } = await import('./lib/claude-capability.mjs');
+  // 缺 flag 时不再返回 undefined：把缺的是哪几个原样带下去，让 UNCERTIFIED 诊断直接指路。
+  const missingFlags = CLAUDE_CAPABILITY_FLAGS
+    .filter((flag) => typeof values[flag] !== 'string' || values[flag].length === 0);
+  if (missingFlags.length > 0) return { missingFlags };
   const identity = inspectClaudeCertificationSource(values);
-  const { readClaudeCapabilityState } = await import('./lib/claude-capability.mjs');
   const stateRead = await readClaudeCapabilityState(values['--capability-state']);
+  // state 读不出来就到此为止：verdict 已经必然 uncertified，再往下只会白 spawn 一次
+  // `claude --version`（Candidate 本就不该 spawn），而且那次 spawn 一旦自己失败，操作员看到的是
+  // CLAUDE_VERSION_UNREADABLE 而不是「state 是个 symlink」这种真实原因。原因原样带下去。
+  if (!stateRead.ok) return { stateReasons: stateRead.reasons };
   return {
-    state: stateRead.ok ? stateRead.state : undefined,
+    state: stateRead.state,
     source: identity.source,
     runtimeSurfaceDigest: identity.runtimeSurfaceDigest,
     environment: await currentClaudeEnvironment(values),
