@@ -144,9 +144,26 @@ function sameValue(left, right) {
   return canonicalJson(left) === canonicalJson(right);
 }
 
+// capability context 的四个必需 flag。清单在这里定义、由 launcher 引用，避免两处各写一份漂移。
+export const CLAUDE_CAPABILITY_FLAGS = Object.freeze([
+  '--source', '--auth-mode', '--auth-context-id', '--capability-state',
+]);
+
 export function evaluateClaudeCapability({
-  state, source, runtimeSurfaceDigest, environment,
+  state, source, runtimeSurfaceDigest, environment, missingFlags,
 }) {
+  // 「命令行少传了 flag」和「flag 都在但认证内容不合格」是两类事，前者只需补参数、后者要查认证
+  // 状态。旧实现让两者都落到下面四条与 flag 无关的泛化原因上，操作员看不出该干什么（G4）。
+  // 只接受本模块自己声明的闭集成员，调用方传进来的其他字符串一律忽略，不进诊断文本。
+  const namedFlags = Array.isArray(missingFlags)
+    ? CLAUDE_CAPABILITY_FLAGS.filter((flag) => missingFlags.includes(flag))
+    : [];
+  if (namedFlags.length > 0) {
+    return {
+      mode: 'candidate',
+      reasons: [`Claude capability flags are missing from this command: ${namedFlags.join(' ')}`],
+    };
+  }
   const reasons = [];
   if (!validSource(source)) reasons.push('current Claude source identity is invalid or unverified');
   if (!HEX64.test(runtimeSurfaceDigest ?? '')) reasons.push('current Claude runtime surface digest is invalid');
