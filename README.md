@@ -7,8 +7,10 @@
 | 步 | 做什么 | 由谁 |
 |---|---|---|
 | **边界** | 把任务砍成一张边界包：硬边界、判断标准、验收物、放层清单 | `boundary-design` |
-| **目标** | 按 runtime 编译：Claude 得到 canonical run contract；Codex 得到 GoalSession v2 的 Goal、Authority 与 Design | `goal-condition-template/` router / compiler |
-| **执行** | Claude 使用已确认 contract；Codex 只使用已授权 GoalSession v2。两者都由控制面独立终验，执行会话不能自证完成 | runtime adapter + controller |
+| **目标** | 默认编译成一段 condition，交给用户自己敲原生 `/goal`；用户显式点名高危任务时才编译成运行契约（Claude 得 canonical run contract，Codex 得 GoalSession v2 的 Goal、Authority 与 Design） | `goal-condition-template/` router / compiler |
+| **执行** | 走 condition 时由原生 goal 机制驱动与判定；走契约时 Claude 使用已确认 contract、Codex 只使用已授权 GoalSession v2，两者都由控制面独立终验，执行会话不能自证完成 | 原生 goal / runtime adapter + controller |
+
+两条路的分界是**要不要审计留痕**。日常任务走 condition：产物是一段自然语言完成条件，执行与完成判定都归还给运行时原生的 goal 机制，怎么干属于执行模型的判断空间。碰 prod、动受治理的仓这类需要留痕的任务才进契约轨，它比 condition 多三样东西：启动前的 hash 确认、baseline 快照、以及主会话独立于执行体的终验。
 
 公开仓只保存脱敏的核心协议、adapter、脚本和测试；具体项目的事实、锚点与核验来源由私有 profile 在安装时注入。
 

@@ -41,24 +41,29 @@ const ERROR_MAX_TURNS_KEYS = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
 
 // 版本闸放宽成下限之后，「新版本改了 result envelope」全靠这道直检兜底，所以诊断必须直接指路：
 // 只说「多了 N 个未知 key」的操作员不知道下一步该干什么。隐私纪律不变——只给计数，不回显 key 名。
-function driftHint(table) {
+// 只服务成功锚：error 锚改走 anchoredShapeHint 之后，这里的表名恒为 CLAUDE_RESULT_KEYS，
+// 参数化只会留下「可以配任意锚表」的错误暗示，下次有人给第三个锚复用它就重新生产张冠李戴的诊断。
+function driftHint() {
   return 'this may be a claude upgrade drifting the result envelope: '
-    + `re-check the new version's result envelope, then update ${table}`;
+    + "re-check the new version's result envelope, then update CLAUDE_RESULT_KEYS";
 }
 
-// 已锚定的 error 形态不能共用 driftHint：subtype=error_max_turns 命中的是实测 17-key 锚，此时
-// 拒收通常意味着「这一轮没干完」而不是「协议变了」。2026-08-13 真实排障里那句漂移话术把方向带偏
-// 一小时，而当天 envelope 与锚定逐 key 一致。改为回显命中的锚与判别用的闭集值，让操作员自己分辨
-// 两类事。隐私纪律不变：subtype 由分支条件恒定，terminal_reason 只回显闭集成员，其余一律折叠。
+// 已锚定的 error 形态不能共用 driftHint。2026-08-13 真实排障里那句漂移话术把方向带偏一小时，
+// 而当天 envelope 与锚定逐 key 一致——问题出在拿成功锚去判 error 形态，不是协议变了。
+// 本提示只陈述「命中的是哪个锚、判别值是什么、该对哪张表」，**不对成因下断言**：良构的
+// 「没干完」envelope 本来就能通过校验，所以走到这个分支时 key 集确实对不上，既可能是 envelope
+// 损坏也可能是 error 锚真的过期了，二者都要靠逐 key 比对才能分辨（2026-08-15 并行审 Codex 指出
+// 初版措辞把成因倒过来断言成「通常是没干完」，与代码路径相反）。
+// 隐私纪律不变：subtype 由分支条件恒定，terminal_reason 只回显闭集成员，其余一律折叠。
 const RECOGNIZED_TERMINAL_REASONS = Object.freeze(['api_error', 'completed', 'max_turns']);
 
 function anchoredShapeHint(raw) {
   const terminalReason = RECOGNIZED_TERMINAL_REASONS.includes(raw.terminal_reason)
     ? raw.terminal_reason : 'unrecognized';
   return 'the envelope declares the anchored error shape subtype=error_max_turns '
-    + `terminal_reason=${terminalReason}; compare it key-by-key against `
-    + 'CLAUDE_ERROR_MAX_TURNS_KEYS — a mismatch on this anchor usually means the run did not '
-    + 'finish, not that the protocol changed';
+    + `terminal_reason=${terminalReason}, so it was checked against CLAUDE_ERROR_MAX_TURNS_KEYS `
+    + 'and not the success anchor; compare the key set against that table before concluding '
+    + 'anything about the run';
 }
 
 export function normalizeTerminal(raw) {
@@ -74,7 +79,7 @@ export function normalizeTerminal(raw) {
     && raw.terminal_reason === 'max_turns';
   const anchor = usesMaxTurnsAnchor ? CLAUDE_ERROR_MAX_TURNS_KEYS : CLAUDE_RESULT_KEYS;
   const anchorSet = usesMaxTurnsAnchor ? ERROR_MAX_TURNS_KEYS : EXPECTED_KEYS;
-  const hint = usesMaxTurnsAnchor ? anchoredShapeHint(raw) : driftHint('CLAUDE_RESULT_KEYS');
+  const hint = usesMaxTurnsAnchor ? anchoredShapeHint(raw) : driftHint();
   const missing = anchor.filter((key) => !Object.hasOwn(raw, key));
   const unknown = Object.keys(raw).filter((key) => !anchorSet.has(key));
   const reasons = [];

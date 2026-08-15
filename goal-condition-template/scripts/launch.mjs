@@ -214,8 +214,12 @@ async function currentClaudeCapabilityContext(values) {
   if (missingFlags.length > 0) return { missingFlags };
   const identity = inspectClaudeCertificationSource(values);
   const stateRead = await readClaudeCapabilityState(values['--capability-state']);
+  // state 读不出来就到此为止：verdict 已经必然 uncertified，再往下只会白 spawn 一次
+  // `claude --version`（Candidate 本就不该 spawn），而且那次 spawn 一旦自己失败，操作员看到的是
+  // CLAUDE_VERSION_UNREADABLE 而不是「state 是个 symlink」这种真实原因。原因原样带下去。
+  if (!stateRead.ok) return { stateReasons: stateRead.reasons };
   return {
-    state: stateRead.ok ? stateRead.state : undefined,
+    state: stateRead.state,
     source: identity.source,
     runtimeSurfaceDigest: identity.runtimeSurfaceDigest,
     environment: await currentClaudeEnvironment(values),

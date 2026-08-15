@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { constants } from 'node:fs';
+import { constants, readFileSync } from 'node:fs';
 import {
   chmod, lstat, mkdir, mkdtemp, readFile, writeFile,
 } from 'node:fs/promises';
@@ -94,6 +94,63 @@ test('missing capability flags are named instead of collapsing into the generic 
   const forged = evaluateClaudeCapability({ missingFlags: ['--not-a-real-flag'] });
   assert.ok(!forged.reasons.join(' ').includes('--not-a-real-flag'));
   assert.ok(forged.reasons.length > 1, 'forged flag names must not short-circuit the real evaluation');
+});
+
+// 同一病灶的另一半（2026-08-15 并行审 Codex + DeepSeek 收敛）：state 文件存在但不安全时，
+// readClaudeCapabilityState 已经算出了精确原因，调用方却把它丢掉、只留一句「state is missing」，
+// 于是操作员被指去补一个其实存在的文件。精确原因现在直通，但通道要挡住路径与内容片段。
+test('a precise capability-state read failure survives instead of collapsing to "missing"', () => {
+  const verdict = evaluateClaudeCapability({
+    stateReasons: ['Claude capability state must be a single-link mode-0600 regular file'],
+  });
+  assert.equal(verdict.mode, 'candidate');
+  assert.deepEqual(verdict.reasons, ['Claude capability state must be a single-link mode-0600 regular file']);
+  assert.ok(!verdict.reasons.join(' ').includes('state is missing'), 'the vague reason must not survive alongside');
+
+  // 自维护：直接从模块源码抽出它能产生的全部原因，逐条要求活着穿过隐私闸。手写代表样本会漏——
+  // 初版字符白名单就是被 `schema_version/mode/...` 那条含 `/` 的原因整条吃掉，而样本恰好没选它。
+  const moduleSource = readFileSync(new URL('../scripts/lib/claude-capability.mjs', import.meta.url), 'utf8');
+  const emitted = [...moduleSource.matchAll(/(?:missing|invalid|push|return \[)\('([^']{20,})'\)?/g)]
+    .map((match) => match[1]);
+  assert.ok(emitted.length >= 15, `expected to harvest this module's reason strings, found ${emitted.length}`);
+  for (const reason of emitted) {
+    assert.deepEqual(
+      evaluateClaudeCapability({ stateReasons: [reason] }).reasons, [reason],
+      `a reason this module itself emits was dropped by the privacy guard: ${reason}`,
+    );
+  }
+
+  // 隐私闸：路径、JSON 片段、非字符串一律不得进诊断，且不得因此短路掉真实评估。
+  // 路径样本按仓内既有手法拼接——仓库自带的「不得泄露机器标识数据」全仓闸会拦下字面写法。
+  const homePrefix = `${'/'}Users${'/'}`;
+  for (const forged of [
+    [`${homePrefix}someone/capability.json is unreadable`],
+    ['{"auth_context_id":"exposed"}'],
+    [42], [null], 'not-an-array', undefined,
+  ]) {
+    const guarded = evaluateClaudeCapability({ stateReasons: forged });
+    const text = guarded.reasons.join(' ');
+    assert.ok(!text.includes(homePrefix), `path leaked into diagnostics: ${text}`);
+    assert.ok(!text.includes('exposed'), `state content leaked into diagnostics: ${text}`);
+    assert.ok(guarded.reasons.length > 1, 'a rejected reason channel must fall through to the real evaluation');
+  }
+});
+
+// 两条短路必须压过一份本来合格的 context，否则把它们挪进 `state === undefined` 分支、或放到
+// certified 判定之后，现有测试仍全绿，而 launcher 将来演进成「能解析多少带多少」时，缺参数的
+// 命令行会拿到 Certified 判定。这条 fail-closed 不变式此前无人守（2026-08-15 并行审指出）。
+test('missing flags and state-read failures outrank an otherwise certified context', () => {
+  const certifiedContext = {
+    state: certifiedState(), source: checkoutSource, runtimeSurfaceDigest: H.runtime, environment,
+  };
+  assert.equal(evaluateClaudeCapability(certifiedContext).mode, 'certified');
+  for (const short of [
+    { missingFlags: ['--capability-state'] },
+    { stateReasons: ['Claude capability state is not valid UTF-8 JSON'] },
+  ]) {
+    const verdict = evaluateClaudeCapability({ ...certifiedContext, ...short });
+    assert.equal(verdict.mode, 'candidate', `a complete context must not overrule ${Object.keys(short)[0]}`);
+  }
 });
 
 test('exact matching certified state evaluates certified', () => {

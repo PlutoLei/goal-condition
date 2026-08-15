@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { REQUIRED_CORE_FILES, PROFILE_PATH } from '../scripts/lib/installer.mjs';
+import { CLAUDE_CAPABILITY_FLAGS } from '../scripts/lib/claude-capability.mjs';
 
 const repositoryRoot = resolve(import.meta.dirname, '../..');
 const templateRoot = join(repositoryRoot, 'goal-condition-template');
@@ -94,7 +95,9 @@ test('core skill leads with the condition path and gates the contract lane behin
     '单一可度量终态', '陈述检查方式', '要紧的约束', '停止条款',
     '不写操作步骤', '只在用户显式点名时进入', '默认永不建议、永不自动升级',
     // 交付要求：编译完直接进剪贴板，且与展示的那份逐字一致——用户不该再手工框选复制。
-    'pbcopy', '逐字一致',
+    // 光有「逐字一致」这句是空头承诺：必须同时规定不经 shell 解释的传输方式与回读校验，
+    // 否则 `echo "…" | pbcopy` 会在 `$`、反引号上把字节改掉，而用户是盲粘，无人发现。
+    'pbcopy', '逐字一致', 'heredoc', 'pbpaste', 'SHA-256',
   ]) {
     assert.ok(skill.includes(term), `condition path is missing ${term}`);
   }
@@ -108,13 +111,35 @@ test('launcher usage documents the capability flags that launch and resume actua
   const launcher = read(join(templateRoot, 'scripts/launch.mjs'));
   const usageBlock = launcher.slice(launcher.indexOf('function usage()'), launcher.indexOf('export function parseArgs'));
   assert.ok(usageBlock.length > 0, 'launcher usage block not found');
-  for (const flag of [
-    '--source', '--auth-mode', '--auth-context-id', '--capability-state', '--expected-manifest-digest',
-  ]) {
-    assert.ok(usageBlock.includes(flag), `usage does not document ${flag}`);
+  // 断言必须按命令分段。整段 includes 会被 certify-claude-* 的 usage 行喂饱——那两行本来就带
+  // --source/--auth-mode/--auth-context-id/--expected-manifest-digest，于是把 launch/resume 两行的
+  // flag 删光测试照样全绿，只有 --capability-state 是它们独有的（2026-08-15 并行审变异实测）。
+  const commandRegion = (command) => {
+    const start = usageBlock.indexOf(`node scripts/launch.mjs ${command} `);
+    assert.notEqual(start, -1, `usage does not document the ${command} command`);
+    const next = usageBlock.indexOf('node scripts/launch.mjs ', start + 1);
+    return usageBlock.slice(start, next === -1 ? undefined : next);
+  };
+  for (const command of ['launch', 'resume']) {
+    const region = commandRegion(command);
+    for (const flag of [...CLAUDE_CAPABILITY_FLAGS, '--expected-manifest-digest']) {
+      assert.ok(region.includes(flag), `${command} usage does not document ${flag}`);
+    }
   }
   // 缺 flag 不静默降级这件事也要写在 usage 里：它决定操作员看到 UNCERTIFIED 时的第一反应。
   assert.ok(usageBlock.includes('CLAUDE_CAPABILITY_UNCERTIFIED'), 'usage does not state the uncertified failure mode');
+
+  // 单一真相源要机械成立：COMMANDS 的 allowed 表若漏掉某个 capability flag，parseArgs 会直接以
+  // usage 拒收该 flag，操作员既传不进去又被判为缺失，launch/resume 永久 UNCERTIFIED 且无解。
+  const commandsBlock = launcher.slice(launcher.indexOf('const COMMANDS'), launcher.indexOf('function usage()'));
+  for (const command of ['launch', 'resume']) {
+    const start = commandsBlock.indexOf(`  ${command}: {`);
+    assert.notEqual(start, -1, `COMMANDS is missing the ${command} entry`);
+    const entry = commandsBlock.slice(start, commandsBlock.indexOf('},', start));
+    for (const flag of CLAUDE_CAPABILITY_FLAGS) {
+      assert.ok(entry.includes(`'${flag}'`), `COMMANDS.${command}.allowed does not accept ${flag}`);
+    }
+  }
 });
 
 test('core skill exposes every required reference and every relative Markdown link resolves', () => {
