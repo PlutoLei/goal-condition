@@ -6,6 +6,7 @@ import test from 'node:test';
 import { compileDraft, recordConfirmation } from '../src/compiler.mjs';
 import { transitionSession } from '../src/domain.mjs';
 import {
+  attemptRuntimePrompt,
   prepareControlledAttempt as prepareAttempt,
   launchControlledAttempt as launchAttempt,
 } from '../src/execution.mjs';
@@ -52,6 +53,20 @@ async function fixture() {
 
 test.afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+test('runtime prompt distinguishes the executor terminal signal from controller certification', () => {
+  const prompt = attemptRuntimePrompt({
+    manifest: { objective: 'Verify the target.' },
+    contextPackage: { sha256: '1'.repeat(64), bytes: '{}' },
+    projectionProof: { sha256: '2'.repeat(64), bytes: '{}' },
+  });
+
+  assert.match(prompt.turn_text, /exactly one controller-started native turn/i);
+  assert.match(prompt.turn_text, /Do not call `create_goal`/);
+  assert.match(prompt.turn_text, /call `update_goal` with status `complete`/);
+  assert.match(prompt.turn_text, /Candidate signal, not Controller certification/);
+  assert.match(prompt.turn_text, /never leave the native goal `active` when ending this turn/i);
 });
 
 test('intent and exclusive root lease are durable before the live launcher is called', async () => {
