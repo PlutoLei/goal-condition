@@ -1,6 +1,7 @@
 import { execFileSync, spawn } from 'node:child_process';
 import {
-  accessSync, constants, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync,
+  accessSync, constants, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+  readlinkSync, realpathSync, rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -8,15 +9,32 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:pat
 import { completionLevel, recordEvidence } from './evidence.mjs';
 
 const OUTPUT_LIMIT = 64 * 1024;
-const DEFAULT_TIMEOUT_MS = 60_000;
+const DEFAULT_TIMEOUT_MS = 180_000;
 const PROCESS_HEADROOM = 32;
+const COMMAND_LINE_TOOLS = '/Library/Developer/CommandLineTools';
 const SYSTEM_PATH = ['/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+const OPTIONAL_TOOL_PATHS = ['/opt/homebrew/bin', '/usr/local/bin'];
+const AUXILIARY_TOOL_COMMANDS = ['codesign', 'node', 'swift'];
+const RUNTIME_PATH = [
+  ...SYSTEM_PATH,
+  ...OPTIONAL_TOOL_PATHS.filter((path) => existsSync(path)),
+];
 const SYSTEM_RUNTIME_PREFIXES = ['/System/', '/usr/lib/'];
 const SYSTEM_RUNTIME_READ_ROOTS = ['/System', '/usr/lib', '/Library/Apple'];
+const OPTIONAL_RUNTIME_READ_ROOTS = [
+  COMMAND_LINE_TOOLS,
+  '/opt/homebrew/opt/openssl@3', '/usr/local/opt/openssl@3',
+  '/opt/homebrew/etc/openssl@3', '/usr/local/etc/openssl@3',
+];
 const HOMEBREW_CELLARS = ['/opt/homebrew/Cellar', '/usr/local/Cellar'];
 const MAX_RUNTIME_OBJECTS = 128;
 const DARWIN_SHELL_SELECTOR = '/private/var/select/sh';
 const XCRUN_RUNTIME = '/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib';
+const TRUST_QUALIFICATION_RELATIVE = 'tools/codex/compute-control/qualification/local';
+const TRUST_QUALIFICATION_FILES = [
+  'component-set.candidate.json',
+  'offline-test-evidence.json',
+];
 
 function verificationError(code, message) {
   const error = new Error(message);
@@ -162,7 +180,7 @@ function runtimeAccess({ invokedPath, executable, runtimeBin }) {
   const readMetadata = new Set();
   const pending = [executable];
   const inspected = new Set();
-  const searchPath = [...new Set([runtimeBin, ...SYSTEM_PATH])].join(':');
+  const searchPath = [...new Set([runtimeBin, ...RUNTIME_PATH])].join(':');
   while (pending.length > 0) {
     if (inspected.size >= MAX_RUNTIME_OBJECTS) {
       throw verificationError('VERIFIER_RUNTIME_DEPENDENCY_LIMIT', 'verifier runtime dependency graph is too large');
@@ -187,16 +205,16 @@ function runtimeAccess({ invokedPath, executable, runtimeBin }) {
     if (selected !== null) {
       readFiles.add(selected.invokedPath);
       readFiles.add(selected.executable);
-      const commandLineTools = '/Library/Developer/CommandLineTools';
-      if (inside(commandLineTools, selected.executable)) {
+      const commandLineTool = inside(COMMAND_LINE_TOOLS, selected.executable);
+      if (commandLineTool) {
         readMetadata.add('/Library');
         readMetadata.add('/Library/Developer');
-        readRoots.add(commandLineTools);
+        readRoots.add(COMMAND_LINE_TOOLS);
       }
       if (existsSync(XCRUN_RUNTIME)) readFiles.add(XCRUN_RUNTIME);
       const selectedFramework = frameworkVersionRoot(selected.executable);
-      if (selectedFramework === null) pending.push(selected.executable);
-      else readRoots.add(selectedFramework);
+      if (selectedFramework !== null) readRoots.add(selectedFramework);
+      else if (!commandLineTool) pending.push(selected.executable);
     }
     const dependencies = machoDependencies(canonical, executable);
     if (dependencies !== null) {
@@ -215,7 +233,7 @@ function resolveExecutable(command) {
   const resolved = resolveExecutablePath(command, process.env.PATH ?? '');
   const candidate = resolved.invokedPath;
   const runtimeBin = dirname(candidate);
-  const searchPath = [...new Set([runtimeBin, ...SYSTEM_PATH])].join(':');
+  const searchPath = [...new Set([runtimeBin, ...RUNTIME_PATH])].join(':');
   const interpreters = scriptInterpreters(resolved.executable, searchPath);
   const interpreter = interpreters.at(-1);
   const selectedInterpreter = interpreter === undefined ? null : selectedDeveloperTool(interpreter.executable);
@@ -227,7 +245,7 @@ function resolveExecutable(command) {
     runtimeBin,
     launchExecutable: selectedInterpreter?.executable ?? interpreter?.executable ?? resolved.executable,
     launchArguments: interpreter === undefined ? [] : [resolved.executable],
-    runtimePath: [...new Set([runtimeBin, interpreterBin, ...SYSTEM_PATH].filter(Boolean))].join(':'),
+    runtimePath: [...new Set([runtimeBin, interpreterBin, ...RUNTIME_PATH].filter(Boolean))].join(':'),
     runtimeAccess: runtimeAccess({ ...resolved, runtimeBin }),
   };
 }
@@ -311,7 +329,18 @@ function verifierRuntimeAccess(resolved, readRoots) {
   if (existsSync(DARWIN_SHELL_SELECTOR)) {
     launcherClosures.push(resolveExecutable(DARWIN_SHELL_SELECTOR).runtimeAccess);
   }
-  return mergeRuntimeAccess(resolved.runtimeAccess, ...launcherClosures, gitMetadataAccess(readRoots));
+  const auxiliaryClosures = [];
+  for (const command of AUXILIARY_TOOL_COMMANDS) {
+    try {
+      auxiliaryClosures.push(resolveExecutable(command).runtimeAccess);
+    } catch { /* an unavailable optional tool remains unavailable inside the verifier */ }
+  }
+  return mergeRuntimeAccess(
+    resolved.runtimeAccess,
+    ...launcherClosures,
+    ...auxiliaryClosures,
+    gitMetadataAccess(readRoots),
+  );
 }
 
 function processLimit() {
@@ -327,16 +356,97 @@ function processLimit() {
   return 1024;
 }
 
-export function verifierProfile({ readRoots, runtimeAccess: access, temporaryRoot }) {
+function discoverSwiftBuildState(readRoots) {
+  const candidates = [];
+  const pending = readRoots.map((root) => ({ depth: 0, path: root }));
+  let visited = 0;
+  while (pending.length > 0) {
+    const { depth, path } = pending.shift();
+    visited += 1;
+    if (visited > 10_000) {
+      throw verificationError('VERIFIER_RUNTIME_STAGING_LIMIT', 'authorized root traversal is too large');
+    }
+    let entries;
+    try {
+      entries = readdirSync(path, { withFileTypes: true });
+    } catch { continue; }
+    const names = new Set(entries.map((entry) => entry.name));
+    if (names.has('Package.swift') && names.has('.build')) candidates.push(join(path, '.build'));
+    if (depth >= 8) continue;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || ['.build', '.git', '.venv', 'node_modules'].includes(entry.name)) continue;
+      pending.push({ depth: depth + 1, path: join(path, entry.name) });
+    }
+  }
+  if (candidates.length > 1) {
+    throw verificationError('VERIFIER_RUNTIME_STAGING_AMBIGUOUS', 'multiple Swift build states are in scope');
+  }
+  return candidates[0] ?? null;
+}
+
+function stageSwiftBuildState({ verifier, readRoots, temporaryRoot }) {
+  const mayInvokeSwift = verifier.argv.includes('pytest') || basename(verifier.argv[0]) === 'swift';
+  if (!mayInvokeSwift) return join(temporaryRoot, 'swift-build');
+  const source = discoverSwiftBuildState(readRoots);
+  const destination = join(temporaryRoot, 'swift-build');
+  if (source !== null) {
+    mkdirSync(destination);
+    for (const name of ['artifacts', 'checkouts', 'prebuilts', 'repositories', 'workspace-state.json']) {
+      const sourcePath = join(source, name);
+      if (!existsSync(sourcePath)) continue;
+      cpSync(sourcePath, join(destination, name), {
+        recursive: true,
+        verbatimSymlinks: true,
+        mode: constants.COPYFILE_FICLONE,
+      });
+    }
+  }
+  return destination;
+}
+
+function controlledWriteRoots(verifier, readRoots) {
+  if (!verifier.argv.includes('pytest')) return [];
+  return readRoots.map((root) => join(root, TRUST_QUALIFICATION_RELATIVE))
+    .filter((root) => TRUST_QUALIFICATION_FILES.every((name) => existsSync(join(root, name))));
+}
+
+function controlledWriteSnapshot(roots) {
+  return JSON.stringify(roots.map((root) => ({
+    root: realpathSync(root),
+    files: readdirSync(root).sort().map((name) => {
+      const path = join(root, name);
+      const stat = lstatSync(path);
+      if (stat.isFile()) {
+        return {
+          bytes: readFileSync(path).toString('base64'),
+          kind: 'file',
+          executable_mode: stat.mode & 0o111,
+          name,
+        };
+      }
+      if (stat.isSymbolicLink()) return { kind: 'symlink', name, target: readlinkSync(path) };
+      return { executable_mode: stat.mode & 0o111, kind: 'other', name };
+    }),
+  })));
+}
+
+export function verifierProfile({ readRoots, runtimeAccess: access, temporaryRoot, writableRoots = [] }) {
+  const canonicalTemporaryRoot = realpathSync(temporaryRoot);
   const canonicalRoots = [...new Set(readRoots.map((root) => realpathSync(root)))].sort();
   const allowedReadRoots = [...new Set([
     ...SYSTEM_RUNTIME_READ_ROOTS,
+    ...OPTIONAL_RUNTIME_READ_ROOTS.filter((root) => existsSync(root)),
+    ...OPTIONAL_RUNTIME_READ_ROOTS.filter((root) => existsSync(root)).map((root) => realpathSync(root)),
     ...access.readRoots.map((root) => realpathSync(root)),
     ...canonicalRoots,
     temporaryRoot,
+    canonicalTemporaryRoot,
   ])].sort();
   const allowedReadFiles = [...new Set(access.readFiles)].sort();
-  const allowedReadMetadata = [...new Set(access.readMetadata ?? [])].sort();
+  const allowedReadMetadata = [...new Set([
+    ...(access.readMetadata ?? []),
+    ...[...allowedReadRoots, ...allowedReadFiles].flatMap((path) => metadataAncestors(path)),
+  ])].sort();
   const readFilters = [
     ...allowedReadFiles.map((path) => `(literal ${seatbeltLiteral(path)})`),
     ...allowedReadRoots.map((root) => `(subpath ${seatbeltLiteral(root)})`),
@@ -345,8 +455,12 @@ export function verifierProfile({ readRoots, runtimeAccess: access, temporaryRoo
     '(version 1)',
     '(deny default)',
     '(deny sysctl-read)',
+    '(allow sysctl-read (sysctl-name-prefix "hw."))',
+    '(allow sysctl-read (sysctl-name-prefix "kern."))',
+    '(deny sysctl-read (sysctl-name-prefix "kern.proc"))',
     '(deny process-info*)',
     '(allow process-info-pidinfo (target self))',
+    '(allow signal (target same-sandbox))',
     '(import "dyld-support.sb")',
     '(allow process-exec)',
     '(allow process-fork)',
@@ -354,7 +468,7 @@ export function verifierProfile({ readRoots, runtimeAccess: access, temporaryRoo
     `(allow file-read-metadata file-test-existence (literal "/") (literal "/etc") (literal "/tmp") (literal "/var") ${allowedReadMetadata.map((path) => `(literal ${seatbeltLiteral(path)})`).join(' ')})`,
     '(allow file-read* file-test-existence (literal "/dev/random") (literal "/dev/urandom"))',
     '(allow file-read-data file-test-existence file-write-data (subpath "/dev/fd") (literal "/dev/null") (literal "/dev/zero"))',
-    `(allow file-write* (subpath ${seatbeltLiteral(temporaryRoot)}))`,
+    `(allow file-write* (subpath ${seatbeltLiteral(temporaryRoot)}) (subpath ${seatbeltLiteral(canonicalTemporaryRoot)}) ${writableRoots.map((root) => `(subpath ${seatbeltLiteral(realpathSync(root))})`).join(' ')})`,
   ].join('\n');
 }
 
@@ -437,8 +551,14 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
     }
     const temporaryRoot = mkdtempSync(join(tmpdir(), 'goal-condition-verifier-'));
     let resolved;
+    let swiftBuildRoot;
+    let writableRoots;
+    let writeSnapshot;
     try {
       resolved = resolveExecutable(verifier.argv[0]);
+      swiftBuildRoot = stageSwiftBuildState({ verifier, readRoots, temporaryRoot });
+      writableRoots = controlledWriteRoots(verifier, readRoots);
+      writeSnapshot = controlledWriteSnapshot(writableRoots);
     } catch (error) {
       rmSync(temporaryRoot, { recursive: true, force: true });
       resolve({
@@ -459,7 +579,12 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
       'exec "$@"',
     ].join('; ');
     const child = spawn('/usr/bin/sandbox-exec', [
-      '-p', verifierProfile({ readRoots, runtimeAccess: verifierRuntimeAccess(resolved, readRoots), temporaryRoot }),
+      '-p', verifierProfile({
+        readRoots,
+        runtimeAccess: verifierRuntimeAccess(resolved, readRoots),
+        temporaryRoot,
+        writableRoots,
+      }),
       '/bin/sh', '-c', resourceWrapper, 'goal-condition-verifier', String(subtreeProcessLimit),
       resolved.launchExecutable, ...resolved.launchArguments, ...verifier.argv.slice(1),
     ], {
@@ -470,6 +595,9 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
       env: {
         HOME: temporaryRoot,
         TMPDIR: temporaryRoot,
+        SWIFTPM_BUILD_DIR: swiftBuildRoot,
+        CLANG_MODULE_CACHE_PATH: join(temporaryRoot, 'swift-module-cache'),
+        SWIFTPM_MODULECACHE_OVERRIDE: join(temporaryRoot, 'swift-module-cache'),
         PATH: resolved.runtimePath,
         LANG: 'C',
         GIT_CONFIG_NOSYSTEM: '1',
@@ -478,6 +606,7 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
         GIT_CONFIG_KEY_0: 'core.precomposeunicode',
         GIT_CONFIG_VALUE_0: 'false',
         GIT_TERMINAL_PROMPT: '0',
+        ...(existsSync(COMMAND_LINE_TOOLS) ? { DEVELOPER_DIR: COMMAND_LINE_TOOLS } : {}),
       },
     });
     const stdout = [];
@@ -501,11 +630,22 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
       settled = true;
       clearTimeout(timer);
       if (timedOut) await waitForProcessExit(terminatedPids);
+      let finalCode = code;
+      let finalError = errorBytes;
+      try {
+        if (controlledWriteSnapshot(writableRoots) !== writeSnapshot) {
+          finalCode = null;
+          finalError = Buffer.from('VERIFIER_CONTROLLED_WRITE_DRIFT');
+        }
+      } catch {
+        finalCode = null;
+        finalError = Buffer.from('VERIFIER_CONTROLLED_WRITE_DRIFT');
+      }
       rmSync(temporaryRoot, { recursive: true, force: true });
       resolve({
-        code,
+        code: finalCode,
         stdout: bounded(stdout),
-        stderr: errorBytes ?? bounded(stderr),
+        stderr: finalError ?? bounded(stderr),
         timed_out: timedOut,
       });
     };

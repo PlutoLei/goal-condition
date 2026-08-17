@@ -97,6 +97,149 @@ test('command verifier admits read-only Git worktree metadata closure', async (t
   assert.match(result.stdout.toString(), /^false\n[0-9a-f]{40}\n$/);
 });
 
+test('command verifier admits metadata-only ancestors for a copied venv interpreter', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  const builder = '/opt/homebrew/opt/python@3.11/bin/python3.11';
+  if (!existsSync(builder)) return t.skip('Homebrew Python 3.11 is unavailable');
+  const base = mkdtempSync(join(homedir(), '.goal-condition-symlink-runtime-test-'));
+  const root = join(base, 'target');
+  mkdirSync(root);
+  execFileSync(builder, ['-m', 'venv', '--copies', join(root, '.venv')]);
+  const interpreter = join(root, '.venv', 'bin', 'python');
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: {
+      cwd: root,
+      argv: [
+        interpreter,
+        '-c',
+        'import ssl, subprocess, tempfile; tempfile.TemporaryFile().close(); subprocess.run(["git", "--version"], check=True, stdout=subprocess.DEVNULL); subprocess.run(["node", "-e", "require(\\"os\\").release()"], check=True); print("verified")',
+      ],
+    },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.equal(result.stdout.toString(), 'verified\n');
+});
+
+test('command verifier can terminate a process group that it created', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  const base = mkdtempSync(join(homedir(), '.goal-condition-signal-test-'));
+  const root = join(base, 'target');
+  const verifier = join(root, 'verify.py');
+  mkdirSync(root);
+  writeFileSync(
+    verifier,
+    '#!/usr/bin/env python3\nimport os, signal, subprocess, sys\nchild = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"], start_new_session=True)\nos.killpg(child.pid, signal.SIGTERM)\nchild.wait(timeout=1)\nprint("verified")\n',
+    { mode: 0o755 },
+  );
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: [verifier] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.equal(result.stdout.toString(), 'verified\n');
+});
+
+test('command verifier permits only byte-stable trust qualification publication', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  const base = mkdtempSync(join(homedir(), '.goal-condition-controlled-write-test-'));
+  const root = join(base, 'target');
+  const qualification = join(root, 'tools/codex/compute-control/qualification/local');
+  const verifier = join(root, 'verify.py');
+  mkdirSync(qualification, { recursive: true });
+  writeFileSync(join(qualification, 'component-set.candidate.json'), 'candidate\n');
+  writeFileSync(join(qualification, 'offline-test-evidence.json'), 'evidence\n');
+  writeFileSync(
+    verifier,
+    '#!/usr/bin/env python3\nimport os, pathlib, tempfile\nroot = pathlib.Path("tools/codex/compute-control/qualification/local")\nfor name in ("component-set.candidate.json", "offline-test-evidence.json"):\n data = (root / name).read_bytes()\n fd, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=root)\n with os.fdopen(fd, "wb") as handle: handle.write(data)\n os.replace(temporary, root / name)\nprint("verified")\n',
+    { mode: 0o755 },
+  );
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: [verifier, 'pytest'] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.equal(result.stdout.toString(), 'verified\n');
+});
+
+test('command verifier rejects controlled trust qualification byte drift', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  const base = mkdtempSync(join(homedir(), '.goal-condition-controlled-drift-test-'));
+  const root = join(base, 'target');
+  const qualification = join(root, 'tools/codex/compute-control/qualification/local');
+  const verifier = join(root, 'verify.py');
+  mkdirSync(qualification, { recursive: true });
+  writeFileSync(join(qualification, 'component-set.candidate.json'), 'candidate\n');
+  writeFileSync(join(qualification, 'offline-test-evidence.json'), 'evidence\n');
+  writeFileSync(
+    verifier,
+    '#!/usr/bin/env python3\nfrom pathlib import Path\nPath("tools/codex/compute-control/qualification/local/component-set.candidate.json").write_text("drift\\n")\n',
+    { mode: 0o755 },
+  );
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: [verifier, 'pytest'] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, null);
+  assert.equal(result.stderr.toString(), 'VERIFIER_CONTROLLED_WRITE_DRIFT');
+});
+
+test('command verifier admits the selected Command Line Tools Swift runtime', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  if (!existsSync('/Library/Developer/CommandLineTools/usr/bin/swift')) {
+    return t.skip('Command Line Tools Swift is unavailable');
+  }
+  const base = mkdtempSync(join(homedir(), '.goal-condition-swift-runtime-test-'));
+  const root = join(base, 'target');
+  mkdirSync(root);
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: ['swift', '--version'] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.match(result.stdout.toString(), /^(?:Apple )?Swift version /);
+});
+
+test('command verifier redirects Swift build state away from the read-only target', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  if (!existsSync('/Library/Developer/CommandLineTools/usr/bin/swift')) {
+    return t.skip('Command Line Tools Swift is unavailable');
+  }
+  const base = mkdtempSync(join(homedir(), '.goal-condition-swift-build-test-'));
+  const root = join(base, 'target');
+  const sources = join(root, 'Sources', 'Fixture');
+  mkdirSync(sources, { recursive: true });
+  writeFileSync(
+    join(root, 'Package.swift'),
+    '// swift-tools-version: 6.0\nimport PackageDescription\nlet package = Package(name: "Fixture", targets: [.executableTarget(name: "Fixture")])\n',
+  );
+  writeFileSync(join(sources, 'main.swift'), 'print("verified")\n');
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: ['swift', 'build', '--disable-sandbox'] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.equal(existsSync(join(root, '.build')), false);
+});
+
 test('command verifier can read authorized roots but not sibling controller or user files', async (t) => {
   if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
   const base = mkdtempSync(join(homedir(), '.goal-condition-verifier-test-'));
