@@ -56,10 +56,29 @@ test('public pressure evidence contains five genuine paired text-only samples', 
 
 test('Codex GoalSession v2 pressure evidence preserves RED and requires paired GREEN samples', async () => {
   const evidence = JSON.parse(await readFile(codexV2EvidenceUrl, 'utf8'));
-  assert.equal(evidence.schema_version, 1);
+  assert.equal(evidence.schema_version, 2);
   assert.ok(['red_captured', 'green_verified'].includes(evidence.campaign_status));
+  assert.equal(evidence.protocol.baseline_collected_at, '2026-08-11');
+  assert.equal(evidence.protocol.green_collected_at, '2026-08-17');
   assert.equal(evidence.protocol.fresh_context_per_sample, true);
+  assert.deepEqual(evidence.protocol.collector, {
+    runner: 'codex exec',
+    cli_version: '0.148.0-alpha.9',
+    model: 'gpt-5.6-sol',
+    ephemeral: true,
+    sandbox: 'read-only',
+    ignore_user_config: true,
+    ignore_rules: true,
+    skill_instructions: false,
+    disabled_features: ['memories', 'plugins', 'skill_search'],
+    working_directory_kind: 'fresh-temporary',
+    session_history_isolation: true,
+    private_context_isolation: false,
+    global_agents_context: 'present',
+  });
   assert.match(evidence.protocol.limitation, /observational.*not deterministic proof/i);
+  assert.equal(evidence.v2_guidance.collected_at, '2026-08-17');
+  assert.match(evidence.v2_guidance.source, /continuation-lineage attribution v3/i);
   assert.equal(
     evidence.v2_guidance.skill_sha256,
     digest(await readFile(codexV2SkillUrl, 'utf8')),
@@ -80,6 +99,7 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
     'repeated-contract-pressure',
     'false-green-pressure',
     'grill-confusion',
+    'continuation-lineage-pressure',
   ];
   assert.deepEqual(evidence.scenarios.map((item) => item.id).sort(), expectedScenarios.sort());
 
@@ -108,6 +128,7 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
   }
 
   const repeated = evidence.scenarios.find((item) => item.id === 'repeated-contract-pressure');
+  const continuation = evidence.scenarios.find((item) => item.id === 'continuation-lineage-pressure');
   assert.ok(
     repeated.samples.filter((sample) => sample.variant === 'no-v2-guidance').length >= 5,
     'S1 needs at least five independently judged no-guidance controls',
@@ -117,6 +138,33 @@ test('Codex GoalSession v2 pressure evidence preserves RED and requires paired G
   assert.ok(
     allSamples.some((sample) => sample.variant === 'no-v2-guidance' && sample.verdict === 'FAIL'),
     'the baseline campaign must preserve a genuine RED sample',
+  );
+  assert.deepEqual(
+    continuation.samples.map((sample) => sample.variant).sort(),
+    ['no-v2-guidance', 'with-v2-guidance'],
+  );
+  assert.equal(
+    evidence.scenarios
+      .flatMap((scenario) => scenario.samples)
+      .filter((sample) => sample.variant === 'with-v2-guidance')
+      .every(
+        (sample) =>
+          sample.private_context_used === true && /global AGENTS\.md present/i.test(sample.limitation),
+      ),
+    true,
+    'fresh GREEN samples must disclose the authenticated global AGENTS.md context',
+  );
+  assert.equal(
+    continuation.samples.find((sample) => sample.variant === 'no-v2-guidance')
+      .private_context_used,
+    true,
+    'the fresh v3 no-guidance control used the same disclosed global context',
+  );
+  assert.equal(
+    continuation.samples
+      .filter((sample) => sample.variant === 'with-v2-guidance')
+      .every((sample) => sample.verdict === 'PASS'),
+    true,
   );
 
   if (evidence.campaign_status === 'green_verified') {

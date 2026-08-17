@@ -29,7 +29,7 @@ Attempt projector 保持 v1 只读：原生 Codex objective 只承载短而稳�
 
 GoalSession v2 controller 通过 `capabilities`、`adopt`、`init`、`preview`、`confirm`、`prepare`、`launch`、`verify`、`revise`、`resume`、`finalize`、`reconcile`、`close`、`mode` 暴露闭世界控制面。`resume` 在 GoalSession 层创建新的不可变 Attempt；它不复用已经被拒绝的 candidate，也不修改共享 v1 schema。
 
-controller 不复制 app-server 执行器：live 副作用仍只经本 adapter 的 `runCodexLaunch` / `runCodexFinalize` / `runCodexClose`。v2 在同一写事务检查租约并保存 LaunchIntent；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path/device/inode，dispatch 时在一个事务内原子 claim `dispatching` 与 Session `Dispatching`，重核版本及物理身份后才调用 launcher。由于当前 app-server 的 `turn/start` 响应 ID 与持久化 readback ID 可能漂移，LaunchReceipt v2 分别绑定两者；controller 在输入中生成 256-bit correlation，并把 exact text SHA-256 与唯一持久化 ID 一起核回，fresh thread 还必须证明精确 `0→1`。只满足集合基数而输入不匹配、初始非空、首次多 turn、后续或 finalize 前后的额外 turn 都是旁路。claim 后读回不明不重发，转 `ReconciliationRequired`。完整命令与状态顺序见 [GoalSession v2 操作协议](../codex-goal-session-v2.md)。
+controller 不复制 app-server 执行器：live 副作用仍只经本 adapter 的 `runCodexLaunch` / `runCodexFinalize` / `runCodexClose`。v2 在同一写事务检查租约并保存 LaunchIntent；LaunchIntent 绑定当前 controller release digest 与 target root 的 canonical path/device/inode，dispatch 时在一个事务内原子 claim `dispatching` 与 Session `Dispatching`，重核版本及物理身份后才调用 launcher。由于当前 app-server 的 `turn/start` 响应 ID 与持久化 readback ID 可能漂移，receipt 分别绑定两者；controller 在输入中生成 256-bit correlation 并核回 exact text SHA-256。单一持久化 turn 使用 LaunchReceipt v2；产品在同一个 controller start 后自动形成多 turn 时，只有根 turn 是唯一 controller 输入、其余 turn 全部零 user-message、通知数与链长度相等，才使用 LaunchReceipt v3 绑定完整有序链。任何后续用户输入、malformed input、计数不符、重复/缺失/重排/新增 turn 都 fail closed。claim 后读回不明不重发，转 `ReconciliationRequired`。完整命令与状态顺序见 [GoalSession v2 操作协议](../codex-goal-session-v2.md)与 [continuation-lineage attribution v3 ADR](../../../docs/decisions/2026-08-17-codex-continuation-lineage-attribution-v3.md)。
 
 同一稳定 Goal 内遇到 context refresh、增加/加强 Condition 或 Authority 内边界调整时，controller 应应用 typed Design Revision、局部失效 Evidence，并创建新 Attempt；不再回到 v1 的完整 Preview/Confirm。等价 verifier 替换属于同一目标生命周期，但在独立 parity/mutation proof API 落地前保持 fail closed。只有 Authority、风险/预算或 Goal 语义变化才重新授权或建立 successor。
 
@@ -67,7 +67,7 @@ controller 被 SIGKILL 时孤儿 daemon 的归宿：app-server 走 stdio，父�
 
 `thread/start` 必须显式传 `ephemeral:false`——goal 必须挂在非 ephemeral 的 thread 上，实测 ephemeral thread 上发起 goal RPC 会被拒绝（`-32600`）。thread 就绪后由控制器调用 `thread/goal/set` 创建 goal；goal set 本身不驱动执行，必须紧接着显式调用 `turn/start {threadId, input:[{type:'text', text}]}` 才能推入真实 turn。
 
-运行期间订阅 `turn/started` 与 `turn/completed` 计 turn 边界：只要 goal 尚未达成，服务端会在一个 turn 完成后约 13ms 内自动链起下一个 turn——这是近瞬时链式，不是等 idle 窗口，adapter 不需要自实现 idle 检测。控制器额外轮询 `thread/goal/get`，配一个 wall-clock deadline（adapter 常量）；超时即终局报告。
+运行期间订阅 `turn/started` 与 `turn/completed` 计 turn 边界：只要 goal 尚未达成，服务端会在一个 turn 完成后约 13ms 内自动链起下一个 turn——这是近瞬时链式，不是等 idle 窗口，adapter 不需要自实现 idle 检测。`turn/started` 的本 Attempt 增量同时参与 v3 attribution：必须与最终持久化 continuation chain 长度逐字相等，但通知本身不能授权一个含用户输入的后续 turn。控制器额外轮询 `thread/goal/get`，配一个 wall-clock deadline（adapter 常量）；超时即终局报告。
 
 两个 turn 计数落在 `turn-counts.json`，它们是**控制器观察到的通知数**，不是服务端的权威 turn 记账：控制器拿到判定的那一拍就停止观察，此刻还在飞的 turn 只记进 `started`。goal 的 `complete` 由模型在 turn 内自标，控制器看得见它**严格早于**那个 turn 结束，所以成功路径上 `completed = started - 1` 是必然而不是漏记。这句口径写在文件自身的 `semantics` 字段里——它是操作员判断「跑了几轮」的唯一依据，字面上的「差一」不解释就会被读成「最后一轮没跑完」。
 
