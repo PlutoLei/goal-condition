@@ -3,7 +3,7 @@ import {
   accessSync, constants, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 
 import { completionLevel, recordEvidence } from './evidence.mjs';
 
@@ -15,6 +15,8 @@ const SYSTEM_RUNTIME_PREFIXES = ['/System/', '/usr/lib/'];
 const SYSTEM_RUNTIME_READ_ROOTS = ['/System', '/usr/lib', '/Library/Apple'];
 const HOMEBREW_CELLARS = ['/opt/homebrew/Cellar', '/usr/local/Cellar'];
 const MAX_RUNTIME_OBJECTS = 128;
+const DARWIN_SHELL_SELECTOR = '/private/var/select/sh';
+const XCRUN_RUNTIME = '/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib';
 
 function verificationError(code, message) {
   const error = new Error(message);
@@ -118,23 +120,46 @@ function machoDependencies(path, executable) {
     .filter(Boolean);
 }
 
-function scriptInterpreter(path, searchPath) {
+function selectedDeveloperTool(path) {
+  let output;
+  try {
+    output = execFileSync('/usr/bin/otool', ['-L', path], { encoding: 'utf8' });
+  } catch {
+    return null;
+  }
+  if (!output.includes('/usr/lib/libxcselect.dylib')) return null;
+  try {
+    const selected = execFileSync('/usr/bin/xcrun', ['--find', basename(path)], { encoding: 'utf8' }).trim();
+    if (!isAbsolute(selected) || !existsSync(selected)) return null;
+    return { invokedPath: resolve(selected), executable: realpathSync(selected) };
+  } catch {
+    return null;
+  }
+}
+
+function frameworkVersionRoot(path) {
+  const match = path.match(/^(.+\.framework\/Versions\/[^/]+)(?:\/|$)/);
+  return match?.[1] ?? null;
+}
+
+function scriptInterpreters(path, searchPath) {
   const firstLine = readFileSync(path).subarray(0, 4096).toString('utf8').split('\n', 1)[0];
-  if (!firstLine.startsWith('#!')) return null;
+  if (!firstLine.startsWith('#!')) return [];
   const words = firstLine.slice(2).trim().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return null;
+  if (words.length === 0) return [];
   if (words[0] === '/usr/bin/env') {
     const command = words[1] === '-S' ? words[2] : words.find((word, index) => index > 0 && !word.startsWith('-'));
-    if (!command) return null;
-    return resolveExecutablePath(command, searchPath);
+    if (!command) return [];
+    return [resolveExecutablePath('/usr/bin/env', searchPath), resolveExecutablePath(command, searchPath)];
   }
-  if (!isAbsolute(words[0])) return null;
-  return resolveExecutablePath(words[0], searchPath);
+  if (!isAbsolute(words[0])) return [];
+  return [resolveExecutablePath(words[0], searchPath)];
 }
 
 function runtimeAccess({ invokedPath, executable, runtimeBin }) {
   const readFiles = new Set([invokedPath, executable]);
   const readRoots = new Set();
+  const readMetadata = new Set();
   const pending = [executable];
   const inspected = new Set();
   const searchPath = [...new Set([runtimeBin, ...SYSTEM_PATH])].join(':');
@@ -146,9 +171,33 @@ function runtimeAccess({ invokedPath, executable, runtimeBin }) {
     const canonical = realpathSync(next);
     if (inspected.has(canonical) || systemRuntime(canonical)) continue;
     inspected.add(canonical);
-    const cellarRoot = cellarVersionRoot(canonical);
-    if (cellarRoot === null) readFiles.add(canonical);
-    else readRoots.add(cellarRoot);
+    const packagedRoot = cellarVersionRoot(canonical) ?? frameworkVersionRoot(canonical);
+    if (packagedRoot === null) readFiles.add(canonical);
+    else readRoots.add(packagedRoot);
+    const interpreters = scriptInterpreters(canonical, searchPath);
+    if (interpreters.length > 0) {
+      for (const interpreter of interpreters) {
+        readFiles.add(interpreter.invokedPath);
+        readFiles.add(interpreter.executable);
+        pending.push(interpreter.executable);
+      }
+      continue;
+    }
+    const selected = selectedDeveloperTool(canonical);
+    if (selected !== null) {
+      readFiles.add(selected.invokedPath);
+      readFiles.add(selected.executable);
+      const commandLineTools = '/Library/Developer/CommandLineTools';
+      if (inside(commandLineTools, selected.executable)) {
+        readMetadata.add('/Library');
+        readMetadata.add('/Library/Developer');
+        readRoots.add(commandLineTools);
+      }
+      if (existsSync(XCRUN_RUNTIME)) readFiles.add(XCRUN_RUNTIME);
+      const selectedFramework = frameworkVersionRoot(selected.executable);
+      if (selectedFramework === null) pending.push(selected.executable);
+      else readRoots.add(selectedFramework);
+    }
     const dependencies = machoDependencies(canonical, executable);
     if (dependencies !== null) {
       for (const dependency of dependencies) {
@@ -158,25 +207,111 @@ function runtimeAccess({ invokedPath, executable, runtimeBin }) {
       }
       continue;
     }
-    const interpreter = scriptInterpreter(canonical, searchPath);
-    if (interpreter !== null) {
-      readFiles.add(interpreter.invokedPath);
-      readFiles.add(interpreter.executable);
-      pending.push(interpreter.executable);
-    }
   }
-  return { readFiles: [...readFiles], readRoots: [...readRoots] };
+  return { readFiles: [...readFiles], readRoots: [...readRoots], readMetadata: [...readMetadata] };
 }
 
 function resolveExecutable(command) {
   const resolved = resolveExecutablePath(command, process.env.PATH ?? '');
   const candidate = resolved.invokedPath;
   const runtimeBin = dirname(candidate);
+  const searchPath = [...new Set([runtimeBin, ...SYSTEM_PATH])].join(':');
+  const interpreters = scriptInterpreters(resolved.executable, searchPath);
+  const interpreter = interpreters.at(-1);
+  const selectedInterpreter = interpreter === undefined ? null : selectedDeveloperTool(interpreter.executable);
+  const interpreterBin = selectedInterpreter === null
+    ? (interpreter === undefined ? null : dirname(interpreter.invokedPath))
+    : dirname(selectedInterpreter.invokedPath);
   return {
     ...resolved,
     runtimeBin,
+    launchExecutable: selectedInterpreter?.executable ?? interpreter?.executable ?? resolved.executable,
+    launchArguments: interpreter === undefined ? [] : [resolved.executable],
+    runtimePath: [...new Set([runtimeBin, interpreterBin, ...SYSTEM_PATH].filter(Boolean))].join(':'),
     runtimeAccess: runtimeAccess({ ...resolved, runtimeBin }),
   };
+}
+
+function mergeRuntimeAccess(...closures) {
+  return {
+    readFiles: [...new Set(closures.flatMap((closure) => closure.readFiles ?? []))],
+    readRoots: [...new Set(closures.flatMap((closure) => closure.readRoots ?? []))],
+    readMetadata: [...new Set(closures.flatMap((closure) => closure.readMetadata ?? []))],
+  };
+}
+
+function metadataAncestors(path) {
+  const ancestors = [];
+  let current = dirname(path);
+  while (current !== dirname(current)) {
+    ancestors.push(current);
+    current = dirname(current);
+  }
+  return ancestors;
+}
+
+function safeGitConfig(path) {
+  if (!existsSync(path)) return false;
+  const raw = readFileSync(path);
+  if (raw.byteLength > 1024 * 1024) return false;
+  const text = raw.toString('utf8');
+  return !/^\s*\[(?:include|includeIf)\b/im.test(text)
+    && !/https?:\/\/[^/\s:@]+:[^@\s]+@/i.test(text)
+    && !/\b(?:ghp_|github_pat_|sk-)[A-Za-z0-9_-]{20,}\b/.test(text)
+    && !/^\s*(?:password|token|secret)\s*=/im.test(text);
+}
+
+function gitMetadataAccess(readRoots) {
+  const readFiles = new Set();
+  const metadataRoots = new Set();
+  const readMetadata = new Set();
+  for (const root of readRoots) {
+    let gitDir;
+    let commonDir;
+    try {
+      gitDir = execFileSync('/usr/bin/git', ['-C', root, 'rev-parse', '--absolute-git-dir'], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      commonDir = execFileSync(
+        '/usr/bin/git', ['-C', root, 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+        { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] },
+      ).trim();
+    } catch {
+      continue;
+    }
+    if (!isAbsolute(gitDir) || !isAbsolute(commonDir)) continue;
+    if (existsSync(gitDir)) {
+      const canonicalGitDir = realpathSync(gitDir);
+      metadataRoots.add(canonicalGitDir);
+      metadataAncestors(canonicalGitDir).forEach((path) => readMetadata.add(path));
+    }
+    for (const name of ['objects', 'refs', 'logs', 'info']) {
+      const path = join(commonDir, name);
+      if (existsSync(path)) {
+        const canonicalPath = realpathSync(path);
+        metadataRoots.add(canonicalPath);
+        metadataAncestors(canonicalPath).forEach((ancestor) => readMetadata.add(ancestor));
+      }
+    }
+    for (const name of ['HEAD', 'packed-refs', 'shallow']) {
+      const path = join(commonDir, name);
+      if (existsSync(path)) readFiles.add(path);
+    }
+    for (const path of [join(commonDir, 'config'), join(gitDir, 'config.worktree')]) {
+      if (safeGitConfig(path)) readFiles.add(path);
+    }
+  }
+  return {
+    readFiles: [...readFiles], readRoots: [...metadataRoots], readMetadata: [...readMetadata],
+  };
+}
+
+function verifierRuntimeAccess(resolved, readRoots) {
+  const launcherClosures = [resolveExecutable('/bin/sh').runtimeAccess];
+  if (existsSync(DARWIN_SHELL_SELECTOR)) {
+    launcherClosures.push(resolveExecutable(DARWIN_SHELL_SELECTOR).runtimeAccess);
+  }
+  return mergeRuntimeAccess(resolved.runtimeAccess, ...launcherClosures, gitMetadataAccess(readRoots));
 }
 
 function processLimit() {
@@ -201,6 +336,7 @@ export function verifierProfile({ readRoots, runtimeAccess: access, temporaryRoo
     temporaryRoot,
   ])].sort();
   const allowedReadFiles = [...new Set(access.readFiles)].sort();
+  const allowedReadMetadata = [...new Set(access.readMetadata ?? [])].sort();
   const readFilters = [
     ...allowedReadFiles.map((path) => `(literal ${seatbeltLiteral(path)})`),
     ...allowedReadRoots.map((root) => `(subpath ${seatbeltLiteral(root)})`),
@@ -210,11 +346,12 @@ export function verifierProfile({ readRoots, runtimeAccess: access, temporaryRoo
     '(deny default)',
     '(deny sysctl-read)',
     '(deny process-info*)',
+    '(allow process-info-pidinfo (target self))',
     '(import "dyld-support.sb")',
     '(allow process-exec)',
     '(allow process-fork)',
     `(allow file-read* file-test-existence file-map-executable ${readFilters.join(' ')})`,
-    '(allow file-read-metadata file-test-existence (literal "/") (literal "/etc") (literal "/tmp") (literal "/var"))',
+    `(allow file-read-metadata file-test-existence (literal "/") (literal "/etc") (literal "/tmp") (literal "/var") ${allowedReadMetadata.map((path) => `(literal ${seatbeltLiteral(path)})`).join(' ')})`,
     '(allow file-read* file-test-existence (literal "/dev/random") (literal "/dev/urandom"))',
     '(allow file-read-data file-test-existence file-write-data (subpath "/dev/fd") (literal "/dev/null") (literal "/dev/zero"))',
     `(allow file-write* (subpath ${seatbeltLiteral(temporaryRoot)}))`,
@@ -322,9 +459,9 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
       'exec "$@"',
     ].join('; ');
     const child = spawn('/usr/bin/sandbox-exec', [
-      '-p', verifierProfile({ readRoots, runtimeAccess: resolved.runtimeAccess, temporaryRoot }),
+      '-p', verifierProfile({ readRoots, runtimeAccess: verifierRuntimeAccess(resolved, readRoots), temporaryRoot }),
       '/bin/sh', '-c', resourceWrapper, 'goal-condition-verifier', String(subtreeProcessLimit),
-      resolved.executable, ...verifier.argv.slice(1),
+      resolved.launchExecutable, ...resolved.launchArguments, ...verifier.argv.slice(1),
     ], {
       cwd: verifier.cwd,
       shell: false,
@@ -333,8 +470,14 @@ export function runCommandVerifier({ verifier, readRoots, timeoutMs = DEFAULT_TI
       env: {
         HOME: temporaryRoot,
         TMPDIR: temporaryRoot,
-        PATH: [...new Set([resolved.runtimeBin, ...SYSTEM_PATH])].join(':'),
+        PATH: resolved.runtimePath,
         LANG: 'C',
+        GIT_CONFIG_NOSYSTEM: '1',
+        GIT_CONFIG_GLOBAL: '/dev/null',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.precomposeunicode',
+        GIT_CONFIG_VALUE_0: 'false',
+        GIT_TERMINAL_PROMPT: '0',
       },
     });
     const stdout = [];

@@ -44,6 +44,59 @@ test('a bypass caps completion at Verified even when all verifiers pass', async 
   assert.deepEqual(result.completion.reason_codes, ['CONTROL_PLANE_BYPASS']);
 });
 
+test('command verifier admits the controller launcher shell closure for a script verifier', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  const base = mkdtempSync(join(homedir(), '.goal-condition-verifier-test-'));
+  const root = join(base, 'target');
+  const verifier = join(root, 'verify.py');
+  mkdirSync(root);
+  writeFileSync(
+    verifier,
+    '#!/usr/bin/env python3\nimport subprocess\nsubprocess.run(["git", "--version"], check=True)\nprint("verified")\n',
+    { mode: 0o755 },
+  );
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: [verifier] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.match(result.stdout.toString(), /^git version .+\nverified\n$/);
+});
+
+test('command verifier admits read-only Git worktree metadata closure', async (t) => {
+  if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
+  const base = mkdtempSync(join(homedir(), '.goal-condition-git-closure-test-'));
+  const source = join(base, 'source');
+  const root = join(base, 'target');
+  mkdirSync(source);
+  execFileSync('/usr/bin/git', ['init', '-q', source]);
+  execFileSync('/usr/bin/git', ['-C', source, 'config', 'core.precomposeunicode', 'true']);
+  const verifier = join(source, 'verify.py');
+  writeFileSync(
+    verifier,
+    '#!/usr/bin/env python3\nimport subprocess\nsubprocess.run(["git", "config", "--bool", "core.precomposeunicode"], check=True)\nsubprocess.run(["git", "rev-parse", "HEAD"], check=True)\nsubprocess.run(["git", "status", "--porcelain=v1"], check=True)\n',
+    { mode: 0o755 },
+  );
+  execFileSync('/usr/bin/git', ['-C', source, 'add', 'verify.py']);
+  execFileSync('/usr/bin/git', [
+    '-C', source, '-c', 'user.name=Goal Condition', '-c', 'user.email=goal-condition@example.invalid',
+    'commit', '-qm', 'fixture',
+  ]);
+  execFileSync('/usr/bin/git', ['-C', source, 'worktree', 'add', '-q', root]);
+  t.after(() => rmSync(base, { recursive: true, force: true }));
+
+  const result = await runCommandVerifier({
+    verifier: { cwd: root, argv: [join(root, 'verify.py')] },
+    readRoots: [root],
+  });
+
+  assert.equal(result.code, 0, result.stderr.toString());
+  assert.match(result.stdout.toString(), /^false\n[0-9a-f]{40}\n$/);
+});
+
 test('command verifier can read authorized roots but not sibling controller or user files', async (t) => {
   if (process.platform !== 'darwin') return t.skip('Seatbelt verifier isolation is macOS-specific');
   const base = mkdtempSync(join(homedir(), '.goal-condition-verifier-test-'));
