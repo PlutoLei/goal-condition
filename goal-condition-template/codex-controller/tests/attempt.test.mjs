@@ -81,7 +81,36 @@ test('LaunchReceipt rejects a primary turn that is absent from the authorized tu
   );
 });
 
-test('LaunchReceipt rejects more than one authorized native turn', () => {
+test('LaunchReceipt v3 binds an ordered native continuation lineage', () => {
+  const intent = createLaunchIntent({
+    sessionId: 'session-0001', attemptId: 'attempt-0001', designRevisionHash: HASH,
+    attemptHash: 'b'.repeat(64), contractHash: 'c'.repeat(64),
+    contextPackageHash: 'd'.repeat(64), projectionProofHash: 'e'.repeat(64),
+    workspaceDigest: 'f'.repeat(64), runId: 'run-0001',
+    controllerReleaseDigest: '9'.repeat(64),
+    targetRootIdentities: [{ path: '/work/project', device: '1', inode: '2' }],
+    nonce: '00112233445566778899aabbccddeeff', expiresAt: '2026-08-12T00:00:00.000Z',
+    key: KEY, keyId: 'controller-key-v1',
+  });
+  const receipt = createLaunchReceipt({
+    intent, threadId: 'thread-native-1', turnStartResponseId: 'turn-start-response-1',
+    turnInputSha256: '7'.repeat(64), turnId: 'turn-native-1',
+    authorizedTurnIds: ['turn-native-1', 'turn-native-2'],
+    startedAt: '2026-08-11T00:00:00.000Z',
+  });
+  assert.equal(receipt.receipt_version, 3);
+  assert.deepEqual(receipt.authorized_turn_ids, ['turn-native-1', 'turn-native-2']);
+  assert.equal(validateAttemptRecord(realizeAttempt({ intent, receipt })), true);
+  assert.throws(
+    () => validateAttemptRecord(realizeAttempt({
+      intent,
+      receipt: { ...receipt, authorized_turn_ids: ['turn-native-1'] },
+    })),
+    (error) => error.code === 'AUTHORIZED_TURNS_INVALID',
+  );
+});
+
+test('LaunchReceipt v3 rejects duplicate continuation turn ids', () => {
   const intent = createLaunchIntent({
     sessionId: 'session-0001', attemptId: 'attempt-0001', designRevisionHash: HASH,
     attemptHash: 'b'.repeat(64), contractHash: 'c'.repeat(64),
@@ -96,7 +125,7 @@ test('LaunchReceipt rejects more than one authorized native turn', () => {
     () => createLaunchReceipt({
       intent, threadId: 'thread-native-1', turnStartResponseId: 'turn-start-response-1',
       turnInputSha256: '7'.repeat(64), turnId: 'turn-native-1',
-      authorizedTurnIds: ['turn-native-1', 'turn-native-2'],
+      authorizedTurnIds: ['turn-native-1', 'turn-native-1'],
       startedAt: '2026-08-11T00:00:00.000Z',
     }),
     (error) => error.code === 'AUTHORIZED_TURNS_INVALID',

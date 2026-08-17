@@ -978,7 +978,7 @@ async function makeFakeAuthSource() {
 // `notifications` 在 turnStart 时按序发出——真实链路上 account/rateLimits/updated 与
 // turn/completed 都是在 turn 跑起来之后才到的（N-5 用例靠它）。
 function makeFakeCodexClientFactory({
-  setGoal, pollGoals = [], threadId = 't-fake', notifications = [],
+  setGoal, pollGoals = [], threadId = 't-fake', notifications = [], threadReadTurns,
 } = {}) {
   const calls = [];
   const factory = ({ onEnvelope }) => {
@@ -1029,8 +1029,9 @@ function makeFakeCodexClientFactory({
           type: 'userMessage',
           content: [{ type: 'text', text, text_elements: [] }],
         }] : [];
+        const turns = threadReadTurns?.[0] ?? [{ id: 'turn-1', status: 'completed', items }];
         const result = {
-          thread: { id: threadId, turns: [{ id: 'turn-1', status: 'completed', items }] },
+          thread: { id: threadId, turns },
         };
         emit('thread/read', params, result);
         return { result };
@@ -1151,8 +1152,38 @@ test('runCodexLaunch keeps the native objective short and readback attributes th
   assert.deepEqual(readback, {
     available: true,
     thread_id: 't-fake',
-    turns: [{ id: 'turn-1', status: 'completed', input_sha256: launched.turnInputSha256 }],
+    turns: [{
+      id: 'turn-1', status: 'completed', input_sha256: launched.turnInputSha256,
+      input_kind: 'controller',
+    }],
   });
+});
+
+test('runCodexReadback distinguishes input-free continuations from malformed user input', async () => {
+  const { stateDir, contract, binding } = await setupCodexState();
+  const authSource = await makeFakeAuthSource();
+  const { factory } = makeFakeCodexClientFactory({
+    setGoal: makeGoal('active'), pollGoals: [makeGoal('complete')],
+    threadReadTurns: [[
+      { id: 'turn-continuation', status: 'completed', items: [] },
+      {
+        id: 'turn-invalid', status: 'completed',
+        items: [
+          { type: 'userMessage', content: [{ type: 'text', text: 'one' }] },
+          { type: 'userMessage', content: [{ type: 'text', text: 'two' }] },
+        ],
+      },
+    ]],
+  });
+  await runCodexLaunch({
+    contract, stateDir, prompt: 'SHORT GOAL', binding, clientFactory: factory,
+    authSource, pollIntervalMs: 1,
+  });
+  const readback = await runCodexReadback({ stateDir, clientFactory: factory, authSource });
+  assert.deepEqual(readback.turns, [
+    { id: 'turn-continuation', status: 'completed', input_sha256: null, input_kind: 'continuation' },
+    { id: 'turn-invalid', status: 'completed', input_sha256: null, input_kind: 'invalid' },
+  ]);
 });
 
 test('runCodexLaunch omits tokenBudget from goal.set when the contract budget has no max_tokens', async () => {
@@ -1449,6 +1480,7 @@ test('runCodexLaunch: a goal completed mid-turn leaves completed = started - 1, 
   });
 
   assert.equal(result.outcome, 'candidate');
+  assert.equal(result.turnStartedCount, 1);
   assert.deepEqual(await readTurnCountsFile(stateDir), { started: 1, completed: 0 });
 
   // 文件必须自己说清四件事，否则操作员只能靠猜。
@@ -2861,6 +2893,31 @@ test('runCodexFinalize binds the persisted turn input bytes for GoalSession v2',
     expectedTurns: [{ id: 'turn-1', input_sha256: inputSha256 }],
   });
 
+  assert.equal(result.attribution.ok, true);
+  assert.equal(result.turnFence.ok, true);
+});
+
+test('runCodexFinalize accepts the exact v3 continuation lineage at both fences', async () => {
+  const { stateDir, binding, authSource } = await setupLaunchedCodexState();
+  const completeGoal = makeGoal('complete', { updatedAt: 1786000900 });
+  const sentText = 'controller turn\n\nController Turn Correlation: ' + '7'.repeat(64);
+  const inputSha256 = createHash('sha256').update(sentText, 'utf8').digest('hex');
+  const root = {
+    id: 'turn-root', status: 'completed',
+    items: [{ type: 'userMessage', content: [{ type: 'text', text: sentText, text_elements: [] }] }],
+  };
+  const continuation = { id: 'turn-continuation', status: 'interrupted', items: [] };
+  const { factory } = makeFakeCodexSessionFactory({
+    setGoal: completeGoal, readbackGoal: completeGoal,
+    threadReadTurns: [[root, continuation], [root, continuation]],
+  });
+  const result = await runCodexFinalize({
+    stateDir, binding, clientFactory: factory, authSource,
+    expectedTurns: [
+      { input_kind: 'controller', input_sha256: inputSha256, id: 'turn-root' },
+      { id: 'turn-continuation', input_sha256: null, input_kind: 'continuation' },
+    ],
+  });
   assert.equal(result.attribution.ok, true);
   assert.equal(result.turnFence.ok, true);
 });

@@ -130,15 +130,17 @@ export function createLaunchReceipt({
   }
   requireHash(turnInputSha256, 'turnInputSha256');
   if (!Array.isArray(authorizedTurnIds)
-    || authorizedTurnIds.length !== 1
-    || authorizedTurnIds[0] !== turnId) {
+    || authorizedTurnIds.length === 0
+    || authorizedTurnIds[0] !== turnId
+    || authorizedTurnIds.some((id) => typeof id !== 'string' || id.length === 0)
+    || new Set(authorizedTurnIds).size !== authorizedTurnIds.length) {
     throw attemptError(
       'AUTHORIZED_TURNS_INVALID',
-      'a receipt must authorize exactly the primary persisted native turn',
+      'a receipt must authorize a unique ordered lineage rooted at the primary persisted native turn',
     );
   }
   return {
-    receipt_version: 2,
+    receipt_version: authorizedTurnIds.length === 1 ? 2 : 3,
     session_id: intent.session_id,
     attempt_id: intent.attempt_id,
     run_id: intent.run_id,
@@ -193,7 +195,7 @@ export function validateAttemptRecord(attempt) {
     throw attemptError('ATTEMPT_STATUS_INVALID', 'attempt status is invalid');
   }
   exactFields(attempt.launch_receipt, RECEIPT_FIELDS, 'launch_receipt');
-  if (attempt.launch_receipt.receipt_version !== 2) {
+  if (![2, 3].includes(attempt.launch_receipt.receipt_version)) {
     throw attemptError('LAUNCH_RECEIPT_VERSION_INVALID', 'launch receipt version is invalid');
   }
   for (const field of ['thread_id', 'turn_start_response_id', 'turn_id']) {
@@ -205,8 +207,12 @@ export function validateAttemptRecord(attempt) {
   requireHash(attempt.launch_receipt.turn_input_sha256, 'turn_input_sha256');
   const authorized = attempt.launch_receipt.authorized_turn_ids;
   if (!Array.isArray(authorized)
-    || authorized.length !== 1
-    || authorized[0] !== attempt.launch_receipt.turn_id) {
+    || authorized.length === 0
+    || authorized[0] !== attempt.launch_receipt.turn_id
+    || authorized.some((id) => typeof id !== 'string' || id.length === 0)
+    || new Set(authorized).size !== authorized.length
+    || (attempt.launch_receipt.receipt_version === 2 && authorized.length !== 1)
+    || (attempt.launch_receipt.receipt_version === 3 && authorized.length < 2)) {
     throw attemptError('AUTHORIZED_TURNS_INVALID', 'launch receipt authorized turns are invalid');
   }
   if (!Array.isArray(attempt.bypasses)) throw attemptError('ATTEMPT_BYPASSES_INVALID', 'bypasses must be an array');

@@ -189,12 +189,20 @@ test('audit schemas are closed-world and pin the public versions', async () => {
   assert.equal(sessionSchema.$defs.condition.additionalProperties, false);
   assert.equal(sessionSchema.$defs.authority.additionalProperties, false);
   assert.equal(sessionSchema.$defs.contextDependency.additionalProperties, false);
-  assert.equal(sessionSchema.$defs.launchReceipt.properties.receipt_version.const, 2);
+  assert.deepEqual(sessionSchema.$defs.launchReceipt.properties.receipt_version.enum, [2, 3]);
   assert.ok(sessionSchema.$defs.launchReceipt.required.includes('turn_start_response_id'));
   assert.ok(sessionSchema.$defs.launchReceipt.required.includes('turn_input_sha256'));
   assert.ok(sessionSchema.$defs.launchReceipt.required.includes('authorized_turn_ids'));
   assert.equal(sessionSchema.$defs.launchReceipt.properties.authorized_turn_ids.minItems, 1);
-  assert.equal(sessionSchema.$defs.launchReceipt.properties.authorized_turn_ids.maxItems, 1);
+  assert.equal(sessionSchema.$defs.launchReceipt.properties.authorized_turn_ids.maxItems, undefined);
+  assert.equal(
+    sessionSchema.$defs.launchReceipt.allOf[0].then.properties.authorized_turn_ids.maxItems,
+    1,
+  );
+  assert.equal(
+    sessionSchema.$defs.launchReceipt.allOf[1].then.properties.authorized_turn_ids.minItems,
+    2,
+  );
   assert.equal(operationSchema.$id, 'https://goal-condition.dev/schema/codex/revision-operation-v1.schema.json');
   assert.equal(operationSchema.$defs.operationBase.additionalProperties, false);
   assert.deepEqual(operationSchema.$defs.operationType.enum, [

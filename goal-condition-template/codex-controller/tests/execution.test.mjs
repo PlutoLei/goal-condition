@@ -146,6 +146,102 @@ test('a fresh-thread 0-to-1 fence binds the persisted turn when start response i
   store.close();
 });
 
+test('one controller start may authorize an ordered input-free native continuation lineage', async () => {
+  const { store, session } = await fixture();
+  const prepared = prepareControlledAttempt({
+    store, sessionId: session.session_id, attemptId: 'attempt-lineage-v3',
+    workspaceDigest: 'b'.repeat(64), runId: 'run-lineage-v3',
+    expiresAt: '2099-08-11T01:00:00.000Z', nonce: '00112233445566778899aabbccddeeff',
+    capabilityReport: { launchable: true },
+  });
+  const result = await launchControlledAttempt({
+    store,
+    prepared,
+    launch: async () => ({
+      outcome: 'candidate', threadId: 'thread-1',
+      turnId: 'turn-start-response-v8', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH, turnStartedCount: 3,
+      candidate: { status: 'ready_for_postflight', remaining_work: false },
+    }),
+    readback: async () => ({
+      available: true, thread_id: 'thread-1',
+      turns: [
+        { id: 'turn-root', input_sha256: TURN_INPUT_HASH, input_kind: 'controller' },
+        { id: 'turn-continuation-1', input_sha256: null, input_kind: 'continuation' },
+        { id: 'turn-continuation-2', input_sha256: null, input_kind: 'continuation' },
+      ],
+    }),
+    now: '2026-08-11T00:01:00.000Z',
+  });
+  assert.equal(result.disposition, 'candidate');
+  assert.equal(result.receipt.receipt_version, 3);
+  assert.equal(result.receipt.turn_id, 'turn-root');
+  assert.deepEqual(result.receipt.authorized_turn_ids, [
+    'turn-root', 'turn-continuation-1', 'turn-continuation-2',
+  ]);
+  store.close();
+});
+
+test('a second user-authored turn is not a native continuation lineage', async () => {
+  const { store, session } = await fixture();
+  const prepared = prepareControlledAttempt({
+    store, sessionId: session.session_id, attemptId: 'attempt-external-second-turn',
+    workspaceDigest: 'b'.repeat(64), runId: 'run-external-second-turn',
+    expiresAt: '2099-08-11T01:00:00.000Z', nonce: '00112233445566778899aabbccddeeff',
+    capabilityReport: { launchable: true },
+  });
+  const result = await launchControlledAttempt({
+    store,
+    prepared,
+    launch: async () => ({
+      outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-response', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH, turnStartedCount: 2,
+      candidate: { status: 'ready_for_postflight', remaining_work: false },
+    }),
+    readback: async () => ({
+      available: true, thread_id: 'thread-1',
+      turns: [
+        { id: 'turn-root', input_sha256: TURN_INPUT_HASH, input_kind: 'controller' },
+        { id: 'turn-external', input_sha256: '8'.repeat(64), input_kind: 'controller' },
+      ],
+    }),
+    now: '2026-08-11T00:01:00.000Z',
+  });
+  assert.equal(result.disposition, 'control_plane_bypass');
+  assert.equal(result.receipt, undefined);
+  store.close();
+});
+
+test('continuation lineage rejects a notification-to-persisted-turn count mismatch', async () => {
+  const { store, session } = await fixture();
+  const prepared = prepareControlledAttempt({
+    store, sessionId: session.session_id, attemptId: 'attempt-lineage-count-mismatch',
+    workspaceDigest: 'b'.repeat(64), runId: 'run-lineage-count-mismatch',
+    expiresAt: '2099-08-11T01:00:00.000Z', nonce: '00112233445566778899aabbccddeeff',
+    capabilityReport: { launchable: true },
+  });
+  const result = await launchControlledAttempt({
+    store,
+    prepared,
+    launch: async () => ({
+      outcome: 'candidate', threadId: 'thread-1', turnId: 'turn-response', initialTurnIds: [],
+      turnInputSha256: TURN_INPUT_HASH, turnStartedCount: 3,
+      candidate: { status: 'ready_for_postflight', remaining_work: false },
+    }),
+    readback: async () => ({
+      available: true, thread_id: 'thread-1',
+      turns: [
+        { id: 'turn-root', input_sha256: TURN_INPUT_HASH, input_kind: 'controller' },
+        { id: 'turn-continuation', input_sha256: null, input_kind: 'continuation' },
+      ],
+    }),
+    now: '2026-08-11T00:01:00.000Z',
+  });
+  assert.equal(result.disposition, 'control_plane_bypass');
+  assert.equal(result.receipt, undefined);
+  store.close();
+});
+
 test('a lone persisted turn with different input bytes is a control-plane bypass', async () => {
   const { store, session } = await fixture();
   const prepared = prepareControlledAttempt({

@@ -44,6 +44,17 @@ function validCanaryReceipt(receipt) {
       .every((field) => typeof receipt[field] === 'string' && HASH.test(receipt[field]));
 }
 
+function validLaunchReceiptLineage(receipt) {
+  const ids = receipt?.authorized_turn_ids;
+  return Array.isArray(ids)
+    && ids.length > 0
+    && ids[0] === receipt?.turn_id
+    && ids.every((id) => typeof id === 'string' && id.length > 0)
+    && new Set(ids).size === ids.length
+    && ((receipt?.receipt_version === 2 && ids.length === 1)
+      || (receipt?.receipt_version === 3 && ids.length > 1));
+}
+
 export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
   const session = exported?.session;
   const events = exported?.events;
@@ -76,9 +87,7 @@ export function certifyRolloutCanary(exported, { releaseManifestDigest } = {}) {
     && receipt?.attempt_id === attempt?.attempt_id
     && receipt?.run_id === attempt?.run_id
     && HASH.test(receipt?.turn_input_sha256 ?? '')
-    && Array.isArray(receipt?.authorized_turn_ids)
-    && receipt.authorized_turn_ids.length === 1
-    && receipt.authorized_turn_ids[0] === receipt.turn_id
+    && validLaunchReceiptLineage(receipt)
     && conditionIds.size === finalDesign.conditions.length
     && [...conditionIds].every((id) => evidenceIds.has(id))
     && certification?.event_type === 'GOAL_SESSION_CERTIFIED'

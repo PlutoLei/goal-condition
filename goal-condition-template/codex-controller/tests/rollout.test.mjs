@@ -75,6 +75,15 @@ test('rollout cannot skip recovery gates', () => {
   );
 });
 
+test('a certified canary may carry a v3 native continuation lineage receipt', () => {
+  const exported = certifiedCanaryExport();
+  const receipt = exported.session.attempts.at(-1).launch_receipt;
+  receipt.receipt_version = 3;
+  receipt.authorized_turn_ids = ['turn-canary', 'turn-continuation'];
+  const promotion = certifyRolloutCanary(exported, { releaseManifestDigest: RELEASE_DIGEST });
+  assert.equal(promotion.receipt_version, 2);
+});
+
 test('default rollout is bound to one live certified dynamic-revision canary receipt', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'goal-condition-rollout-canary-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));

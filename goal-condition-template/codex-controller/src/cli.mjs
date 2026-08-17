@@ -781,10 +781,16 @@ async function finalize(flags) {
     const result = await runCodexFinalize({
       stateDir: runtime.stateDir,
       binding: runtime.binding,
-      expectedTurns: [{
-        id: attempt.launch_receipt.turn_id,
-        input_sha256: attempt.launch_receipt.turn_input_sha256,
-      }],
+      expectedTurns: attempt.launch_receipt.receipt_version === 3
+        ? attempt.launch_receipt.authorized_turn_ids.map((id, index) => (index === 0 ? {
+          id,
+          input_sha256: attempt.launch_receipt.turn_input_sha256,
+          input_kind: 'controller',
+        } : { id, input_sha256: null, input_kind: 'continuation' }))
+        : [{
+          id: attempt.launch_receipt.turn_id,
+          input_sha256: attempt.launch_receipt.turn_input_sha256,
+        }],
     });
     if (result.attribution.ok !== true) {
       let next = structuredClone(session);

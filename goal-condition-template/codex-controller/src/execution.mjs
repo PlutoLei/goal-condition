@@ -179,7 +179,15 @@ export async function launchControlledAttempt({
   const turns = Array.isArray(native?.turns) ? native.turns : [];
   const persistedTurnId = turns[0]?.id;
   const persistedTurnInputSha256 = turns[0]?.input_sha256;
-  const authorizedTurnIds = [persistedTurnId];
+  const authorizedTurnIds = turns.map((turn) => turn?.id);
+  const uniqueTurnIds = authorizedTurnIds.every((id) => typeof id === 'string' && id.length > 0)
+    && new Set(authorizedTurnIds).size === authorizedTurnIds.length;
+  const continuationLineage = turns.length > 1
+    && Number.isSafeInteger(runtime?.turnStartedCount)
+    && runtime.turnStartedCount === turns.length
+    && turns[0]?.input_kind === 'controller'
+    && turns.slice(1).every((turn) => turn?.input_kind === 'continuation'
+      && turn?.input_sha256 === null);
   if (native?.available !== true
     || native.thread_id !== runtime.threadId
     || typeof runtime?.turnId !== 'string'
@@ -188,9 +196,9 @@ export async function launchControlledAttempt({
     || !HASH.test(runtime.turnInputSha256)
     || !Array.isArray(runtime.initialTurnIds)
     || runtime.initialTurnIds.length !== 0
-    || turns.length !== 1
-    || typeof persistedTurnId !== 'string'
-    || persistedTurnId.length === 0
+    || turns.length === 0
+    || !uniqueTurnIds
+    || (turns.length > 1 && !continuationLineage)
     || persistedTurnInputSha256 !== runtime.turnInputSha256) {
     return reconcileAmbiguous({ store, prepared, readback: async () => native });
   }

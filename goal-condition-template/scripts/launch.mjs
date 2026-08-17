@@ -35,23 +35,28 @@ function sha256Text(text) {
   return createHash('sha256').update(text, 'utf8').digest('hex');
 }
 
-function nativeTurnInputSha256(turn) {
+function classifyNativeTurnInput(turn) {
   const userMessages = Array.isArray(turn?.items)
     ? turn.items.filter((item) => item?.type === 'userMessage') : [];
+  if (userMessages.length === 0) {
+    return { input_sha256: null, input_kind: 'continuation' };
+  }
   const content = userMessages[0]?.content;
   if (userMessages.length !== 1
     || !Array.isArray(content)
     || content.length !== 1
     || content[0]?.type !== 'text'
-    || typeof content[0]?.text !== 'string') return null;
-  return sha256Text(content[0].text);
+    || typeof content[0]?.text !== 'string') {
+    return { input_sha256: null, input_kind: 'invalid' };
+  }
+  return { input_sha256: sha256Text(content[0].text), input_kind: 'controller' };
 }
 
 function summarizeNativeTurn(turn) {
   return {
     id: turn?.id,
     status: turn?.status ?? null,
-    input_sha256: nativeTurnInputSha256(turn),
+    ...classifyNativeTurnInput(turn),
   };
 }
 
@@ -1348,7 +1353,13 @@ export async function runCodexLaunch({
         turnCap: effectiveCap(MAX_TURNS_PER_ATTEMPT, contract, 'max_turns'),
         tokenCap: effectiveCap(MAX_TOKENS_PER_ATTEMPT, contract, 'max_tokens'),
       });
-      return { ...terminal, turnId, initialTurnIds, turnInputSha256 };
+      return {
+        ...terminal,
+        turnId,
+        initialTurnIds,
+        turnInputSha256,
+        turnStartedCount: turnCounts.started - turnsBaseline,
+      };
     });
   } catch (error) {
     if (error instanceof AttemptClaimError) throw error;
@@ -1515,22 +1526,34 @@ export async function runCodexResume({
 // 产物是两份 controller-owned 证据文件，字段与 workflow.mjs 的闭世界形状逐字对齐；归因不过就把
 // 两份都写成 ok:false + 安全 reasons（fail-closed：主会话再喂 nextAction 自然被拒，而不是缺文件）。
 function verifyNativeTurnFence(envelope, threadId, expectedTurnIds, expectedTurns) {
-  const v2 = expectedTurns !== undefined;
-  const normalizedExpected = v2 ? expectedTurns : expectedTurnIds;
+  const structured = expectedTurns !== undefined;
+  const normalizedExpected = structured ? expectedTurns : expectedTurnIds;
+  const exactKeys = (value, keys) => {
+    const observed = Object.keys(value ?? {}).sort();
+    return observed.length === keys.length && observed.every((key, index) => key === keys[index]);
+  };
+  const v2 = structured
+    && normalizedExpected?.length === 1
+    && normalizedExpected.every((turn) => exactKeys(turn, ['id', 'input_sha256'])
+      && typeof turn.id === 'string'
+      && turn.id.length > 0
+      && typeof turn.input_sha256 === 'string'
+      && SHA256.test(turn.input_sha256));
+  const v3 = structured
+    && normalizedExpected?.length > 1
+    && normalizedExpected.every((turn, index) => exactKeys(turn, ['id', 'input_kind', 'input_sha256'])
+      && typeof turn.id === 'string'
+      && turn.id.length > 0
+      && (index === 0
+        ? turn.input_kind === 'controller'
+          && typeof turn.input_sha256 === 'string'
+          && SHA256.test(turn.input_sha256)
+        : turn.input_kind === 'continuation' && turn.input_sha256 === null))
+    && new Set(normalizedExpected.map((turn) => turn.id)).size === normalizedExpected.length;
   if (!Array.isArray(normalizedExpected)
     || normalizedExpected.length === 0
-    || (v2 && normalizedExpected.length !== 1)
-    || (v2 && normalizedExpected.some((turn) => {
-      const keys = Object.keys(turn ?? {}).sort();
-      return keys.length !== 2
-        || keys[0] !== 'id'
-        || keys[1] !== 'input_sha256'
-        || typeof turn.id !== 'string'
-        || turn.id.length === 0
-        || typeof turn.input_sha256 !== 'string'
-        || !SHA256.test(turn.input_sha256);
-    }))
-    || (!v2 && (new Set(normalizedExpected).size !== normalizedExpected.length
+    || (structured && !v2 && !v3)
+    || (!structured && (new Set(normalizedExpected).size !== normalizedExpected.length
       || normalizedExpected.some((id) => typeof id !== 'string' || id.length === 0)))) {
     return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_INVALID'] };
   }
@@ -1545,16 +1568,22 @@ function verifyNativeTurnFence(envelope, threadId, expectedTurnIds, expectedTurn
     || (v2 && observedTurns.some((turn) => !SHA256.test(turn.input_sha256 ?? '')))) {
     return { ok: false, reason_codes: ['FINALIZE_NATIVE_TURN_HISTORY_INVALID'] };
   }
-  const expected = new Set(v2
-    ? normalizedExpected.map((turn) => `${turn.id}:${turn.input_sha256}`)
-    : normalizedExpected);
-  const observedKeys = v2
-    ? observedTurns.map((turn) => `${turn.id}:${turn.input_sha256}`)
+  const expectedKeys = structured
+    ? normalizedExpected.map((turn) => JSON.stringify(v3 ? {
+      id: turn.id, input_sha256: turn.input_sha256, input_kind: turn.input_kind,
+    } : { id: turn.id, input_sha256: turn.input_sha256 }))
+    : normalizedExpected;
+  const expected = new Set(expectedKeys);
+  const observedKeys = structured
+    ? observedTurns.map((turn) => JSON.stringify(v3 ? {
+      id: turn.id, input_sha256: turn.input_sha256, input_kind: turn.input_kind,
+    } : { id: turn.id, input_sha256: turn.input_sha256 }))
     : observed;
   if (observedKeys.some((key) => !expected.has(key))) {
     return { ok: false, reason_codes: ['UNRECEIPTED_NATIVE_TURN'] };
   }
-  if ([...expected].some((key) => !observedKeys.includes(key))) {
+  if (expectedKeys.length !== observedKeys.length
+    || expectedKeys.some((key, index) => observedKeys[index] !== key)) {
     return { ok: false, reason_codes: ['FINALIZE_TURN_RECEIPT_MISMATCH'] };
   }
   return { ok: true, reason_codes: [] };
