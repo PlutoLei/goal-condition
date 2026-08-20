@@ -231,6 +231,49 @@ test('blocked provider result preserves an existing receipt and is never candida
   assert.equal(publications, 0);
 });
 
+// runId 同时进 receipt 的 run_identity 与 state 目录路径，所以判据必须与 receipt 侧同一条、
+// 且在任何副作用之前判——宽的那处放行、窄的那处在整轮 canary 跑完之后才抛，是最贵的失败形态
+// （2026-08-20 并行审实测 `-foo` 正是这个形态）。同时：失败出口必须回传 run_id，否则本轮证据
+// 躺在一个随机名目录里、从未出现在任何输出中。
+test('an unusable run id fails before any lane runs, and rejections still name the run', async () => {
+  const compiled = compile();
+  const lanes = () => {
+    let touched = 0;
+    return {
+      calls: () => touched,
+      deps: {
+        captureBaseline: async () => ({ snapshot: { baseline: true }, digest: baselineDigest }),
+        runControlLane: async () => { touched += 1; return { denied: true }; },
+        runAdapterLane: async () => { touched += 1; },
+      },
+    };
+  };
+  for (const badRunId of ['-leading-dash', '', 'has/slash', null, undefined, 42]) {
+    const lane = lanes();
+    await assert.rejects(
+      () => runClaudeCertification({
+        compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+        dependencies: { ...lane.deps, runId: () => badRunId },
+      }),
+      (error) => error.code === 'CLAUDE_CERTIFICATION_RUN_ID_INVALID',
+      `run id ${JSON.stringify(badRunId)} must be rejected`,
+    );
+    assert.equal(lane.calls(), 0, 'no lane may run before the run id is validated');
+  }
+  // 非 certified 出口带 run_id：否则操作员找不到本轮的 state 目录取证。
+  const lane = lanes();
+  const rejectedResult = await runClaudeCertification({
+    compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+    dependencies: {
+      ...lane.deps,
+      runControlLane: async () => ({ denied: false }),
+      runId: () => 'cert-run-reject',
+    },
+  });
+  assert.equal(rejectedResult.published, false);
+  assert.equal(rejectedResult.run_id, 'cert-run-reject');
+});
+
 test('all-green fake lanes publish one Certified state bound to five evidence hashes', async () => {
   const compiled = compile();
   let published;

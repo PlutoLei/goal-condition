@@ -11,7 +11,12 @@ import { canonicalJson } from './contract.mjs';
 const HEX64 = /^[0-9a-f]{64}$/;
 const GIT_COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
-const OPAQUE_ID = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/;
+// 不透明标识符的唯一判据：首字符必须是字母数字（排除以 `-`/`.` 开头这类会被下游拒绝或被当成
+// 命令行 flag 的形态），总长有上限。导出供 certification 复用——runId 既要进 receipt 的
+// run_identity 又要进 state 目录路径，两处各写一套判据必然漂移：宽的那处放行、窄的那处在整轮
+// canary 跑完之后才抛（2026-08-20 并行审实测：`-foo` 过得了路径闸、过不了 receipt 闸）。
+export const CLAUDE_OPAQUE_ID = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/;
+const OPAQUE_ID = CLAUDE_OPAQUE_ID;
 const AUTH_MODES = Object.freeze(['claude_ai', 'api_key']);
 
 const STATE_FIELDS = Object.freeze([

@@ -157,8 +157,11 @@ test('certification derives a per-run state directory instead of reusing the pre
     'the certification state directory must be scoped by run id');
   // 末段必须仍是 contract hash：runners/claude.mjs 用 basename(stateDir) 与 binding.contractHash
   // 交叉校验，把 run 维度加在末段会让每次 launch 直接判不匹配。
-  assert.match(args, /contractHash:\s*runtimeContractHash/,
-    'the state directory basename must stay the contract hash');
+  // 必须锚定整个属性值，不能只做子串匹配：`contractHash: runtimeContractHash + '-' + runId` 能通过
+  // 子串版断言，而它正是紧邻注释声称要钉死的那条变异——真跑时 basename 变成 `<hash>-<uuid>`，
+  // runners/claude.mjs 的 binding 交叉校验必然命中，认证永久不可用而单测全绿（2026-08-20 并行审实测）。
+  assert.match(args, /contractHash:\s*runtimeContractHash\s*,/,
+    'the state directory basename must stay exactly the contract hash');
   // runId 进了路径，就必须挡住路径穿越——它可由 dependencies.runId 注入。
   assert.match(source, /RUN_ID_INVALID/, 'the run id used in a path must be validated');
 });
