@@ -348,7 +348,9 @@ async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
   // candidate_rejected（2026-08-14 实战两次必败，归档目录后立刻通过；信任根台账「认证操作坑」）。
   // 目录末段仍须是 contract hash——runners/claude.mjs 拿 basename(stateDir) 与 binding.contractHash
   // 做交叉校验——所以 run 维度只能加在 controller 段。
-  if (!/^[A-Za-z0-9-]+$/.test(String(runId))) {
+  // 必须显式判类型：String(null) === 'null'、String(undefined) === 'undefined' 都能过正则，
+  // 于是所有 runId 为空的 run 又共用一个名叫 null 的目录——正好复现本次要修的那个残骸继承 bug。
+  if (typeof runId !== 'string' || !/^[A-Za-z0-9-]+$/.test(runId)) {
     throw new Error('CLAUDE_CERTIFICATION_RUN_ID_INVALID: run id must be a bare path-safe token');
   }
   const stateDir = stateDirFor({
