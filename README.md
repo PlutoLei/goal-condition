@@ -219,3 +219,7 @@ npm test
 ## License
 
 MIT
+
+---
+
+*by [Lei Yuxuan](https://plutolei.github.io) ([@PlutoLei](https://github.com/PlutoLei))*
