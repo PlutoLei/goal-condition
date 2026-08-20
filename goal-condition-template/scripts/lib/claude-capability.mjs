@@ -196,7 +196,14 @@ export function evaluateClaudeCapability({
   reasons.push(...validateClaudeCapabilityState(state));
   if (reasons.length > 0) return { mode: 'candidate', reasons: [...new Set(reasons)] };
   if (state.mode !== 'certified') reasons.push('Claude capability state is Candidate');
-  if (!sameValue(state.active_source, source)) reasons.push('Claude source identity differs from the certified source');
+  // 换 release 必重认证，这是 Claude 侧刻意的 fail-closed 语义（Codex rollout 那条「release-only
+  // 变化时刷新身份并保留认证」不适用于这里：认证绑定的是实际跑过 canary 的那堆字节）。诊断必须
+  // 直接说出这个出路——2026-08-14 activate 到新 release 后只核了 surface digest 相同就以为认证
+  // 存活，实际每次 launch 都会停在这一条上。
+  if (!sameValue(state.active_source, source)) {
+    reasons.push('Claude source identity differs from the certified source; certification binds the exact '
+      + 'release that ran the canary, so re-certify this one (an identical runtime surface does not carry it over)');
+  }
   if (state.runtime_surface_digest !== runtimeSurfaceDigest) reasons.push('Claude runtime surface digest drifted');
   if (!sameValue(state.environment, environment)) reasons.push('Claude environment differs from the certified environment');
 

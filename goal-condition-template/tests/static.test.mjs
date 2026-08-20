@@ -142,6 +142,27 @@ test('launcher usage documents the capability flags that launch and resume actua
   }
 });
 
+// 与上面那条 phase 断言同族：认证的 adapter lane 在单测里整个被 runAdapterLane fake 掉，
+// 离线覆盖不到它的真实调用形状，只能静态钉。这条钉的是「每次认证 run 落在自己的空目录」——
+// 旧实现只按 (state_root, contract hash) 派生，而 contract bytes 不含被认证的 release 身份，
+// 于是认证下一个 release 会带着上一轮的 thread.json / candidate.json 起跑，报出与真实原因
+// 无关的 candidate_rejected（2026-08-14 实战两次必败，归档目录后立刻通过）。
+test('certification derives a per-run state directory instead of reusing the previous run residue', () => {
+  const source = read(join(templateRoot, 'scripts/lib/claude-certification.mjs'));
+  const marker = source.indexOf('const stateDir = stateDirFor(');
+  assert.notEqual(marker, -1, 'certification no longer derives an adapter state directory');
+  const args = callArguments(source, source.indexOf('(', marker + 'const stateDir = stateDirFor'.length));
+  assert.ok(args !== null, 'unbalanced stateDirFor call in claude-certification');
+  assert.match(args, /controller:\s*`claude-certification\/\$\{runId\}`/,
+    'the certification state directory must be scoped by run id');
+  // 末段必须仍是 contract hash：runners/claude.mjs 用 basename(stateDir) 与 binding.contractHash
+  // 交叉校验，把 run 维度加在末段会让每次 launch 直接判不匹配。
+  assert.match(args, /contractHash:\s*runtimeContractHash/,
+    'the state directory basename must stay the contract hash');
+  // runId 进了路径，就必须挡住路径穿越——它可由 dependencies.runId 注入。
+  assert.match(source, /RUN_ID_INVALID/, 'the run id used in a path must be validated');
+});
+
 test('core skill exposes every required reference and every relative Markdown link resolves', () => {
   const required = [
     'references/run-contract.md',

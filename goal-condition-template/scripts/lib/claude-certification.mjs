@@ -341,9 +341,19 @@ export function interpretClaudeControlReport(report, compiled) {
 async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
   const { prepareClaude, runClaudeCertificationAttempt } = await import('./runners/claude.mjs');
   const runtimeContractHash = sha256(Buffer.from(compiled.contractBytes, 'utf8'));
+  // 认证是一次性 canary：每次 run 必须落在自己的空目录里，绝不复用上一轮的残骸。
+  // 旧实现只按 (state_root, contract hash) 派生，而 contract bytes 不含被认证的 release 身份
+  // （它在 profile 里），于是「用同一套 canary 参数认证下一个 release」直接落进上一轮用过的目录，
+  // 带着那里的 thread.json / candidate.json / hook-started-at 起跑，报出与真实原因无关的
+  // candidate_rejected（2026-08-14 实战两次必败，归档目录后立刻通过；信任根台账「认证操作坑」）。
+  // 目录末段仍须是 contract hash——runners/claude.mjs 拿 basename(stateDir) 与 binding.contractHash
+  // 做交叉校验——所以 run 维度只能加在 controller 段。
+  if (!/^[A-Za-z0-9-]+$/.test(String(runId))) {
+    throw new Error('CLAUDE_CERTIFICATION_RUN_ID_INVALID: run id must be a bare path-safe token');
+  }
   const stateDir = stateDirFor({
     stateRoot: compiled.profile.state_root,
-    controller: 'claude-certification',
+    controller: `claude-certification/${runId}`,
     contractHash: runtimeContractHash,
   });
   await prepareClaude({
