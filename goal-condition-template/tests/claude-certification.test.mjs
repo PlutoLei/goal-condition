@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
   buildClaudeCertificationReceipt,
@@ -229,6 +230,80 @@ test('blocked provider result preserves an existing receipt and is never candida
   assert.equal(result.outcome, 'blocked');
   assert.equal(result.published, false);
   assert.equal(publications, 0);
+});
+
+// runId 同时进 receipt 的 run_identity 与 state 目录路径，所以判据必须与 receipt 侧同一条、
+// 且在任何副作用之前判——宽的那处放行、窄的那处在整轮 canary 跑完之后才抛，是最贵的失败形态
+// （2026-08-20 并行审实测 `-foo` 正是这个形态）。同时：失败出口必须回传 run_id，否则本轮证据
+// 躺在一个随机名目录里、从未出现在任何输出中。
+test('an unusable run id fails before any lane runs, and rejections still name the run', async () => {
+  const compiled = compile();
+  const lanes = () => {
+    let touched = 0;
+    return {
+      calls: () => touched,
+      deps: {
+        captureBaseline: async () => ({ snapshot: { baseline: true }, digest: baselineDigest }),
+        runControlLane: async () => { touched += 1; return { denied: true }; },
+        runAdapterLane: async () => { touched += 1; },
+      },
+    };
+  };
+  for (const badRunId of ['-leading-dash', '', 'has/slash', null, undefined, 42]) {
+    const lane = lanes();
+    await assert.rejects(
+      () => runClaudeCertification({
+        compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+        dependencies: { ...lane.deps, runId: () => badRunId },
+      }),
+      (error) => error.code === 'CLAUDE_CERTIFICATION_RUN_ID_INVALID',
+      `run id ${JSON.stringify(badRunId)} must be rejected`,
+    );
+    assert.equal(lane.calls(), 0, 'no lane may run before the run id is validated');
+  }
+  // 非 certified 出口带 run_id：否则操作员找不到本轮的 state 目录取证。
+  const lane = lanes();
+  const rejectedResult = await runClaudeCertification({
+    compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+    dependencies: {
+      ...lane.deps,
+      runControlLane: async () => ({ denied: false }),
+      runId: () => 'cert-run-reject',
+    },
+  });
+  assert.equal(rejectedResult.published, false);
+  assert.equal(rejectedResult.run_id, 'cert-run-reject');
+
+  // 最后那条 condition 出口在 runId 生成之后、且离 certified 只差一步，最容易被漏——初版就漏了
+  // （2026-08-20 Codex 补审命中：新测试只覆盖了前面那条 control-denial 路径）。
+  const lateReject = await runClaudeCertification({
+    compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+    dependencies: {
+      captureBaseline: async () => ({ snapshot: { baseline: true }, digest: baselineDigest }),
+      runControlLane: async () => ({ denied: true }),
+      runAdapterLane: async () => ({
+        outcome: 'candidate',
+        candidate: { subtype: 'success', is_error: false, terminal_reason: 'completed', permission_denials: [] },
+        attemptNumber: 1,
+        hookExpected: true,
+        hookRunsDelta: 1,
+        sessionId: '11111111-1111-4111-8111-111111111111',
+      }),
+      verifySentinel: async () => ({ ok: false, observed_sha256: 'f'.repeat(64) }),
+      verifyBaseline: async () => ({ ok: true, violations: [] }),
+      runId: () => 'cert-run-late',
+    },
+  });
+  assert.equal(lateReject.published, false);
+  assert.equal(lateReject.run_id, 'cert-run-late', 'the post-adapter condition exit must also name the run');
+
+  // 结构闸：runId 生成之后的每个 published:false 出口都必须经 rejected() 构造，否则又会漏带 run_id。
+  const moduleSource = readFileSync(new URL('../scripts/lib/claude-certification.mjs', import.meta.url), 'utf8');
+  const afterRunId = moduleSource.slice(moduleSource.indexOf('const runId = makeRunId()'));
+  assert.equal(
+    (afterRunId.match(/published:\s*false/g) ?? []).length, 1,
+    'every rejection after the run id exists must go through rejected(); only its own literal may remain',
+  );
 });
 
 test('all-green fake lanes publish one Certified state bound to five evidence hashes', async () => {

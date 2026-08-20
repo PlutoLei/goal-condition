@@ -80,7 +80,10 @@ Hard Prohibition 只能是 controller schema 枚举的 capability ID，且 `rule
 Claude 普通 launch 还必须通过 machine-level Candidate/Certified capability gate。state 位于
 `<controller-state-root>/runtime-certifications/claude.json`，精确绑定已验证 source identity、Claude
 runtime-surface digest、CLI/OS/arch 与非秘密 auth context。Candidate 不得占 attempt、写 settings、claim
-session 或 spawn；不得使用 `force`/`skip`。
+session 或 spawn；不得使用 `force`/`skip`。**认证绑定的是实际跑过 canary 的那个精确 release：切到任何
+新 release 都必须重跑认证，runtime surface 逐位相同也不例外**——上面 Codex rollout 那条「release-only
+文件变化时刷新当前 release 身份并保留认证」只适用于 Codex gate，Claude 侧刻意不做等价放行。每次认证
+run 落在自己的 state 目录，不复用上一轮残骸。
 
 唯一 Candidate 豁口是固定的 `certify-claude-prepare` → 展示完整 preview 与当前 SHA-256 → 用户明确确认
 该 hash → `certify-claude-run`。hash 覆盖 source/runtime/auth/disposable roots/sentinel/budget/contract 的闭世界

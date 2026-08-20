@@ -11,7 +11,12 @@ import { canonicalJson } from './contract.mjs';
 const HEX64 = /^[0-9a-f]{64}$/;
 const GIT_COMMIT = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const VERSION = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
-const OPAQUE_ID = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/;
+// 不透明标识符的唯一判据：首字符必须是字母数字（排除以 `-`/`.` 开头这类会被下游拒绝或被当成
+// 命令行 flag 的形态），总长有上限。导出供 certification 复用——runId 既要进 receipt 的
+// run_identity 又要进 state 目录路径，两处各写一套判据必然漂移：宽的那处放行、窄的那处在整轮
+// canary 跑完之后才抛（2026-08-20 并行审实测：`-foo` 过得了路径闸、过不了 receipt 闸）。
+export const CLAUDE_OPAQUE_ID = /^[0-9A-Za-z][0-9A-Za-z._:-]{0,127}$/;
+const OPAQUE_ID = CLAUDE_OPAQUE_ID;
 const AUTH_MODES = Object.freeze(['claude_ai', 'api_key']);
 
 const STATE_FIELDS = Object.freeze([
@@ -196,7 +201,14 @@ export function evaluateClaudeCapability({
   reasons.push(...validateClaudeCapabilityState(state));
   if (reasons.length > 0) return { mode: 'candidate', reasons: [...new Set(reasons)] };
   if (state.mode !== 'certified') reasons.push('Claude capability state is Candidate');
-  if (!sameValue(state.active_source, source)) reasons.push('Claude source identity differs from the certified source');
+  // 换 release 必重认证，这是 Claude 侧刻意的 fail-closed 语义（Codex rollout 那条「release-only
+  // 变化时刷新身份并保留认证」不适用于这里：认证绑定的是实际跑过 canary 的那堆字节）。诊断必须
+  // 直接说出这个出路——2026-08-14 activate 到新 release 后只核了 surface digest 相同就以为认证
+  // 存活，实际每次 launch 都会停在这一条上。
+  if (!sameValue(state.active_source, source)) {
+    reasons.push('Claude source identity differs from the certified source; certification binds the exact '
+      + 'release that ran the canary, so re-certify this one (an identical runtime surface does not carry it over)');
+  }
   if (state.runtime_surface_digest !== runtimeSurfaceDigest) reasons.push('Claude runtime surface digest drifted');
   if (!sameValue(state.environment, environment)) reasons.push('Claude environment differs from the certified environment');
 

@@ -1,12 +1,12 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { lstat, mkdir, readFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import { canonicalJson, validateContract } from './contract.mjs';
 import {
-  CLAUDE_CANARY_CONDITIONS, publishClaudeCapabilityState, validateClaudeCapabilityState,
+  CLAUDE_CANARY_CONDITIONS, CLAUDE_OPAQUE_ID, publishClaudeCapabilityState, validateClaudeCapabilityState,
 } from './claude-capability.mjs';
 import {
   captureSnapshot, compareSnapshot, snapshotDigest,
@@ -341,11 +341,42 @@ export function interpretClaudeControlReport(report, compiled) {
 async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
   const { prepareClaude, runClaudeCertificationAttempt } = await import('./runners/claude.mjs');
   const runtimeContractHash = sha256(Buffer.from(compiled.contractBytes, 'utf8'));
+  // 认证是一次性 canary：每次 run 必须落在自己的空目录里，绝不复用上一轮的残骸。
+  // 旧实现只按 (state_root, contract hash) 派生，而 contract bytes 不含被认证的 release 身份
+  // （它在 profile 里），于是「用同一套 canary 参数认证下一个 release」直接落进上一轮用过的目录，
+  // 带着那里的 thread.json / candidate.json / hook-started-at 起跑，报出与真实原因无关的
+  // candidate_rejected（2026-08-14 实战两次必败，归档目录后立刻通过；信任根台账「认证操作坑」）。
+  // 目录末段仍须是 contract hash——runners/claude.mjs 拿 basename(stateDir) 与 binding.contractHash
+  // 做交叉校验——所以 run 维度只能加在 controller 段。
+  // runId 的合法性已在 runClaudeCertification 生成处判过（与 receipt 同一条判据）；这里只保留
+  // 路径安全的兜底，因为本函数也可被单独调用。
+  if (typeof runId !== 'string' || !CLAUDE_OPAQUE_ID.test(runId) || runId.includes('/')) {
+    throw new ClaudeCertificationError(
+      'CLAUDE_CERTIFICATION_RUN_ID_INVALID', 'run id must be an opaque path-safe identifier',
+    );
+  }
   const stateDir = stateDirFor({
     stateRoot: compiled.profile.state_root,
-    controller: 'claude-certification',
+    controller: `claude-certification/${runId}`,
     contractHash: runtimeContractHash,
   });
+  // 「每次 run 一个空目录」是本修复的全部依据，但它此前只是「相信 runId 每次都新」。runId 可注入
+  // （单测就固定成 'cert-run-1'），一旦复用，prepare 会带着上一轮的 thread.json 起跑，落回那条
+  // 与真实原因无关的 candidate_rejected——即本修复要消灭的形态。
+  // 用 mkdir 原子占坑，不用「先 lstat 再建」：后者是 TOCTOU，同 runId 的两个执行体可以都看到
+  // ENOENT 然后一起进同一个目录，产物互相覆盖；而且那种写法把 EACCES/EIO 一并吞成「不存在」，
+  // 是 fail-open（2026-08-20 Codex 补审命中，P1 + P2）。mkdir 的 EEXIST 判定由内核保证互斥，
+  // 其余错误原样抛出。
+  await mkdir(dirname(stateDir), { recursive: true });
+  try {
+    await mkdir(stateDir);
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    throw new ClaudeCertificationError(
+      'CLAUDE_CERTIFICATION_STATE_DIR_REUSED',
+      'the derived certification state directory already exists; each canary run requires a fresh one',
+    );
+  }
   await prepareClaude({
     contract: compiled.contract,
     contractPath: join(compiled.profile.state_root, 'claude-certification-contract.json'),
@@ -461,28 +492,40 @@ export async function runClaudeCertification({
       'CLAUDE_CERTIFICATION_BASELINE_INVALID', 'capture did not return a trusted lowercase SHA-256 digest',
     );
   }
+  // runId 同时进 receipt 的 run_identity 和 state 目录路径，所以判据必须与 receipt 侧同一条，
+  // 且必须在任何副作用之前判：否则宽的那处放行、窄的那处在整轮 canary 跑完、state 已落盘之后才抛
+  // （2026-08-20 并行审实测 `-foo` 正是这个形态）。dependencies.runId 可注入，故不能只信默认实现。
   const runId = makeRunId();
+  if (typeof runId !== 'string' || !CLAUDE_OPAQUE_ID.test(runId)) {
+    throw new ClaudeCertificationError(
+      'CLAUDE_CERTIFICATION_RUN_ID_INVALID',
+      'run id must be an opaque identifier that starts with an alphanumeric character',
+    );
+  }
+
+  // 每个非 certified 出口都必须回传 run_id：state 目录名现在含 runId，不报出来的话本轮证据
+  // （attempts/*-result.json、candidate.json、thread.json、hook-runs.jsonl）就躺在一个从未出现在
+  // 任何输出里的随机目录中，只能靠 ls + mtime 猜。旧实现那条确定路径正是 2026-08-14 定位根因
+  // 所依赖的东西，per-run 目录不能把这份可运维性一起换掉（2026-08-20 并行审指出）。
+  const rejected = (outcome, reasons) => ({
+    outcome, published: false, run_id: runId, reasons,
+  });
 
   let control;
   try {
     control = await runControlLane({ compiled: fixed, runId });
   } catch (error) {
     const outcome = classifyClaudeCanaryBlocker(error);
-    return { outcome, published: false, reasons: ['Claude control lane was unavailable'] };
+    return rejected(outcome, ['Claude control lane was unavailable']);
   }
   if (control?.denied !== true) {
-    return {
-      outcome: 'candidate_rejected', published: false,
-      reasons: ['ambient-deny-control did not observe the required Read denial'],
-    };
+    return rejected('candidate_rejected', ['ambient-deny-control did not observe the required Read denial']);
   }
 
   const sentinelBeforeAdapter = await assertSentinelAbsent({ compiled: fixed });
   if (sentinelBeforeAdapter?.ok !== true) {
-    return {
-      outcome: 'candidate_rejected', published: false,
-      reasons: ['sentinel-output was created by the control lane before the isolated adapter attempt'],
-    };
+    return rejected('candidate_rejected',
+      ['sentinel-output was created by the control lane before the isolated adapter attempt']);
   }
 
   let adapter;
@@ -492,11 +535,11 @@ export async function runClaudeCertification({
     });
   } catch (error) {
     const outcome = classifyClaudeCanaryBlocker(error);
-    return { outcome, published: false, reasons: ['Claude isolated adapter lane was unavailable'] };
+    return rejected(outcome, ['Claude isolated adapter lane was unavailable']);
   }
   if (adapter?.outcome !== 'candidate') {
     const outcome = classifyClaudeCanaryBlocker(adapter);
-    return { outcome, published: false, reasons: ['isolated adapter did not produce an exact candidate'] };
+    return rejected(outcome, ['isolated adapter did not produce an exact candidate']);
   }
 
   const sentinel = await verifySentinel({ compiled: fixed, adapter });
@@ -539,10 +582,7 @@ export async function runClaudeCertification({
     },
   };
   if (!exactGreenConditions(conditions)) {
-    return {
-      outcome: 'candidate_rejected', published: false,
-      reasons: CLAUDE_CANARY_CONDITIONS.filter((id) => conditions[id] !== true),
-    };
+    return rejected('candidate_rejected', CLAUDE_CANARY_CONDITIONS.filter((id) => conditions[id] !== true));
   }
 
   const certifiedAt = now();
