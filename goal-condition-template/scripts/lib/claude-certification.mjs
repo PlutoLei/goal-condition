@@ -1,7 +1,7 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, readFile } from 'node:fs/promises';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { lstat, mkdir, readFile } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 
 import { canonicalJson, validateContract } from './contract.mjs';
@@ -362,8 +362,16 @@ async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
   });
   // 「每次 run 一个空目录」是本修复的全部依据，但它此前只是「相信 runId 每次都新」。runId 可注入
   // （单测就固定成 'cert-run-1'），一旦复用，prepare 会带着上一轮的 thread.json 起跑，落回那条
-  // 与真实原因无关的 candidate_rejected——即本修复要消灭的形态。所以直接断言目录是新的。
-  if (await lstat(stateDir).then(() => true, () => false)) {
+  // 与真实原因无关的 candidate_rejected——即本修复要消灭的形态。
+  // 用 mkdir 原子占坑，不用「先 lstat 再建」：后者是 TOCTOU，同 runId 的两个执行体可以都看到
+  // ENOENT 然后一起进同一个目录，产物互相覆盖；而且那种写法把 EACCES/EIO 一并吞成「不存在」，
+  // 是 fail-open（2026-08-20 Codex 补审命中，P1 + P2）。mkdir 的 EEXIST 判定由内核保证互斥，
+  // 其余错误原样抛出。
+  await mkdir(dirname(stateDir), { recursive: true });
+  try {
+    await mkdir(stateDir);
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
     throw new ClaudeCertificationError(
       'CLAUDE_CERTIFICATION_STATE_DIR_REUSED',
       'the derived certification state directory already exists; each canary run requires a fresh one',
@@ -574,10 +582,7 @@ export async function runClaudeCertification({
     },
   };
   if (!exactGreenConditions(conditions)) {
-    return {
-      outcome: 'candidate_rejected', published: false,
-      reasons: CLAUDE_CANARY_CONDITIONS.filter((id) => conditions[id] !== true),
-    };
+    return rejected('candidate_rejected', CLAUDE_CANARY_CONDITIONS.filter((id) => conditions[id] !== true));
   }
 
   const certifiedAt = now();

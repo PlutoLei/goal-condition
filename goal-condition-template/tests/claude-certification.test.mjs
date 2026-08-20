@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 import {
   buildClaudeCertificationReceipt,
@@ -272,6 +273,37 @@ test('an unusable run id fails before any lane runs, and rejections still name t
   });
   assert.equal(rejectedResult.published, false);
   assert.equal(rejectedResult.run_id, 'cert-run-reject');
+
+  // 最后那条 condition 出口在 runId 生成之后、且离 certified 只差一步，最容易被漏——初版就漏了
+  // （2026-08-20 Codex 补审命中：新测试只覆盖了前面那条 control-denial 路径）。
+  const lateReject = await runClaudeCertification({
+    compiled, confirmedHash: compiled.hash, source, runtimeSurfaceDigest, environment,
+    dependencies: {
+      captureBaseline: async () => ({ snapshot: { baseline: true }, digest: baselineDigest }),
+      runControlLane: async () => ({ denied: true }),
+      runAdapterLane: async () => ({
+        outcome: 'candidate',
+        candidate: { subtype: 'success', is_error: false, terminal_reason: 'completed', permission_denials: [] },
+        attemptNumber: 1,
+        hookExpected: true,
+        hookRunsDelta: 1,
+        sessionId: '11111111-1111-4111-8111-111111111111',
+      }),
+      verifySentinel: async () => ({ ok: false, observed_sha256: 'f'.repeat(64) }),
+      verifyBaseline: async () => ({ ok: true, violations: [] }),
+      runId: () => 'cert-run-late',
+    },
+  });
+  assert.equal(lateReject.published, false);
+  assert.equal(lateReject.run_id, 'cert-run-late', 'the post-adapter condition exit must also name the run');
+
+  // 结构闸：runId 生成之后的每个 published:false 出口都必须经 rejected() 构造，否则又会漏带 run_id。
+  const moduleSource = readFileSync(new URL('../scripts/lib/claude-certification.mjs', import.meta.url), 'utf8');
+  const afterRunId = moduleSource.slice(moduleSource.indexOf('const runId = makeRunId()'));
+  assert.equal(
+    (afterRunId.match(/published:\s*false/g) ?? []).length, 1,
+    'every rejection after the run id exists must go through rejected(); only its own literal may remain',
+  );
 });
 
 test('all-green fake lanes publish one Certified state bound to five evidence hashes', async () => {
