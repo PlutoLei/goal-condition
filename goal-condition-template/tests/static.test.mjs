@@ -500,7 +500,7 @@ test('Claude adapter is runtime-specific and fail closed', () => {
     'terminal_reason', 'permission_denials', 'baseline_digest', 'runBinding',
     'preflightEvidence', 'postflightEvidence', 'controller-owned',
     'Stop hook', 'JSON decision', '4000', 'disableAllHooks', '--resume',
-    '21', '2.1.223', 'realpath',
+    '24', '2.1.260', '--strict-mcp-config', 'realpath',
   ]) {
     assert.ok(adapter.includes(term), `Claude adapter is missing ${term}`);
   }

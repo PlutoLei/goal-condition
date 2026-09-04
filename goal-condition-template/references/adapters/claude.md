@@ -92,12 +92,16 @@ CLI 对重复 UUID 明确拒绝（实测），预派不会静默串台。终局�
 
 这仍然不是通用 `physical` constraint 编译器：allow 是免询问授权，Controller state 的 deny 保护控制器机件，`additionalDirectories` 在 `acceptEdits` 下也不是只读沙箱；任意业务约束没有对应的 OS enforcement。因此 claude runtime 的 constraint 仍一律写 `audit_only`，实际 mutation 由独立 baseline compare 判定。确需物理保证，须先提供可 fault-inject 的 sandbox、proxy 或只读凭证，或改用有物理面的 runtime。2026-08-12 的旧 F-B1 canary 仍证明当前 CLI 的目录级 Edit/Write deny 行为，但 target-local settings deny 已被 2026-08-13 的 setting-source isolation 取代；新版 release canary 应证明 ambient project permissions 不加载、Controller flag settings 仍加载，并继续以 baseline compare 裁决 mutation。
 
-### 启动姿态里的两个权限事实
+### 启动姿态里的四个权限事实
 
 - **`--permission-mode acceptEdits`**：`launchSpec`/`resumeSpec` 固定带这个 flag。除生成的 deny 外，工作目录与 additionalDirectories 内的编辑不会逐次询问；`permissions.allow` 还会免询问批准声明的 Bash/WebFetch/Skill。无人值守需要这层授权，但它不是验收或通用隔离，不能靠“模型会先问一句”成立约束。
 - **`--max-turns`**：固定带上。无显式预算时取 `DEFAULT_MAX_TURNS=50`；用户确认的 `budget.max_turns` 原样进入 argv，可提高到 `MAX_TURNS_CEILING=200`，超过 200 在占号与 spawn 前红，不静默改写成 200。它与 Stop hook 的 `MAX_HOOK_BLOCKS` 是两层不同的闸：前者硬停单次 attempt，后者决定 hook 还愿不愿意把未达标的会话续下去。
+- **`--strict-mcp-config`（且不带 `--mcp-config`）**：`launchSpec`/`resumeSpec` 固定带上，执行体不加载任何 MCP server（用户级、项目级、plugin 带来的都不加载）。2026-09-04 真实 run 实测：acceptEdits 下执行体调用一个 plugin 的 MCP 读工具，被拒一次即记入 `permission_denials`，整 run 按边界违规判终局——而那次调用本身没有任何越界意图。MCP 工具面从执行体里移除，比在 prompt 里写「不要调 MCP」可靠。
+- **`--disallowedTools Agent Task`**：固定带上，执行体不派子代理（`Agent` 是现名，`Task` 是旧名，一起禁）。同一次实测：执行体派了一个只读子代理去读文档，子代理用 `/System/Volumes/Data` 前缀的 firmlink 路径读 target root 内的文件，CLI 判在工作目录之外，13 次拒绝全部记到主 envelope 的 `permission_denials`。单执行体也是本 adapter 的问责模型——一份 transcript、一份 `permission_denials`、一个 Stop hook。这两条与 `acceptEdits` 一样只是 CLI 声明的姿态，未做 fault injection，不据此把任何 contract constraint 升为 `physical`；`EXECUTOR_TOOL_POSTURE` 是 argv 的最后一段，`--disallowedTools` 是变长参数，放在别的 flag 前面会把它们吞成工具名。
 
-max-turns 的特殊恢复路由不只看 17-key 全集，还要求实测 discriminator 同时成立：`type=result`、`subtype=error_max_turns`、`is_error=true`、`terminal_reason=max_turns`。key 对但取值不对仍按协议漂移落红，不会错误压低 hook 期望或标成可续。
+prompt 编译时把这两条也写给执行体（「不得调用 MCP 工具、不得派子代理、只用 contract `target_roots` 给出的路径形式读写文件」）：姿态挡住的是工具，写明是为了执行体不把轮数烧在反复尝试上。任何被拒的工具调用——哪怕是读——都让 `permission_denials` 非空而终局，这是 `acceptEdits` 面下唯一的越界信号，不能为「良性」的拒绝开口子。
+
+max-turns 的特殊恢复路由不只看 19-key 全集，还要求实测 discriminator 同时成立：`type=result`、`subtype=error_max_turns`、`is_error=true`、`terminal_reason=max_turns`。key 对但取值不对仍按协议漂移落红，不会错误压低 hook 期望或标成可续。
 
 ### Stop hook 契约
 
@@ -134,8 +138,8 @@ max-turns 的特殊恢复路由不只看 17-key 全集，还要求实测 discrim
 
 不得只看 `subtype`。Adapter 向公共状态机提交的结果必须先通过实测 key 集全等校验，未知 key 或缺失 key 一律 fail closed，不静默丢弃。锚有**两个**，按 `subtype` 二选一、互斥不重叠：
 
-- `subtype` 不是 `error_max_turns` → 21-key 成功锚（`CLAUDE_RESULT_KEYS`，2.1.223 实测，2.1.228 复核未漂）；
-- `subtype === "error_max_turns"` → 17-key error 锚（`CLAUDE_ERROR_MAX_TURNS_KEYS`，2.1.226 真实 run 与 2.1.228 spike 逐 key 一致：比成功锚少 `api_error_status`/`result`/`time_to_request_ms`/`ttft_ms`/`ttft_stream_ms`、多 `errors`）；全集相等后仍须满足上面的四值 discriminator，才产生 `budgetExhausted`。
+- `subtype` 不是 `error_max_turns` → 24-key 成功锚（`CLAUDE_RESULT_KEYS`：2.1.223 实测 21 key，2.1.228 复核未漂，2026-09-04 在 2.1.260 的真实 run 上重锚为 24 key，新增 `first_content_frame_ms`、`queued_turn_count`、`subagent_stats`——那次 run 的执行体已 `subtype:success / terminal_reason:completed`，仍因 3 个未知 key 被判 `terminal_report`，这正是直检的设计方向，代价是每次漂移都要人核对新 envelope、改表、加 fixture、抬下限）；
+- `subtype === "error_max_turns"` → 19-key error 锚（`CLAUDE_ERROR_MAX_TURNS_KEYS`：2.1.226 真实 run 与 2.1.228 spike 逐 key 一致的 17 key，2026-09-04 在 2.1.260 用 `--max-turns 1` 硬停实测重锚为 19 key，多 `queued_turn_count`、`subagent_stats`；比成功锚少 `api_error_status`/`result`/`time_to_request_ms`/`ttft_ms`/`ttft_stream_ms`/`first_content_frame_ms`、多 `errors`）；全集相等后仍须满足上面的四值 discriminator，才产生 `budgetExhausted`。
 
 第二锚过闸的结果是**未达标候选而不是协议漂移**——「没干完」和「envelope 变形」是两类事，单锚时代它们同落 malformed，把最需要续跑的形态（预算耗尽）封死在 resume 之外。launch 返回体以 `budgetExhausted: true` 标注这类候选（报告体字段，**不进** `candidate`——candidate 恒 4 字段，`workflow.mjs` 的 claudeTerminalState 做闭世界形状检查），控制器据此走「未达标可续」分流。其他 error subtype（如 `error_during_execution`）没有实测锚，一律按成功锚落红：只为实测过的形态建锚。
 
@@ -148,21 +152,21 @@ max-turns 的特殊恢复路由不只看 17-key 全集，还要求实测 discrim
 | `terminal_reason` | 精确为 `completed` |
 | `permission_denials` | 必须是空数组 |
 
-`terminal_reason:"completed"` 这一取值是 `2.1.223` 实测锚定；⚠️ SDK 文档列出的 `terminal_reason` 取值集并不包含 `completed`（列的是 `success`/`max_turns_reached` 等），字段取值存在文档与实现的漂移，exact-match 判定必须钉住实测版本的取值。
+`terminal_reason:"completed"` 这一取值是 `2.1.223` 实测锚定、`2.1.260` 复核不变；⚠️ SDK 文档列出的 `terminal_reason` 取值集并不包含 `completed`（列的是 `success`/`max_turns_reached` 等），字段取值存在文档与实现的漂移，exact-match 判定必须钉住实测版本的取值。
 
 ### 版本闸：下限，不是白名单
 
-版本闸只排除已知过旧的版本：launch 前置闸拒绝低于 `CLAUDE_VERSION_FLOOR`（= `2.1.223`，实测锚定的最早版本）的 claude，等于或高于一律放行。envelope 的**形状**漂移由上面那道 21-key 全集校验直接兜住——注意它**只覆盖 key 集**，字段取值不在其内（见下面「放松之后丢了什么」第 1 条）。
+版本闸只排除已知过旧的版本：launch 前置闸拒绝低于 `CLAUDE_VERSION_FLOOR`（= `2.1.260`，两个锚在 2026-09-04 重新实测的版本；此前为 `2.1.223`）的 claude，等于或高于一律放行。下限随锚一起抬：新锚要求新 key 都在，更旧的 claude 无论如何都会在直检处落红，下限低于锚的实测版本只是把同一个拒绝换个措辞。envelope 的**形状**漂移由上面那道 24-key 全集校验直接兜住——注意它**只覆盖 key 集**，字段取值不在其内（见下面「放松之后丢了什么」第 1 条）。
 
 判定细节：版本串按 major/minor/patch 逐段**数值**比较（`2.1.9` 低于 `2.1.10`，字符串字典序在这里会翻车）；解析器锚定串首，接受版本号打头的形态（`2.1.223`、`2.1.223 (Claude Code)`），版本号不在串首的（`Claude Code 2.1.225`）会被**拒**；解析不出来一律拒，不当作放行。生产路径上这个解析器拿不到 `--version` 的原样输出——采集器（`scripts/launch.mjs`）先用无锚定正则抽出三段数字再写进 `probes.json`，`parseVersion` 是那一步之后的兜底，别把采集器那一步省掉，省掉之后前缀形态的输出会变成「读不出来 → 拒」的可用性 bug。预发布号是**已知边界**：`2.1.223-beta.1` 在 semver 里低于 `2.1.223`，这里却放行；改 `parseVersion` 没用，采集器的正则已经把预发布后缀丢掉了，真要拦得改采集器——claude `--version` 目前不发预发布标签，暂记为已知边界。
 
-之所以不是精确 allowlist：版本号是**代理指标**，它想挡的 result envelope 形状漂移已经有**直接检查**在管。于是两种情形都对 allowlist 不利——envelope 没变的新版本被 allowlist 拦下是纯误杀；envelope 的 key 集真变了的新版本，21-key 直检照样红，诊断还更精确（reason 会指出「可能是 claude 升版导致 envelope 漂移，核对新版本的 result envelope 后更新 `CLAUDE_RESULT_KEYS`」，按隐私纪律只给计数、不回显 key 名）。代理指标严于直接指标，换来的代价是 claude 每隔几天升一次版就「工具不可用」——而那种闸的真实结局是有人把它注释掉，那才是最坏的。
+之所以不是精确 allowlist：版本号是**代理指标**，它想挡的 result envelope 形状漂移已经有**直接检查**在管。于是两种情形都对 allowlist 不利——envelope 没变的新版本被 allowlist 拦下是纯误杀；envelope 的 key 集真变了的新版本，24-key 直检照样红，诊断还更精确（reason 会指出「可能是 claude 升版导致 envelope 漂移，核对新版本的 result envelope 后更新 `CLAUDE_RESULT_KEYS`」，按隐私纪律只给计数、不回显 key 名）。代理指标严于直接指标，换来的代价是 claude 每隔几天升一次版就「工具不可用」——而那种闸的真实结局是有人把它注释掉，那才是最坏的。
 
 #### 放松之后丢了什么
 
 allowlist 原本顺带覆盖、而直检覆盖不到的有三处。它们**不都是可观测的**，别用可观测性声明把缺口盖住。
 
-1. **取值锚没有直检兜底。** 21-key 全集校验判的是 **key 集**；`terminal_reason:"completed"` 是**取值**锚，取值由 `workflow.mjs` 的 exact-match 判定（不等于 `completed` 即红），而那个取值是 `2.1.223` 实测钉下来的，没有任何检查去核对它在新版本里还是不是同一个意思。两个方向后果不同：取值被**改名** → exact-match 全红，方向是 fail-closed，但诊断退化成「Claude terminal_reason must be completed」，读起来像「模型没干完活」，操作员可能把续跑配额烧在一个幻觉上；取值语义**变宽**（例如新版本把 `max_turns_reached` 也归进 `completed`）→ 形状与取值两道检查都过，产出**假 candidate**。**升版后第一次 run 必须人工核对这个取值。**
+1. **取值锚没有直检兜底。** 24-key 全集校验判的是 **key 集**；`terminal_reason:"completed"` 是**取值**锚，取值由 `workflow.mjs` 的 exact-match 判定（不等于 `completed` 即红），而那个取值是 `2.1.223` 实测钉下来的，没有任何检查去核对它在新版本里还是不是同一个意思。两个方向后果不同：取值被**改名** → exact-match 全红，方向是 fail-closed，但诊断退化成「Claude terminal_reason must be completed」，读起来像「模型没干完活」，操作员可能把续跑配额烧在一个幻觉上；取值语义**变宽**（例如新版本把 `max_turns_reached` 也归进 `completed`）→ 形状与取值两道检查都过，产出**假 candidate**。**升版后第一次 run 必须人工核对这个取值。**
 2. **Stop hook 的 block 协议**（stdout 写 JSON decision、exit 0）。不是 envelope 形状，直检覆盖不到。可观测性要分开说：hook **本体被篡改**抓得住——每个 attempt 现场重新 lstat + 重算 hook 脚本 sha256（不信任 `probes.json` 的缓存值），与现场重新生成的期望值比对，篡改会在下一个 attempt 的前置闸落红；残留敞口是最后一个 attempt 内的篡改没有下一轮去查。但**协议漂移**抓不住：生成的脚本向 `hook-runs.jsonl` 追加留痕这一步在 decision 分支**之外无条件执行**，协议漂了（改回 exit 2、或换 JSON 形状）hook 照常运行、照常追加、`hookRuns` 照常涨，只是 claude 不再理会 block。它的真实表现是「会话没续、postflight 红」，与「任务本来就没做完」不可区分——**弱可观测，没有专门指向病因的信号**。（`hookRuns` 不涨描述的是另一种失效：hook **缺席**，resume 没继承 `--settings` 或 hook 被删。两者不是一回事。）
 3. **`--settings` deny 的防护面。** 同样不是 envelope 形状，而且这里**没有可用的观测量**：`permission_denials` 必须为空才算成功，deny 面失效产出的也是空数组，与健康 run 逐字节相同——「deny 好使、没人尝试」和「deny 坏了、写进去了」在这个字段上不可区分；何况这条信号要求真有人去写受保护路径，正常 run 里根本不产生观测量。
 4. **setting-source isolation 是权限确定性的直接边界。** Claude 2.1.229 的 `--setting-sources ""` 把 allowed sources 解析为空；runtime 仍固定加入 `flagSettings` 与 `policySettings`。因此不再依赖 project settings 的发现路径或文件扫描。升版时要重验的是空 source 的行为与 flag/policy 固定来源，而不是追逐新的 git-root discovery 规则。

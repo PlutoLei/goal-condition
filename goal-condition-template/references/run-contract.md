@@ -47,6 +47,8 @@ launch/resume 固定传 `--setting-sources ""`，排除 ambient user/project/loc
 
 `success_criteria.command` 是供人审阅的精确命令说明，不是 shell 执行入口。机器执行只允许 `{id, type:"command", cwd, argv, requires_env?, capture?}`；不得增加 `shell` 字段，不得用 `eval`、`sh -c` 或拼接后的 shell 字符串。`requires_env` 只记录变量名和是否存在，snapshot 不保存变量值。默认 `capture:"hash"`；只有确认输出不含敏感内容时才可显式使用 `capture:"text"`。
 
+Command entry 的 `capture` 默认 `hash`：capture 时记下输出的 SHA-256，verify 时重跑比对，任何字节差异都是 `COMMAND_SNAPSHOT_CHANGED`。所以 preflight/postflight 里只能放**输出确定**的命令：`pytest -q` 会打印耗时（`3 passed in 0.26s`），两次运行必然不同，一定落红——要跑测试就用一个只打印 `PASS`/`FAIL` 并按退出码退出的 argv 包装（例如 `python -c` 调 `subprocess.run` 后只 print 固定字符串），或者把测试只放在 postflight（hook 判的是退出码）。2026-09-04 真实 run 实测：一条 preflight `pytest -q` 让整个边界比对判否，而工作树本身完全在 `allowed_mutations` 之内。
+
 Preflight 的 Git entry 使用 `target`，可声明 `require_branch`、`require_clean`、`require_upstream`；path entry 使用 `target` 与 `require: file|directory|exists`；command entry 使用 `cwd + argv[]`。这些 target/cwd 都必须位于 snapshot 要求的唯一 target root 内。Postflight 只接受 command entry，Git 与 path 边界由 baseline compare 复验。
 
 `require_branch`、`require_clean`、`require_upstream` 是 **launch 前置条件，不是 run-long 不变量**：它们只在 `snapshot.mjs capture` 采集 baseline 时判定，`verify` 阶段一律跳过。原因是 run 一旦产出 `allowed_mutations.files` 里声明允许的文件，工作树相对 baseline 就必然变脏——在 verify 重跑 `require_clean` 会让「产出了正确结果」结构性必红，且诊断会指导操作员删掉被验收对象本身。verify 阶段的 Git 边界完全由 baseline compare 承担，且比重跑谓词更精确：`GIT_BRANCH_CHANGED` 钉住分支不得偏离 baseline，`GIT_UPSTREAM_CHANGED` 钉住 upstream 配置不得变动，工作树与提交材料按 `allowed_mutations` 逐路径归类为 change 或 violation。跳过的只是谓词判定，Git 材料（refs、tree、index、worktree 清单、ancestry）在两个阶段一样完整采集。
@@ -86,6 +88,8 @@ node scripts/snapshot.mjs capture --contract <contract-file> --out <baseline-fil
 每个 committed blob 通过无固定输出 buffer 的单次 stream 同时计算 raw bytes SHA-256 和 canonical repository object ID；后者使用 `rev-parse --show-object-format=storage` 返回的 `sha1` 或 `sha256`、`ls-tree -l` 声明的 blob size、`blob <size>\0` header 与同一份 streamed bytes。实际 byte count 必须等于声明 size，computed object ID 必须等于 tree object ID，否则在产出 snapshot 前分别以 `GIT_BLOB_SIZE_MISMATCH` 或 `GIT_BLOB_OBJECT_MISMATCH` fail closed，诊断只包含长度或 digest。普通 committed material 同时保留 `object` 与 `bytes_sha256`；tree compare 不再因 HEAD 相同而跳过，同 HEAD 或同 mode/type/object identity 下的 bytes/material drift 永远以 `GIT_COMMITTED_OBJECT_INTEGRITY_CHANGED` 拒绝，不能被 `allowed_mutations.files` 放行。
 
 Git index 变更单独审计，tag 或其他 refs 的增删改一律违规；只有在 `allowed_mutations.git` 精确允许 `commit`、argv-only `git --no-replace-objects merge-base --is-ancestor` 证明 current HEAD 是 externally-bound baseline HEAD 的后代、且唯一变化 ref 是当前 branch 时，才把前移视为允许的 commit。Shallow repository 与非空或非 regular `info/grafts` 会在证明前被拒绝。Verifier 还会把发生变化的 committed tree path 与 baseline effective filesystem 的 Git-projected object/type/mode 对比；directory state 会递归展开为 Git leaf。预先存在的受保护 dirty material 被原样提交可以通过，受保护 material 的新增、删除或 object/type/mode 改变会失败，声明允许的路径则记入 changes。这样 clean/smudge 或 CRLF 规则不会把 raw worktree bytes 错当成 canonical committed object。
+
+Snapshot 的 worktree 扫描覆盖 target root 下**每一个**条目，包括 gitignored 的：任何 realpath 逃出 target root 的 symlink（例如指向外部 release 目录的 skill 链接、`.venv/bin/python`）报 `SYMLINK_ESCAPES_TARGET_ROOT`，单个超过 Node `readFile` 上限（2 GiB）的文件报 `SNAPSHOT_FAILED observed=ERR_FS_FILE_TOO_LARGE`。capture 前用 `find <root> -type l` 与 `find <root> -size +1500M` 自查，把逃出的链接与超大文件临时挪出 root，postflight verify 之后再放回。
 
 Snapshot 在 capture 前还会验证 target root 与 context 的物理路径：root 必须是非 symlink 的稳定目录，context 必须是 root 内的非 symlink regular file，二者的 realpath 都不得落入临时存储。Contract 中的 context hash 与现场 bytes 不一致时必须重新生成、完整 preview 并重新确认，而不能把现场文件静默吸收到旧 contract。
 

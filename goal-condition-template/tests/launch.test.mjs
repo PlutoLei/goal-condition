@@ -280,8 +280,8 @@ const stubCollect = async ({ hookScriptPath }) => {
   const bytes = await readFileFs(hookScriptPath);
   const st = await lstatFs(hookScriptPath);
   return {
-    claudeVersionRaw: '2.1.223 (Claude Code)\n',
-    claudeVersion: '2.1.223',
+    claudeVersionRaw: '2.1.260 (Claude Code)\n',
+    claudeVersion: '2.1.260',
     claudeSessionIdFlag: true,
     claudeSettingSourcesFlag: true,
     hookMode: (st.mode & 0o7777).toString(8).padStart(4, '0'),
@@ -317,8 +317,8 @@ test('prepareClaude writes hook (0500), settings (deny normalized path), hook-en
   assert.equal(hookEnv.GC_LAUNCH_TEST_TOKEN, 'secret-value');
 
   const probes = JSON.parse(await readFile(join(stateDir, 'probes.json'), 'utf8'));
-  assert.equal(probes.claudeVersionRaw, '2.1.223 (Claude Code)\n');
-  assert.equal(probes.claudeVersion, '2.1.223');
+  assert.equal(probes.claudeVersionRaw, '2.1.260 (Claude Code)\n');
+  assert.equal(probes.claudeVersion, '2.1.260');
   assert.equal(probes.hookScript.mode, '0500');
   assert.equal(probes.hookScript.exists, true);
   assert.equal(probes.expectedHookSha256, probes.hookScript.sha256);
@@ -417,7 +417,7 @@ test('prepareClaude rejects when a requires_env name is missing from the environ
 });
 
 const claudeResultFixture = JSON.parse(
-  await readFile(new URL('./fixtures/claude-result-21key.json', import.meta.url), 'utf8'),
+  await readFile(new URL('./fixtures/claude-result-24key.json', import.meta.url), 'utf8'),
 );
 
 function stubResolving(stdout) {
@@ -1271,7 +1271,7 @@ test('a Claude attempt lease blocks a concurrent resume and preserves the retry 
 test('an error_max_turns hard stop keeps the pointer and resumes without surgery', async (t) => {
   const { stateDir, contract, binding } = await setupClaudeState(t);
   const errorFixture = JSON.parse(
-    await readFile(new URL('./fixtures/claude-result-17key-error-max-turns.json', import.meta.url), 'utf8'),
+    await readFile(new URL('./fixtures/claude-result-19key-error-max-turns.json', import.meta.url), 'utf8'),
   );
   // 真实 CLI 在 max-turns 硬停时非零退出、stdout 仍是 error 形态 envelope（S-B 实测）。
   const launchStub = stubRejectingEchoing(errorFixture, 'Command failed with exit code 1');

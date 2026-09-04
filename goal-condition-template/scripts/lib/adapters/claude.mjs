@@ -9,32 +9,37 @@ import {
 } from '../claude-permissions.mjs';
 
 // 版本闸是**下限**不是精确 allowlist。它想挡的是 result envelope 形状漂移，可那是个代理指标——
-// 真正要防的东西下面的 21-key 全集校验已经**直接**在管：envelope 没变的新版本被精确 allowlist 拦下
+// 真正要防的东西下面的 24-key 全集校验已经**直接**在管：envelope 没变的新版本被精确 allowlist 拦下
 // 是纯误杀，envelope 真变了的新版本直检照样红且诊断更精确。代理指标严于直接指标，代价却是 claude
 // 每隔几天升一次版就「工具不可用」（2026-08-09 真实触发：2.1.225 上线，allowlist 只有 2.1.223），
 // 而那种闸的真实结局是有人把它注释掉。下限只排除已知过旧的版本。
-export const CLAUDE_VERSION_FLOOR = '2.1.223';
+// 2026-09-04 重新锚定到 2.1.260：两个锚（成功 24 key、max-turns 硬停 19 key）都在该版本重新实测，下限随之抬起；
+// 更旧的 claude 无论如何都会在直检处因「缺 key」落红，下限低于锚的实测版本只是把同一个拒绝换个措辞。
+export const CLAUDE_VERSION_FLOOR = '2.1.260';
 
-// 实测锚定版本 2.1.223 的 result envelope 完整 key 集（spike S3 抓取）。SDK 文档与实现存在字段漂移，
-// 以实测集为准；升版改了 envelope 由 normalizeTerminal 落红，核对新版本 envelope 后再改这张表。
+// 实测锚定版本 2.1.260 的成功 result envelope 完整 key 集（2026-09-04 真实 run 抓取）：2.1.223 spike S3 的 21 key
+// 加 first_content_frame_ms、queued_turn_count、subagent_stats。SDK 文档与实现存在字段漂移，以实测集为准；
+// 升版改了 envelope 由 normalizeTerminal 落红，核对新版本 envelope 后再改这张表。
 export const CLAUDE_RESULT_KEYS = Object.freeze([
   'api_error_status', 'duration_api_ms', 'duration_ms', 'fast_mode_disabled_reason',
-  'fast_mode_state', 'is_error', 'modelUsage', 'num_turns', 'permission_denials',
-  'result', 'session_id', 'stop_reason', 'subtype', 'terminal_reason',
-  'time_to_request_ms', 'total_cost_usd', 'ttft_ms', 'ttft_stream_ms', 'type', 'usage', 'uuid',
+  'fast_mode_state', 'first_content_frame_ms', 'is_error', 'modelUsage', 'num_turns',
+  'permission_denials', 'queued_turn_count', 'result', 'session_id', 'stop_reason', 'subagent_stats',
+  'subtype', 'terminal_reason', 'time_to_request_ms', 'total_cost_usd', 'ttft_ms', 'ttft_stream_ms',
+  'type', 'usage', 'uuid',
 ]);
 
 const EXPECTED_KEYS = new Set(CLAUDE_RESULT_KEYS);
 
-// max-turns 硬停的 error 形态 envelope 完整 key 集：2.1.226 真实 run 与 2.1.228 spike S-B 逐 key
-// 一致（比成功锚少 api_error_status/result/time_to_request_ms/ttft_ms/ttft_stream_ms、多 errors，
-// terminal_reason 取值 max_turns）。只为实测过的 error_max_turns 建锚；其他 error subtype 没有
+// max-turns 硬停的 error 形态 envelope 完整 key 集：2.1.226 真实 run 与 2.1.228 spike S-B 逐 key 一致的 17 key，
+// 2026-09-04 在 2.1.260 用 --max-turns 1 硬停实测重锚为 19 key（多 queued_turn_count、subagent_stats；比成功锚少
+// api_error_status/result/time_to_request_ms/ttft_ms/ttft_stream_ms/first_content_frame_ms、多 errors，
+// terminal_reason 取值 max_turns，四值 discriminator 未变）。只为实测过的 error_max_turns 建锚；其他 error subtype 没有
 // 实测锚，一律按成功锚落红（fail closed）——「没干完」和「协议漂移」是两类事，2026-08-10 真实
 // run 曾因单锚把前者判成后者而封死续跑。
 export const CLAUDE_ERROR_MAX_TURNS_KEYS = Object.freeze([
   'duration_api_ms', 'duration_ms', 'errors', 'fast_mode_disabled_reason', 'fast_mode_state',
-  'is_error', 'modelUsage', 'num_turns', 'permission_denials', 'session_id', 'stop_reason',
-  'subtype', 'terminal_reason', 'total_cost_usd', 'type', 'usage', 'uuid',
+  'is_error', 'modelUsage', 'num_turns', 'permission_denials', 'queued_turn_count', 'session_id',
+  'stop_reason', 'subagent_stats', 'subtype', 'terminal_reason', 'total_cost_usd', 'type', 'usage', 'uuid',
 ]);
 
 const ERROR_MAX_TURNS_KEYS = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
@@ -70,8 +75,8 @@ export function normalizeTerminal(raw) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     return { ok: false, reasons: ['Claude result must be an object'] };
   }
-  // 锚按 subtype 二选一：error_max_turns 走 17-key error 锚，其余（含未知 error subtype）一律
-  // 按 21-key 成功锚判。两个锚都是全集相等校验，互斥不重叠。
+  // 锚按 subtype 二选一：error_max_turns 走 19-key error 锚，其余（含未知 error subtype）一律
+  // 按 24-key 成功锚判。两个锚都是全集相等校验，互斥不重叠。
   const usesMaxTurnsAnchor = raw.subtype === 'error_max_turns';
   const budgetExhausted = usesMaxTurnsAnchor
     && raw.type === 'result'
@@ -237,6 +242,15 @@ export function effectiveMaxTurns(budget) {
     : DEFAULT_MAX_TURNS;
 }
 
+// 执行体工具面收紧（2026-09-04 真实 run 实测的两类 permission_denials，都不是模型越界而是姿态漏洞）：
+// ① `--strict-mcp-config` 且不带 `--mcp-config`：不加载任何 MCP server（含 plugin 带来的）——此前 acceptEdits 下
+//    一次 MCP 读工具调用被拒即记 permission_denials，整 run 判终局；
+// ② `--disallowedTools Agent Task`：不派子代理。实测子代理用 /System/Volumes/Data 前缀的 firmlink 路径读 target
+//    root 内的文件，被 CLI 判在工作目录之外，13 次拒绝全记到主 envelope。单执行体也是本 adapter 的问责模型。
+// 两条都是 CLI 声明的姿态，未做 fault injection，不据此把任何 constraint 升为 physical。必须是 argv 最后一段：
+// --disallowedTools 是变长参数，放在别的 flag 前面会把它们吞成工具名。
+export const EXECUTOR_TOOL_POSTURE = Object.freeze(['--strict-mcp-config', '--disallowedTools', 'Agent', 'Task']);
+
 export function launchSpec({ prompt, settingsPath, cwd, budget, sessionId }) {
   // prompt 由调用方从权限受控文件 bytes 读出、单 argv 传入（现行规则）；本函数纯数据不执行。
   // sessionId 由控制器预派（claim-before-dispatch）：resume 指针在 spawn 之前就落盘，max-turns
@@ -246,7 +260,7 @@ export function launchSpec({ prompt, settingsPath, cwd, budget, sessionId }) {
     argv: ['claude', '-p', prompt, '--output-format', 'json', '--session-id', sessionId,
       '--setting-sources', '',
       '--settings', settingsPath, '--permission-mode', 'acceptEdits',
-      '--max-turns', String(effectiveMaxTurns(budget))],
+      '--max-turns', String(effectiveMaxTurns(budget)), ...EXECUTOR_TOOL_POSTURE],
     settingsPath, cwd, env_names: [],
   };
 }
@@ -258,7 +272,7 @@ export function resumeSpec({
     argv: ['claude', '-p', diagnosticText, '--resume', sessionId, '--output-format', 'json',
       '--setting-sources', '',
       '--settings', settingsPath, '--permission-mode', 'acceptEdits',
-      '--max-turns', String(effectiveMaxTurns(budget))],
+      '--max-turns', String(effectiveMaxTurns(budget)), ...EXECUTOR_TOOL_POSTURE],
     settingsPath, cwd, env_names: [],
   };
 }
