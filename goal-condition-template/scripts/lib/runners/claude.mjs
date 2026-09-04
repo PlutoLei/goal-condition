@@ -5,7 +5,6 @@ import {
   chmod, lstat, readFile, rm, stat, writeFile,
 } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { homedir } from 'node:os';
 import { basename, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -18,7 +17,7 @@ import { assertFixedClaudeCertificationProfile } from '../claude-certification.m
 import { canonicalJson, contractHash } from '../contract.mjs';
 import {
   AttemptClaimError, canonicalPath, initStateDir, nextAttempt, readControllerJsonNoFollow,
-  removeOwnedControllerFile, writeControllerJsonExclusive,
+  removeOwnedControllerFile, writeControllerJsonExclusive, claudeTranscriptPath,
 } from '../runner-common.mjs';
 
 const execFile = promisify(execFileCallback);
@@ -233,14 +232,9 @@ export async function prepareClaude({ contract, contractPath, stateDir, collect 
   return { settingsPath, hookScriptPath, probes };
 }
 
-// claude -p 的会话 transcript 落在 ~/.claude/projects/<slug(cwd)>/<sessionId>.jsonl；slug 规则
-// （绝对路径中非 [A-Za-z0-9-] 的字符一律替换成 '-'）是 CLI 内部实现、无稳定性承诺——spike S-C
-// 在 2.1.228 实测确认。因此这条路径只作观测通道（readback，fail-open）：规则漂移的表现是
-// 「文件不存在 → available:false」，绝不进入判定或证据链。
-export function claudeTranscriptPath({ cwd, sessionId }) {
-  const slug = String(cwd).replace(/[^A-Za-z0-9-]/g, '-');
-  return join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
-}
+// transcript 路径规则定义在 runner-common.mjs（readback 与 certification 共用）；这里只作观测通道
+// （readback，fail-open）：规则漂移的表现是「文件不存在 → available:false」，绝不进入判定或证据链。
+export { claudeTranscriptPath };
 
 // 现场重新 lstat/hash hook 文件——probes.json 记的是 prepare 时刻的观测，attempt 之间可能被
 // 篡改；不信任缓存值，每次 attempt 都重新采集这一项再交 assertLaunchable 判定。路径由调用方

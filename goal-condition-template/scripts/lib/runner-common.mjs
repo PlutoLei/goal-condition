@@ -1,4 +1,5 @@
 // Runtime-neutral controller state, claims, attempt accounting, and diagnostics.
+import { homedir } from 'node:os';
 import { constants, existsSync, realpathSync } from 'node:fs';
 import {
   chmod, link, lstat, mkdir, open, readdir, rm, writeFile,
@@ -280,3 +281,12 @@ function renderDiagnosticText(reds) {
 
 // 控制器按候选返回体的 hookExpected 累计「本应出现 Stop 事件」的轮次，再与运行次数对账；
 // max-turns 硬停不触发 Stop hook，不能把那一轮误报成 hook 缺席。
+
+// claude -p 的会话 transcript 落在 ~/.claude/projects/<slug(cwd)>/<sessionId>.jsonl；slug 规则
+// （绝对路径中非 [A-Za-z0-9-] 的字符一律替换成 '-'）是 CLI 内部实现、无稳定性承诺——spike S-C
+// 在 2.1.228 实测确认，2.1.260 复核不变。放在这里是因为 runner 的 readback 与 certification 的
+// control lane 都要用，而两者之间有 import 边；同一条规则只能有一处定义。
+export function claudeTranscriptPath({ cwd, sessionId }) {
+  const slug = String(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+  return join(homedir(), '.claude', 'projects', slug, `${sessionId}.jsonl`);
+}

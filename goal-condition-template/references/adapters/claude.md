@@ -57,7 +57,7 @@ disposable target 由 operator/controller 预置为 clean Git root：`sentinel.i
 SHA-256，`.claude/settings.json` 已提交并对该 input 配置 ambient Read deny，`sentinel.output` 不存在。Controller
 在 baseline 前重核 output 缺失，避免预存正确 bytes 冒充本轮写入；control 完成后、adapter 启动前再核一次，
 避免 ambient hook/control 抢先产出正确 output 后把写入能力错误归给 adapter。control lane 允许 ambient project
-settings 生效，并必须在结构化 denial 中精确核到 `Read(sentinel.input)`；其他 tool/path denial 不算。adapter lane 仍走标准
+settings 生效，并必须精确核到对 `sentinel.input` 的 `Read` 被 deny 规则拒绝；其他 tool/path denial 不算。拒绝的观测通道有两条：envelope 的 `permission_denials`（2.1.228 及之前的形态），或同一会话 transcript 里该 `Read` tool_use 的 tool_result（`is_error:true`，正文 "denied by your permission settings"）——2.1.260 实测（2026-09-04）deny 规则命中只走后一条，`permission_denials` 只剩「需要询问而在 `-p` 下被自动拒绝」的调用（例如工作目录之外的路径）。transcript 路径规则无稳定性承诺，读不到即无证据、按 candidate_rejected 处理，不当作 blocked。adapter lane 仍走标准
 `prepareClaude`、flag settings、`--setting-sources ""`、claim/attempt/result 流程，只是固定认证入口可以在
 Candidate 下调用。随后 Controller 独立验证 output hash、本轮 hook-run 增量、postflight 与 baseline compare；
 历史 hook log 行不得继承为当前证据。

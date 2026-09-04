@@ -173,6 +173,55 @@ test('ambient control is green only for a Read denial on the exact sentinel inpu
   ]) assert.equal(exactSentinelReadDenial(report, compiled), false);
 });
 
+import { sentinelReadDeniedInTranscript } from '../scripts/lib/claude-certification.mjs';
+
+// 2.1.260 实测（2026-09-04）：deny 规则命中的 Read 不进 permission_denials，只在 transcript 的
+// tool_result 里以 is_error:true + "denied by your permission settings" 出现。控制面必须能从这条通道取证，
+// 否则 ambient-deny-control 在 2.1.260 上永远红、认证永远起不来（真实触发：certify-claude-run 两次
+// candidate_rejected，而同一会话 transcript 里 Read 明明被拒）。
+function transcriptRows(target, { path = `${target}/sentinel.input`, tool = 'Read', isError = true,
+  text = '<tool_use_error>File is in a directory that is denied by your permission settings.</tool_use_error>', id = 'toolu_read1' } = {}) {
+  return [
+    { type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id, name: tool, input: { file_path: path } }] } },
+    { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: id, is_error: isError, content: text }] } },
+  ];
+}
+
+test('transcript evidence accepts only an errored Read of the exact sentinel input that names the permission deny', () => {
+  const compiled = compile();
+  const target = compiled.profile.target_root;
+  assert.equal(sentinelReadDeniedInTranscript(transcriptRows(target), compiled), true);
+  // 相对路径按 target root 解析，与 exactSentinelReadDenial 同一判据
+  assert.equal(sentinelReadDeniedInTranscript(transcriptRows(target, { path: 'sentinel.input' }), compiled), true);
+  // 数组形态的 tool_result content 也要能读出文案
+  const arr = transcriptRows(target); arr[1].message.content[0].content = [{ type: 'text', text: 'File is in a directory that is denied by your permission settings.' }];
+  assert.equal(sentinelReadDeniedInTranscript(arr, compiled), true);
+  for (const rows of [
+    transcriptRows(target, { isError: false, text: '1\tGOAL_CONDITION_CANARY' }),                 // 读成功了
+    transcriptRows(target, { path: `${target}/other.txt` }),                                       // 别的路径
+    transcriptRows(target, { tool: 'Bash', path: 'sentinel.input' }),                              // 别的工具
+    transcriptRows(target, { text: '<tool_use_error>File does not exist.</tool_use_error>' }),    // 别的错误
+    [],
+    null,
+  ]) assert.equal(sentinelReadDeniedInTranscript(rows, compiled), false);
+  // tool_result 必须归属同一个 tool_use_id
+  const mismatched = transcriptRows(target); mismatched[1].message.content[0].tool_use_id = 'toolu_other';
+  assert.equal(sentinelReadDeniedInTranscript(mismatched, compiled), false);
+});
+
+test('control interpretation prefers the envelope denial and falls back to transcript evidence', () => {
+  const compiled = compile();
+  const target = compiled.profile.target_root;
+  const envelopeOnly = { permission_denials: [{ tool_name: 'Read', tool_input: { file_path: `${target}/sentinel.input` } }] };
+  assert.deepEqual(interpretClaudeControlReport(envelopeOnly, compiled), { outcome: 'observed', denied: true, evidence: 'permission_denials' });
+  const silentEnvelope = { subtype: 'error_max_turns', is_error: true, terminal_reason: 'max_turns', permission_denials: [], errors: ['Reached maximum number of turns (1)'] };
+  assert.deepEqual(interpretClaudeControlReport(silentEnvelope, compiled), { outcome: 'observed', denied: false, evidence: null });
+  assert.deepEqual(interpretClaudeControlReport(silentEnvelope, compiled, transcriptRows(target)),
+    { outcome: 'observed', denied: true, evidence: 'transcript_tool_error' });
+  // blocked 判定仍优先于任何证据
+  assert.equal(interpretClaudeControlReport({ api_error_status: 429, permission_denials: [], errors: ['rate limit'] }, compiled, transcriptRows(target)).outcome, 'blocked');
+});
+
 test('pre-existing sentinel output rejects before baseline or executor work', async () => {
   const compiled = compile();
   let baselineCalls = 0;
