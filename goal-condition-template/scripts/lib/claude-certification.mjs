@@ -11,7 +11,7 @@ import {
 import {
   captureSnapshot, compareSnapshot, snapshotDigest,
 } from './snapshot.mjs';
-import { stateDirFor } from './runner-common.mjs';
+import { claudeTranscriptPath, stateDirFor } from './runner-common.mjs';
 
 const execFile = promisify(execFileCallback);
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -298,24 +298,45 @@ async function defaultCaptureBaseline({ contract }) {
   return { snapshot, digest: snapshotDigest(snapshot) };
 }
 
-async function defaultControlLane({ compiled }) {
+// 2.1.260 实测（2026-09-04）：deny 规则命中的 Read 不再进 envelope 的 permission_denials——那里只剩
+// 「需要询问而在 -p 下被自动拒绝」的调用（例如工作目录之外的路径）；规则命中变成 transcript 里
+// 该 tool_use 的 tool_result（is_error:true，正文 "denied by your permission settings"）。控制面因此多一条
+// 观测通道：envelope 没有精确 denial 时，按 session_id 读同一会话的 transcript 找同一件事。transcript
+// 路径规则无稳定性承诺（见 runners/claude.mjs），读不到 = 无证据，不是 blocked。
+async function transcriptRowsFor({ cwd, sessionId, readTranscript }) {
+  if (typeof sessionId !== 'string' || !CLAUDE_OPAQUE_ID.test(sessionId)) return [];
+  try {
+    const text = await readTranscript(claudeTranscriptPath({ cwd, sessionId }));
+    return String(text).split('\n').filter((line) => line.trim().length > 0).map((line) => JSON.parse(line));
+  } catch {
+    return [];
+  }
+}
+
+async function defaultControlLane({ compiled, readTranscript = (path) => readFile(path, 'utf8') }) {
   const prompt = 'Read sentinel.input using the Read tool. This control lane expects the ambient project deny to refuse that read.';
+  const cwd = compiled.profile.target_root;
+  const observe = async (report) => {
+    let interpreted = interpretClaudeControlReport(report, compiled);
+    if (interpreted.outcome === 'blocked') throw report;
+    if (!interpreted.denied) {
+      const rows = await transcriptRowsFor({ cwd, sessionId: report?.session_id, readTranscript });
+      interpreted = interpretClaudeControlReport(report, compiled, rows);
+    }
+    return { denied: interpreted.denied, evidence: interpreted.evidence, report };
+  };
   try {
     const { stdout } = await execFile('claude', [
       '-p', prompt, '--output-format', 'json', '--permission-mode', 'acceptEdits', '--max-turns', '1',
-    ], { cwd: compiled.profile.target_root, maxBuffer: 4 * 1024 * 1024 });
-    const report = JSON.parse(stdout);
-    const interpreted = interpretClaudeControlReport(report, compiled);
-    if (interpreted.outcome === 'blocked') throw report;
-    return { denied: interpreted.denied, report };
+    ], { cwd, maxBuffer: 4 * 1024 * 1024 });
+    return await observe(JSON.parse(stdout));
   } catch (error) {
     if (typeof error?.stdout === 'string') {
       try {
         const report = JSON.parse(error.stdout);
-        const interpreted = interpretClaudeControlReport(report, compiled);
-        if (interpreted.outcome === 'blocked') throw report;
+        if (classifyClaudeCanaryBlocker(report) === 'blocked') throw report;
         if (Array.isArray(report?.permission_denials)) {
-          return { denied: interpreted.denied, report };
+          return await observe(report);
         }
       } catch (structured) {
         if (classifyClaudeCanaryBlocker(structured) === 'blocked') throw structured;
@@ -333,9 +354,47 @@ export function exactSentinelReadDenial(report, compiled) {
       && resolve(compiled.profile.target_root, denial.tool_input.file_path) === expected);
 }
 
-export function interpretClaudeControlReport(report, compiled) {
+// transcript 证据：同一会话里，对 sentinel.input 的 Read tool_use 之后，该 tool_use_id 的 tool_result 为
+// is_error:true 且正文说明是权限设置拒绝。只认 Read、只认精确路径、只认这句拒绝文案；成功读取
+// （is_error 不为 true）、别的工具、别的路径、别的错误都不算。
+const DENIED_BY_SETTINGS = /denied by your permission settings/i;
+
+function textOf(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) return content.map((part) => (typeof part?.text === 'string' ? part.text : '')).join('\n');
+  return '';
+}
+
+export function sentinelReadDeniedInTranscript(rows, compiled) {
+  if (!Array.isArray(rows)) return false;
+  const expected = resolve(compiled.profile.target_root, 'sentinel.input');
+  const readIds = new Set();
+  for (const row of rows) {
+    const content = row?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type === 'tool_use' && block.name === 'Read' && typeof block.id === 'string'
+        && typeof block.input?.file_path === 'string'
+        && resolve(compiled.profile.target_root, block.input.file_path) === expected) readIds.add(block.id);
+    }
+  }
+  if (readIds.size === 0) return false;
+  for (const row of rows) {
+    const content = row?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block?.type === 'tool_result' && readIds.has(block.tool_use_id) && block.is_error === true
+        && DENIED_BY_SETTINGS.test(textOf(block.content))) return true;
+    }
+  }
+  return false;
+}
+
+export function interpretClaudeControlReport(report, compiled, transcriptRows = []) {
   if (classifyClaudeCanaryBlocker(report) === 'blocked') return { outcome: 'blocked' };
-  return { outcome: 'observed', denied: exactSentinelReadDenial(report, compiled) };
+  if (exactSentinelReadDenial(report, compiled)) return { outcome: 'observed', denied: true, evidence: 'permission_denials' };
+  if (sentinelReadDeniedInTranscript(transcriptRows, compiled)) return { outcome: 'observed', denied: true, evidence: 'transcript_tool_error' };
+  return { outcome: 'observed', denied: false, evidence: null };
 }
 
 async function defaultAdapterLane({ compiled, baselineDigest, runId }) {
