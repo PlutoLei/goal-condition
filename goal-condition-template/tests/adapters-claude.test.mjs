@@ -1,15 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { CLAUDE_RESULT_KEYS, CLAUDE_ERROR_MAX_TURNS_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, DEFAULT_MAX_TURNS, MAX_TURNS_CEILING } from '../scripts/lib/adapters/claude.mjs';
+import { CLAUDE_RESULT_KEYS, CLAUDE_ERROR_MAX_TURNS_KEYS, normalizeTerminal, buildStopHook, buildSettings, MAX_HOOK_BLOCKS, assertLaunchable, launchSpec, resumeSpec, DEFAULT_MAX_TURNS, MAX_TURNS_CEILING, EXECUTOR_TOOL_POSTURE } from '../scripts/lib/adapters/claude.mjs';
 import { runtimeTerminalState } from '../scripts/lib/workflow.mjs';
 
-const fixtureUrl = new URL('./fixtures/claude-result-21key.json', import.meta.url);
+const fixtureUrl = new URL('./fixtures/claude-result-24key.json', import.meta.url);
 const realResult = JSON.parse(await readFile(fixtureUrl, 'utf8'));
 
 // spike S-B（2.1.228）的实测产物：--max-turns 1 触发硬停，CLI 出 error 形态 envelope。与
-// 2026-08-10/08-12 两次真实 run 在 2.1.226/2.1.228 的观测逐 key 一致。形状从实测文件读，不手抄。
-const errorFixtureUrl = new URL('./fixtures/claude-result-17key-error-max-turns.json', import.meta.url);
+// 2026-08-10/08-12 两次真实 run 在 2.1.226/2.1.228 的观测逐 key 一致；2026-09-04 在 2.1.260 重做同一硬停，
+// 多 queued_turn_count、subagent_stats（19 key）。形状从实测文件读，不手抄。
+const errorFixtureUrl = new URL('./fixtures/claude-result-19key-error-max-turns.json', import.meta.url);
 const errorMaxTurnsResult = JSON.parse(await readFile(errorFixtureUrl, 'utf8'));
 
 // spike S5 runB 的实测产物：模型改不动 hook 就换 Bash 直接重定向（`printf 'exit 0' > stop-hook.sh`），
@@ -18,8 +19,12 @@ const denySurfaceUrl = new URL('../../spikes/goal-runtime-adapters-v2/fixtures/s
 const denySurface = JSON.parse(await readFile(denySurfaceUrl, 'utf8'));
 const bashRedirectDenial = denySurface.runB.permissionDenials[0];
 
-test('CLAUDE_RESULT_KEYS pins the measured 2.1.223 result envelope exactly', () => {
-  assert.equal(CLAUDE_RESULT_KEYS.length, 21);
+test('CLAUDE_RESULT_KEYS pins the measured 2.1.260 result envelope exactly', () => {
+  assert.equal(CLAUDE_RESULT_KEYS.length, 24);
+  // 2026-09-04 在 2.1.260 重新锚定：比 2.1.223 多这三个 key。缺任一个即回到 21-key 时代的形状，必须落红。
+  for (const added of ['first_content_frame_ms', 'queued_turn_count', 'subagent_stats']) {
+    assert.ok(CLAUDE_RESULT_KEYS.includes(added), `${added} must be pinned`);
+  }
   assert.deepEqual([...Object.keys(realResult)].sort(), [...CLAUDE_RESULT_KEYS].sort());
 });
 
@@ -47,18 +52,19 @@ test('normalizeTerminal fails closed on unknown, missing, or non-object input', 
 
 // ---------------------------------------------------------------------------
 // error_max_turns 第二锚（D5）：「没干完」和「协议漂移」是两类事。2026-08-10 真实 run 里
-// max-turns 硬停的 17-key envelope 被单锚判成 malformed，thread.json 不落盘，resume 死锁。
+// max-turns 硬停的 19-key envelope 被单锚判成 malformed，thread.json 不落盘，resume 死锁。
 // ---------------------------------------------------------------------------
 
 test('CLAUDE_ERROR_MAX_TURNS_KEYS pins the measured error envelope exactly', () => {
-  assert.equal(CLAUDE_ERROR_MAX_TURNS_KEYS.length, 17);
+  assert.equal(CLAUDE_ERROR_MAX_TURNS_KEYS.length, 19);
+  assert.ok(!CLAUDE_ERROR_MAX_TURNS_KEYS.includes('first_content_frame_ms'), 'a hard stop has no content frame');
   assert.deepEqual([...Object.keys(errorMaxTurnsResult)].sort(), [...CLAUDE_ERROR_MAX_TURNS_KEYS].sort());
-  // 与成功锚的差集也是实测事实（少 5 多 1），锚表改动必须两边一起过目。
+  // 与成功锚的差集也是实测事实（少 6 多 1：2.1.260 的硬停没有 first_content_frame_ms），锚表改动必须两边一起过目。
   const success = new Set(CLAUDE_RESULT_KEYS);
   const error = new Set(CLAUDE_ERROR_MAX_TURNS_KEYS);
   assert.deepEqual(
     CLAUDE_RESULT_KEYS.filter((key) => !error.has(key)).sort(),
-    ['api_error_status', 'result', 'time_to_request_ms', 'ttft_ms', 'ttft_stream_ms'],
+    ['api_error_status', 'first_content_frame_ms', 'result', 'time_to_request_ms', 'ttft_ms', 'ttft_stream_ms'],
   );
   assert.deepEqual(CLAUDE_ERROR_MAX_TURNS_KEYS.filter((key) => !success.has(key)), ['errors']);
 });
@@ -157,7 +163,7 @@ test('cross-shape confusion fails closed in both directions and hints the right 
   const errorBody = normalizeTerminal({ ...errorMaxTurnsResult, subtype: 'success' });
   assert.equal(errorBody.ok, false);
   assert.ok(errorBody.reasons.some((reason) => reason.includes('CLAUDE_RESULT_KEYS')));
-  // 没建锚的 error subtype（形状同为 17-key）不放行：只为实测过的形态建锚，其余 fail closed。
+  // 没建锚的 error subtype（形状同为 19-key）不放行：只为实测过的形态建锚，其余 fail closed。
   const unanchored = normalizeTerminal({ ...errorMaxTurnsResult, subtype: 'error_during_execution' });
   assert.equal(unanchored.ok, false);
 });
@@ -337,7 +343,7 @@ test('buildSettings rejects every unrepresentable value interpolated into permis
 
 const goodProbes = Object.freeze({
   contractHash: 'a'.repeat(64), confirmedHash: 'a'.repeat(64), baselineDigestStored: true,
-  claudeVersion: '2.1.223',
+  claudeVersion: '2.1.260',
   claudeSessionIdFlag: true,
   claudeSettingSourcesFlag: true,
   settings: buildSettings({
@@ -371,11 +377,15 @@ test('launchSpec/resumeSpec are pure argv data with settings pinned', () => {
     '--session-id', 'sid-launch',
     '--setting-sources', '',
     '--settings', '/state/dir/settings.json', '--permission-mode', 'acceptEdits',
-    '--max-turns', String(DEFAULT_MAX_TURNS)]);
+    '--max-turns', String(DEFAULT_MAX_TURNS), ...EXECUTOR_TOOL_POSTURE]);
   const resume = resumeSpec({ sessionId: 'sid-1', settingsPath: '/state/dir/settings.json',
     diagnosticText: 'fix pf-test', cwd: '/work/root' });
   assert.ok(resume.argv.includes('--resume') && resume.argv.includes('sid-1'));
   assert.ok(resume.argv.includes('--settings'));   // S3：resume 不带 settings 则 hook 静默失效
+  // 工具面收紧是 launch 与 resume 共有的姿态；--disallowedTools 是变长参数，必须是 argv 的最后一段。
+  assert.deepEqual(EXECUTOR_TOOL_POSTURE, ['--strict-mcp-config', '--disallowedTools', 'Agent', 'Task']);
+  assert.deepEqual(spec.argv.slice(-4), [...EXECUTOR_TOOL_POSTURE]);
+  assert.deepEqual(resume.argv.slice(-4), [...EXECUTOR_TOOL_POSTURE]);
 });
 
 test('explicit Claude turn budgets can raise the default up to a hard preflight ceiling', () => {
@@ -412,7 +422,7 @@ test('assertLaunchable passes the good probe set and fails each broken one', () 
   const broken = [
     { ...goodProbes, confirmedHash: 'b'.repeat(64) },
     { ...goodProbes, baselineDigestStored: false },
-    { ...goodProbes, claudeVersion: '2.1.222' },                      // 低于实测下限的旧版本
+    { ...goodProbes, claudeVersion: '2.1.259' },                      // 低于实测下限的旧版本
     { ...goodProbes, claudeSessionIdFlag: false },                    // --help 探测不到 --session-id
     { ...goodProbes, claudeSettingSourcesFlag: false },               // 隔离环境 settings 的能力缺失
     (() => { const p = { ...goodProbes }; delete p.claudeSessionIdFlag; return p; })(),  // 旧 probes.json 缺探测值
@@ -493,36 +503,36 @@ test('assertLaunchable independently rejects a direct-call permission DSL bypass
 });
 
 // 版本闸是下限不是精确 allowlist：精确 allowlist 每次 claude 升版都会挡下合法 launch（2026-08-09
-// 真实触发：2.1.225 上线，allowlist 只有 2.1.223），而它想挡的 envelope 漂移由上面那道 21-key 直检
-// 直接负责。下限只排除已知过旧的版本。
+// 真实触发：2.1.225 上线，allowlist 只有 2.1.223），而它想挡的 envelope 漂移由上面那道 24-key 直检
+// 直接负责。下限只排除已知过旧的版本；2026-09-04 随两个锚在 2.1.260 重新实测抬到 2.1.260。
 test('the claude version gate is a floor: older rejects, equal and newer launch', () => {
   const withVersion = (claudeVersion) => assertLaunchable(hookContract, { ...goodProbes, claudeVersion });
 
   // ① 低于下限：拒，且 reason 说明至少要哪个版本（操作员据此知道要升到哪儿）。
-  const tooOld = withVersion('2.1.222');
+  const tooOld = withVersion('2.1.259');
   assert.equal(tooOld.ok, false);
-  assert.ok(tooOld.reasons.some((reason) => reason.includes('2.1.223')),
+  assert.ok(tooOld.reasons.some((reason) => reason.includes('2.1.260')),
     'the reason must name the minimum version');
 
-  // ② 等于下限放行；③ 高于下限放行（2.1.225 是触发这次改动的真实版本）。
-  for (const ok of ['2.1.223', '2.1.225', '2.2.0', '3.0.0']) {
+  // ② 等于下限放行；③ 高于下限放行。
+  for (const ok of ['2.1.260', '2.1.261', '2.2.0', '3.0.0']) {
     assert.deepEqual(withVersion(ok), { ok: true, reasons: [] }, `${ok} must launch`);
   }
   // launch.mjs 采集器拿到的原样 --version 输出带后缀，这类形态也要解析得出来。
-  assert.deepEqual(withVersion('2.1.223 (Claude Code)'), { ok: true, reasons: [] });
-  assert.deepEqual(withVersion('2.1.225 (Claude Code)\n'), { ok: true, reasons: [] });
+  assert.deepEqual(withVersion('2.1.260 (Claude Code)'), { ok: true, reasons: [] });
+  assert.deepEqual(withVersion('2.1.261 (Claude Code)\n'), { ok: true, reasons: [] });
 
   // ④ 解析不出来 → 拒，不是放行（null 是采集器在 --version 输出不含三段数字时的取值）。
   for (const unreadable of [null, undefined, '', 'unknown', '2.1', 'v2', 223, { major: 2 }]) {
     const verdict = withVersion(unreadable);
     assert.equal(verdict.ok, false, `${String(unreadable)} must not launch`);
-    assert.ok(verdict.reasons.some((reason) => reason.includes('2.1.223')));
+    assert.ok(verdict.reasons.some((reason) => reason.includes('2.1.260')));
   }
 
-  // ⑤ 逐段数值比较，不是字典序：字典序会把 2.1.9 / 2.1.10 判成不低于 2.1.223（放行旧版本），
+  // ⑤ 逐段数值比较，不是字典序：字典序会把 2.1.9 / 2.1.10 判成不低于 2.1.260（放行旧版本），
   // 又会把 2.1.1000 判成更旧（误杀新版本）——两个方向都要咬。
-  assert.equal(withVersion('2.1.9').ok, false, '2.1.9 is older than 2.1.223');
-  assert.equal(withVersion('2.1.10').ok, false, '2.1.10 is older than 2.1.223');
+  assert.equal(withVersion('2.1.9').ok, false, '2.1.9 is older than 2.1.260');
+  assert.equal(withVersion('2.1.10').ok, false, '2.1.10 is older than 2.1.260');
   assert.deepEqual(withVersion('2.1.1000'), { ok: true, reasons: [] });
 });
 
