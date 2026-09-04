@@ -222,6 +222,16 @@ test('control interpretation prefers the envelope denial and falls back to trans
   assert.equal(interpretClaudeControlReport({ api_error_status: 429, permission_denials: [], errors: ['rate limit'] }, compiled, transcriptRows(target)).outcome, 'blocked');
 });
 
+test('the fixed canary prompt states the executor permission facts', () => {
+  // 2.1.260 实测：objective 只说「读 A 写 B」时，执行体先试 `cp` 被拒再用 Write——输出正确、
+  // permission_denials 非空、isolated-adapter-candidate 红。权限事实写进 prompt 是 canary 自己的 M2 Run A 教训。
+  const { objective } = compile().contract;
+  for (const fact of ['Read tool', 'Write tool', 'Do not run any shell command', 'do not call MCP tools',
+    'do not spawn subagents', 'any denied tool call fails this canary']) {
+    assert.ok(objective.includes(fact), `canary objective must state: ${fact}`);
+  }
+});
+
 test('pre-existing sentinel output rejects before baseline or executor work', async () => {
   const compiled = compile();
   let baselineCalls = 0;

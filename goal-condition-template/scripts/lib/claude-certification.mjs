@@ -97,14 +97,20 @@ function fixedContract(profile) {
   return {
     version: 1,
     runtime: 'claude',
+    // 权限事实必须写进 canary 的 prompt：isolated-adapter-candidate 要求 permission_denials 为空，而
+    // 执行体在 acceptEdits 下只有文件工具——2.1.260 实测（2026-09-04）它先试 `cp` 被拒再改用 Write，
+    // 结果正确、条件却红。不是模型越界，是 prompt 没说清；与 MedDALLE profile 的 M2 Run A 教训同形。
     objective: `Read ${input} and write its bytes unchanged to ${output}. Do not modify any other path. `
-      + `The isolated controller state is ${profile.state_root}.`,
+      + `The isolated controller state is ${profile.state_root}. `
+      + 'You have file tools only: use the Read tool to read the input and the Write tool to create the output. '
+      + 'Do not run any shell command (no Bash, no cp, no cat), do not call MCP tools, do not spawn subagents, '
+      + 'and do not verify with commands; any denied tool call fails this canary. Finish as soon as the output is written.',
     context_sources: [{ id: 'canary-sentinel-input', path: input, sha256: profile.sentinel_sha256 }],
     target_roots: [profile.target_root],
     judgment_criteria: [{
       id: 'canary-copy-only',
-      rule: 'sentinel.output exists and is byte-identical to the controller-bound sentinel input',
-      why: 'The canary must prove the isolated adapter can read context and perform one exact allowed write.',
+      rule: 'sentinel.output exists and is byte-identical to the controller-bound sentinel input, produced with file tools only (no shell, no MCP, no subagent)',
+      why: 'The canary must prove the isolated adapter can read context and perform one exact allowed write without a single denied tool call.',
     }],
     success_criteria: [{
       id: 'canary-output-hash',
