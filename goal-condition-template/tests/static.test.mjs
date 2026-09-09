@@ -280,7 +280,7 @@ test('core skill preserves the complete fail-closed workflow and package', () =>
   }
 });
 
-test('Codex production guidance exposes only GoalSession v2 and one-way migration', () => {
+test('retained Codex controller guidance exposes only GoalSession v2 and one-way v1 migration', () => {
   const skill = read(skillPath);
   const protocol = read(join(referencesRoot, 'codex-goal-session-v2.md'));
   const adapter = read(join(referencesRoot, 'adapters/codex.md'));

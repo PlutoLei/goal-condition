@@ -5,6 +5,8 @@ description: 当用户要为目标、长任务或 agent 会话设计边界，或
 
 # boundary-design
 
+**Codex routing:** for new Codex tasks, use [the portable native Goal brief](../codex-native/skills/boundary-design/SKILL.md). The existing workflow below remains for separate Claude maintenance and legacy compatibility.
+
 本 skill 把操作手册式任务描述收敛为“目标 + 少而真实的边界 + 可验证出口”。产物是平台无关的 boundary package，可直接交给 goal-condition 编译成 run contract；runtime launcher 与权限参数由下游 adapter 负责，本 skill 不复制它们。
 
 ## 输出格式

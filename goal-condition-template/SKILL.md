@@ -5,6 +5,8 @@ description: 当用户要把会话收口成一段可直接交给原生 /goal 的
 
 # goal-condition
 
+**Codex routing:** for new Codex tasks, use [the native Goal skill](../codex-native/skills/goal-condition/SKILL.md). The instructions below retain the existing Claude workflow and Codex GoalSession v2 recovery protocol; they do not override the native Codex skill or provide a fallback for new Codex execution.
+
 两条路，默认走第一条。
 
 ## 主路径：把会话收口成一段 condition
