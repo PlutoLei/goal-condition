@@ -1,5 +1,17 @@
 # goal-condition
 
+**Codex 新任务：使用 [`codex-native/`](codex-native/README.md)。** 新版 `goal-condition` 负责目标、验收与恢复，持续执行统一交给原生 `/goal`；`boundary-design` 提供简洁的目标简报。普通任务不再经过项目注册、admission、哈希确认、强制快照或强制提交。宿主权限、当前项目审批和科研证据要求仍适用。
+
+```sh
+node codex-native/scripts/install.mjs inspect
+node codex-native/scripts/install.mjs install
+node codex-native/scripts/install.mjs status
+```
+
+本次只更新 Codex 分发。Claude 由其维护者单独调整，见 [Claude 交接说明](docs/handoffs/2026-09-09-codex-native-goal.md)。下文保留原设计与 legacy controller 文档供旧会话恢复和 Claude 维护参考，其中 Codex GoalSession v2、contract 与认证流程不再是 Codex 新任务入口，也不作为原生 `/goal` 的回退路线。
+
+## 原设计与 legacy controller 参考
+
 给 agent 派活时，别写操作手册，写边界。
 
 整条链路是三步——**边界 → 目标 → 执行**：
@@ -44,7 +56,7 @@ GOAL: <一句话，带语境>
 
 能往高处走就往高处走。阶梯高处的边界不占上下文、不怕被忽略、不需要被「记得」。硬边界为空也完全正常：多数任务只需要判断标准和验收物。
 
-## goal-condition 的当前架构
+## legacy controller 架构
 
 核心协议不是运行时专属的长提示词，而是两条明确分开的控制路径：
 

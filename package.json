@@ -3,6 +3,7 @@
   "type": "module",
   "engines": {"node": ">=20"},
   "scripts": {
-    "test": "node --test goal-condition-template/tests/*.test.mjs"
+    "test": "node --test goal-condition-template/tests/*.test.mjs",
+    "test:native": "node --test codex-native/tests/*.test.mjs"
   }
 }
