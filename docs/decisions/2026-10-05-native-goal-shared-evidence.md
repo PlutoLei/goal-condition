@@ -35,12 +35,12 @@ A design discussion between Claude and Codex agreed on accepting the mechanism d
 ## Consequences
 
 - One shared rule set, two thin runtime adapters; drift between the copies fails `npm test`.
-- Adding `references/goal-semantics.md` to the Claude release core changes the release. Claude runtime certification binds the exact release and must be rerun before activation.
+- Adding `references/goal-semantics.md` to the release core edits `scripts/lib/runtime-surfaces.mjs`, a `runtime_shared` file, so both runtime surface digests change. `activate` checks release integrity only and does not require certification, and native `/goal` needs none. The controlled Claude launch stays Candidate until the new release is certified, and an existing Codex GoalSession v2 rollout gate drops to `canary`.
 - Staging a commit older than this change with the current installer fails `CORE_SOURCE_MISSING`, as with earlier core additions.
 - The Codex native distribution now lives on `main`, so retiring the old clone no longer loses its source.
 
 ## Rejected Alternatives
 
-- **Physical restructure into `shared/`, `runtimes/`, `legacy/`.** The installer, release manifests, runtime-surface digests and certification receipts bind the `goal-condition-template/` paths. Moving them forces a migration of every release and receipt for a cosmetic gain.
+- **Physical restructure into `shared/`, `runtimes/`, `legacy/`.** The installer, release manifests, runtime-surface digests and certification receipts bind the `goal-condition-template/` paths. Moving them would require coordinated changes to the installer, the manifest and surface tables, and the certification path checks, with no change in runtime behavior.
 - **Symmetric controllers.** Restoring GoalSession v2 for Codex, or adding a launcher for Claude, contradicts the native-first priority and duplicates what the hosts already provide.
 - **Pure native on both sides, deleting the Claude run contract.** The contract still provides hash confirmation, baseline snapshots and independent postflight for audited work, and it has a current certification. Keep it, but freeze its scope.
