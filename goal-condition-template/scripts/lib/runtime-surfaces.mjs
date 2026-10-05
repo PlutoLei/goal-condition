@@ -36,6 +36,7 @@ const capabilityEntries = [
   ['codex-controller/src/values.mjs', 'codex'],
   ['codex-controller/src/verification.mjs', 'codex'],
   ['references/codex-goal-session-v2.md', 'release_only'],
+  ['references/goal-semantics.md', 'release_only'],
   ['references/run-contract.md', 'release_only'],
   ['references/adapters/claude.md', 'release_only'],
   ['references/adapters/codex.md', 'release_only'],
