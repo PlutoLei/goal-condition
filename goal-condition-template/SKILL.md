@@ -1,30 +1,42 @@
 ---
 name: goal-condition
-description: 当用户要把会话收口成一段可直接交给原生 /goal 的 condition 时使用；也在用户显式点名高危任务要审计留痕时，把任务或边界包编译成可确认、可验证的 Claude Code 或 Codex goal 运行契约。
+description: 当用户要在 Claude Code 里用原生 /goal 跑长任务，需要把会话收口成一段 condition 并启动时使用；也在用户显式点名高危任务要审计留痕时，把任务或边界包编译成可确认、可验证的 Claude run contract，或恢复已有的 Codex GoalSession v2 会话。
 ---
 
 # goal-condition
 
-**Codex routing:** for new Codex tasks, use [the native Goal skill](../codex-native/skills/goal-condition/SKILL.md). The instructions below retain the existing Claude workflow and Codex GoalSession v2 recovery protocol; they do not override the native Codex skill or provide a fallback for new Codex execution.
+本文件是 Claude Code 的入口。Codex 新任务使用仓库 `codex-native/skills/goal-condition`，同样交给原生 `/goal`。两边共用[目标、授权、预算与证据语义](references/goal-semantics.md)；本文件只写 Claude 侧的启动、长度、预算与停止方式。
 
 两条路，默认走第一条。
 
 ## 主路径：把会话收口成一段 condition
 
-产物是一段自然语言 condition，交给用户**自己**敲 `/goal <condition>`（Claude Code 与 Codex 原生都吃自由文本）。执行与完成判定归还原生机制：怎么干是执行体的判断，完没完成由原生评估器每轮对照 transcript 判定。本 skill 只编译，不代跑、不代确认。
+产物是一段自然语言 condition，交给 Claude Code 原生 `/goal` 执行与判定：怎么干是执行体的判断，完没完成由原生评估器判定。本 skill 只编译和发起，不另起控制器、不代判完成。
+
+Claude Code 原生 `/goal` 的事实（官方文档与 2.1.289 实测）：
+
+- 它是会话级的 prompt-based Stop hook。每轮结束时，独立的小模型评估器（`ANTHROPIC_DEFAULT_HAIKU_MODEL` 档）只看 transcript，不跑命令、不读文件，返回未满足 / 满足 / 不可能。有子代理或后台命令在跑时，该轮评估推迟。
+- 你手敲 `/goal <condition>` 上限 4000 字符；裸 `/goal` 查状态，`/goal clear` 提前清除。达成后自动清除。
+- 没有原生预算入口。恢复会话会找回未完成的 goal，但轮数、计时与 token 基线重置。
+- 需要受信任的工作区；`disableAllHooks` 或 `allowManagedHooksOnly` 生效时 `/goal` 不可用。
 
 Condition 是**达成后就该停的状态**，不是祈使句式的任务清单。写成任务书是这条路最常见的失败。四要素：
 
-1. **单一可度量终态**——一个，不是一串：测试结果、退出码、文件计数、队列清空。
-2. **陈述检查方式**——执行体怎么把证据落进对话。原生评估器不跑命令、不读文件，只看 transcript，所以写「跑 X 并把输出贴出来」，不写「确保 X 成立」。命令与前置条件从[项目 profile](references/anchors-and-rules.md) 的锚点表取；计数一律现场取，不写死。
+1. **单一可度量终态**——一个一致的结果，可以由几项必要验收共同构成，但不是一串互相独立的目标：测试结果、退出码、文件计数、队列清空。
+2. **陈述检查方式**——执行体怎么把证据落进对话。评估器只看 transcript，所以写「跑 X 并把输出贴出来」，不写「确保 X 成立」。命令与前置条件从[项目 profile](references/anchors-and-rules.md) 的锚点表取；计数一律现场取，不写死。
 3. **要紧的约束**——达成路上不许动的东西。铁律库自动兜底：命中分线的写线内红线，命不中的落治理分层默认，无人值守禁用一切覆盖开关。
-4. **停止条款**——turn 或时间上限写进 condition 文本，原生机制没有别的入口。
+4. **停止条款**——什么情况下应停下来交还用户，而不是继续硬磨：缺凭据、需要用户决定、外部状态不可达。用户给了 turn 或时间上限就写进这里（原生没有别的入口）；没给就不编造数字。
 
-整段 ≤4000 字符（原生上限）。多目标输入必须让用户选一个，不得静默合并。
+多目标输入必须让用户选一个，不得静默合并。
 
-**编译守恒**：只写终态、检查、约束、停止，**不写操作步骤**。「怎么干」属于执行模型的判断空间；把 condition 写成操作手册就放弃了本 skill 的存在理由。缺失信息只在会导致两个实质不同、且无法采用保守默认时才提一个问题。
+**编译守恒**：只写终态、检查、约束、停止，**不写操作步骤**。验证命令、必要依赖与恢复条件属于检查与约束，可以写；实现配方不写。「怎么干」属于执行模型的判断空间；把 condition 写成操作手册就放弃了本 skill 的存在理由。缺失信息只在会导致两个实质不同、且无法采用保守默认时才提一个问题。
 
-**交付**：自审四要素齐备、且整段在 4000 字符内之后，把 condition 原样送进剪贴板（macOS 用 `pbcopy`，其他平台换等价命令），**同时**在对话里贴出同一份全文供审阅。用户只需敲 `/goal ` 粘贴，不该再手工框选复制。
+**发起**：用户只是在规划或讨论时，交付 condition 文本，不发起。用户明确要求以 goal 方式执行时，自审四要素齐备后按长度选通道：
+
+- **≤500 字符且宿主提供 `ProposeGoal` 工具**：调用它，保持 `ask_user` 为默认的 true。用户在审批框里看到的就是将要运行的全文，按一下键批准即开始。提议是非阻塞的；用户拒绝时不会收到通知，不要追问，也不要换个说法再提。plan mode、非交互会话或用户在设置里关掉 `modelProposedGoals` 时工具不可用，改走下一条。
+- **其余情况（超过 500 字符、工具不可用）**：走剪贴板，整段 ≤4000 字符。
+
+剪贴板交付：把 condition 原样送进剪贴板（macOS 用 `pbcopy`，其他平台换等价命令），**同时**在对话里贴出同一份全文供审阅。用户只需敲 `/goal ` 粘贴，不该再手工框选复制。
 
 剪贴板里的字节必须和展示的那份**逐字一致**，否则用户看着一份确认、实际跑的是另一份。condition 是自然语言长文本，常含 `$`、反引号、`!`、引号与换行，所以传输通道不能经 shell 解释：**先用 quoted heredoc 落成文件，再 `pbcopy < 文件`**，不要用 `echo "…" | pbcopy` 之类会做变量替换、命令替换或历史展开的写法。送进去之后**回读校验**——比对 `pbpaste` 与该文件的 SHA-256，不一致就重来，不要嘴上声称一致。用户是盲粘，这道回读是这条不变式唯一的验证点。
 
@@ -32,7 +44,7 @@ Condition 是**达成后就该停的状态**，不是祈使句式的任务清单
 
 **只在用户显式点名时进入**——碰 prod、动治理仓这类要审计留痕的高危任务。默认永不建议、永不自动升级；轻任务一律走上面的主路径。本通道给出主路径没有的三样东西：启动前的 hash 确认、baseline 快照、以及主会话独立于执行体的 postflight 核验。
 
-本 skill 是平台无关的 router/compiler。Codex 只有 GoalSession v2 一个公开执行协议；Claude 使用共享 run contract。它不保存项目私有锚点，也不递归创建另一个 goal。
+本通道处于维护模式：只修缺陷与认证漂移，不再扩展。新任务的长时执行一律交给原生 `/goal`；Claude 只在用户显式选择时走 run contract；Codex 新任务不再进入 GoalSession v2，下面的 Codex 流程只用于已存在会话的恢复、收尾与 `migrate-v1`。本通道不保存项目私有锚点，也不递归创建另一个 goal。
 
 先 Classify，再按 runtime 分流：
 
@@ -51,9 +63,9 @@ Claude: Compile shared run contract → Validate → Preview → Confirm(contrac
 
 一个 contract 只能有一个 single objective。输入若含多个可独立完成的目标，必须让用户选择一个；不得静默合并，也不得在本 skill 内启动子 goal 来拆分。
 
-## Codex GoalSession v2
+## Codex GoalSession v2（仅已有会话）
 
-`runtime="codex"` 永远读取 [GoalSession v2 操作协议](references/codex-goal-session-v2.md) 与 [Codex adapter](references/adapters/codex.md)。controller 缺失、版本不兼容或 gate 未开放时 fail closed，并给出安装、升级或迁移下一步；不得回退到 Codex v1。
+新 Codex 任务不走本节。处理已有 GoalSession v2 会话时，永远读取 [GoalSession v2 操作协议](references/codex-goal-session-v2.md) 与 [Codex adapter](references/adapters/codex.md)。controller 缺失、版本不兼容或 gate 未开放时 fail closed，并给出安装、升级或迁移下一步；不得回退到 Codex v1。
 
 V2 release gate 是 `disabled → canary → enabled`：`disabled` 阻止 live；`canary` 只运行显式选择的 V2 canary；`enabled` 是正常 Codex 路由。`canary→enabled` 必须绑定当前安装 manifest digest、Codex runtime-surface digest 与 controller-owned Certified live canary receipt。整包只有 Claude/release-only 文件变化时保留 Codex 认证并刷新当前 release 身份；Codex 或 shared runtime surface 变化时自动降为 `canary`。旧 rollout state 只做一次单向转换；schema-v4 的任何 live 状态都降为 schema-v5 `canary`，不继承旧 receipt。
 

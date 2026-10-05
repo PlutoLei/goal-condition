@@ -28,3 +28,7 @@ The new installer backs up old Codex skill entries, installs physical directorie
 Executable checks cover installer failure/rollback/drift, migration metadata, and evidence coverage/scope. Real host behavior scenarios are documented separately and must not be reported as executed merely because these unit tests pass. Private machine migration records and raw native tool receipts stay outside Git.
 
 Native Goal completion must not be called `Certified Complete`. Legacy certification requirements need an explicit project-specific migration decision before their governed work can be moved.
+
+## Follow-up (2026-10-05)
+
+The Claude-side review above is done. See [ADR 2026-10-05](../decisions/2026-10-05-native-goal-shared-evidence.md): both runtimes use native `/goal`, the shared semantics live in `shared/goal-semantics.md`, and the Claude skill now documents its own evaluator, length limits and `ProposeGoal` launch channel.

@@ -44,6 +44,8 @@ See the [validation record](VALIDATION.md) for observed results and remaining ev
 
 ## Legacy and Claude compatibility
 
-The existing `goal-condition-template/` controllers and Claude runtime implementation are retained for historical recovery and separate Claude maintenance. They are not a fallback for new Codex goals. A project-specific certification requirement must be resolved through that project's governance; native Goal completion does not satisfy it by renaming the result.
+Goal, authority, budget and evidence semantics are shared with the Claude Code skill through `skills/goal-condition/references/goal-semantics.md`, a byte-identical copy of the repository's `shared/goal-semantics.md`. Edit the shared source and copy it; `npm test` fails on drift. Claude Code also runs long tasks through its own native `/goal`; see the [ADR](../docs/decisions/2026-10-05-native-goal-shared-evidence.md).
+
+The existing `goal-condition-template/` controllers and Claude run contract are retained for existing-session recovery and the maintenance-mode controlled channel. They are not a fallback for new Codex goals. A project-specific certification requirement must be resolved through that project's governance; native Goal completion does not satisfy it by renaming the result.
 
 Local project profiles should retain their evidence and authority rules while routing new Codex work through this skill. See [migration](skills/goal-condition/references/legacy-migration.md) and the [Claude handoff](../docs/handoffs/2026-09-09-codex-native-goal.md). Private profiles, machine paths, receipts and migration identifiers must not be committed to the public repository.

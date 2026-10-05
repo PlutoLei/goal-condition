@@ -7,6 +7,8 @@ description: Shape a sustained Codex task into a clear goal, scope, and verifiab
 
 Native `/goal` is the only execution path for new Codex goals. This skill defines the work and its evidence; the host owns execution, pause/resume, budgets, and goal status. It does not operate a second controller or certify a runtime.
 
+Goal, authority, budget, and evidence semantics are shared with the Claude Code skill in [references/goal-semantics.md](references/goal-semantics.md). This file covers only the Codex launch, status, budget, and stopping behavior.
+
 ## Route by the user's request
 
 - **Research, plan, or rewrite a skill:** deliver the requested analysis or changes. Reading or editing this skill is not a request to run its workflow. Do not create a goal for planning alone.

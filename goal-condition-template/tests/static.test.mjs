@@ -10,7 +10,7 @@ const templateRoot = join(repositoryRoot, 'goal-condition-template');
 const skillPath = join(templateRoot, 'SKILL.md');
 const boundarySkillPath = join(repositoryRoot, 'boundary-design/SKILL.md');
 const referencesRoot = join(templateRoot, 'references');
-const requiredDescription = '当用户要把会话收口成一段可直接交给原生 /goal 的 condition 时使用；也在用户显式点名高危任务要审计留痕时，把任务或边界包编译成可确认、可验证的 Claude Code 或 Codex goal 运行契约。';
+const requiredDescription = '当用户要在 Claude Code 里用原生 /goal 跑长任务，需要把会话收口成一段 condition 并启动时使用；也在用户显式点名高危任务要审计留痕时，把任务或边界包编译成可确认、可验证的 Claude run contract，或恢复已有的 Codex GoalSession v2 会话。';
 
 function read(pathname) {
   return existsSync(pathname) ? readFileSync(pathname, 'utf8') : '';
@@ -103,6 +103,17 @@ test('core skill leads with the condition path and gates the contract lane behin
   }
   // 评估器只看 transcript 这条事实必须留在正文：它决定 condition 要写「贴出来」而不是「确保成立」。
   assert.ok(skill.includes('只看 transcript'), 'core skill no longer states the evaluator input boundary');
+  // 2026-10-05：2.1.289 起模型可经 ProposeGoal 提议 goal（≤500 字符、一键批准），手敲 /goal 上限 4000。
+  // 两个上限分属两个通道，混成一个数字会让长 condition 被工具拒收，或让短 condition 白走剪贴板。
+  const mainPath = skill.slice(conditionHeading, contractHeading);
+  for (const term of ['ProposeGoal', '500 字符', 'ask_user', '4000 字符', 'modelProposedGoals']) {
+    assert.ok(mainPath.includes(term), `condition path is missing launch-channel fact ${term}`);
+  }
+  // 主路径曾把 Claude 评估器的事实写成「Claude Code 与 Codex 原生都」适用；Codex 的 goal 由执行模型
+  // 自审完成，事实不能互相冒充。Codex 机制归 codex-native，这里不得出现它的工具名。
+  for (const codexOnly of ['create_goal', 'update_goal', 'token_budget', 'Claude Code 与 Codex 原生都']) {
+    assert.equal(mainPath.includes(codexOnly), false, `Claude condition path claims Codex mechanism ${codexOnly}`);
+  }
 });
 
 // G4（2026-08-14）：launch/resume 实际接受五个认证 flag，缺任一就 UNCERTIFIED，而 usage 一行没列，

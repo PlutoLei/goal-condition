@@ -1,28 +1,36 @@
 # goal-condition
 
-**Codex 新任务：使用 [`codex-native/`](codex-native/README.md)。** 新版 `goal-condition` 负责目标、验收与恢复，持续执行统一交给原生 `/goal`；`boundary-design` 提供简洁的目标简报。普通任务不再经过项目注册、admission、哈希确认、强制快照或强制提交。宿主权限、当前项目审批和科研证据要求仍适用。
-
-```sh
-node codex-native/scripts/install.mjs inspect
-node codex-native/scripts/install.mjs install
-node codex-native/scripts/install.mjs status
-```
-
-本次只更新 Codex 分发。Claude 由其维护者单独调整，见 [Claude 交接说明](docs/handoffs/2026-09-09-codex-native-goal.md)。下文保留原设计与 legacy controller 文档供旧会话恢复和 Claude 维护参考，其中 Codex GoalSession v2、contract 与认证流程不再是 Codex 新任务入口，也不作为原生 `/goal` 的回退路线。
-
-## 原设计与 legacy controller 参考
-
 给 agent 派活时，别写操作手册，写边界。
+
+## 用原生 `/goal` 跑长任务
+
+Claude Code 与 Codex 都把长任务交给各自原生的 `/goal`。本仓只负责把任务收口成目标与验收，不另起控制器、不代判完成。两边共用一份[目标、授权、预算与证据语义](shared/goal-semantics.md)；启动方式与机制差异各写在自己的 skill 里：
+
+| | Claude Code | Codex |
+|---|---|---|
+| skill 源 | [`goal-condition-template/SKILL.md`](goal-condition-template/SKILL.md) | [`codex-native/skills/goal-condition`](codex-native/README.md) |
+| 谁发起 | 用户明确要求后，模型用 `ProposeGoal` 提议（≤500 字符，一键批准）；更长或工具不可用时进剪贴板，用户敲 `/goal`（≤4000 字符） | 用户明确要求后，模型调用 `create_goal`；宿主无该工具时给出文本让用户敲 `/goal` |
+| 谁判定完成 | 独立小模型评估器，每轮只读 transcript | 执行模型自审后调用 `update_goal` |
+| 预算 | 无原生入口，用户给的上限写进 condition | 原生 `token_budget`，只在用户明确给出时设置 |
+| 控制 | 裸 `/goal` 查状态、`/goal clear` | `/goal edit/pause/resume/clear` |
+
+两个判定者都不独立核实文件，所以共享语义统一的是证据标准，而不是机制：每项完成主张绑定本次运行的新鲜观察，缺证即未通过，目标达成与预算耗尽分开报告。设计取舍见 [ADR 2026-10-05](docs/decisions/2026-10-05-native-goal-shared-evidence.md)。
+
+`shared/goal-semantics.md` 是正本，两个 skill 的 `references/goal-semantics.md` 是随包分发的副本；`npm test` 校验三者逐字节一致。
+
+安装：Codex 用 `codex-native/scripts/install.mjs`（见 [codex-native/README.md](codex-native/README.md)）；Claude 用下文「安装与私有 profile」的 stage / activate，再把 runtime link 指向 Claude 的 skills 目录。
+
+## 受控通道（维护模式）
+
+日常长任务一律走原生 `/goal`。碰 prod、动受治理的仓这类要审计留痕的任务，Claude 可由用户显式选择 run contract：它比原生 goal 多三样东西——启动前的 hash 确认、baseline 快照、以及主会话独立于执行体的终验。该通道只修缺陷与认证漂移，不再扩展。Codex 新任务不再进入 GoalSession v2；下文的 Codex controller 文档只用于已有会话的恢复、收尾与 `migrate-v1`。
 
 整条链路是三步——**边界 → 目标 → 执行**：
 
 | 步 | 做什么 | 由谁 |
 |---|---|---|
 | **边界** | 把任务砍成一张边界包：硬边界、判断标准、验收物、放层清单 | `boundary-design` |
-| **目标** | 默认编译成一段 condition，交给用户自己敲原生 `/goal`；用户显式点名高危任务时才编译成运行契约（Claude 得 canonical run contract，Codex 得 GoalSession v2 的 Goal、Authority 与 Design） | `goal-condition-template/` router / compiler |
-| **执行** | 走 condition 时由原生 goal 机制驱动与判定；走契约时 Claude 使用已确认 contract、Codex 只使用已授权 GoalSession v2，两者都由控制面独立终验，执行会话不能自证完成 | 原生 goal / runtime adapter + controller |
-
-两条路的分界是**要不要审计留痕**。日常任务走 condition：产物是一段自然语言完成条件，执行与完成判定都归还给运行时原生的 goal 机制，怎么干属于执行模型的判断空间。碰 prod、动受治理的仓这类需要留痕的任务才进契约轨，它比 condition 多三样东西：启动前的 hash 确认、baseline 快照、以及主会话独立于执行体的终验。
+| **目标** | 默认编译成交给原生 `/goal` 的 condition / objective；用户显式选择受控通道时，Claude 编译成 canonical run contract | runtime 各自的 goal-condition skill |
+| **执行** | 默认由原生 goal 机制驱动与判定；受控通道由控制面独立终验，执行会话不能自证完成 | 原生 goal / Claude runtime adapter + controller |
 
 公开仓只保存脱敏的核心协议、adapter、脚本和测试；具体项目的事实、锚点与核验来源由私有 profile 在安装时注入。
 
@@ -56,12 +64,12 @@ GOAL: <一句话，带语境>
 
 能往高处走就往高处走。阶梯高处的边界不占上下文、不怕被忽略、不需要被「记得」。硬边界为空也完全正常：多数任务只需要判断标准和验收物。
 
-## legacy controller 架构
+## 受控通道与 legacy controller 架构
 
 核心协议不是运行时专属的长提示词，而是两条明确分开的控制路径：
 
 - Claude 使用 canonical JSON run contract 作为唯一权威 artifact，逐字节预览并确认 hash。
-- Codex 只使用 GoalSession v2：Goal 与 Maximum Authority 授权后，Design Revision 动态演化，每次执行投影为 immutable Attempt。
+- Codex 已有会话使用 GoalSession v2（新任务走原生 `/goal`）：Goal 与 Maximum Authority 授权后，Design Revision 动态演化，每次执行投影为 immutable Attempt。
 
 Codex V2 内部仍生成一个通过共享 closed-world validator 的私有 `AttemptManifest`，但它只是 launcher ABI；`version: 1` 不是旧 runtime 的入口或 fallback 信号。
 
@@ -147,6 +155,7 @@ Release 只允许以下完整核心集；pinned commit 缺少任何一项都会�
 - `references/adapters/claude.md`
 - `references/adapters/codex.md`
 - `references/codex-goal-session-v2.md`
+- `references/goal-semantics.md`
 - `schema/run-contract.schema.json`
 - `scripts/validate-contract.mjs`
 - `scripts/snapshot.mjs`
@@ -200,6 +209,8 @@ runtime surface 分类同时受静态 import-closure 回归约束：shared 文�
 ```text
 npm test
 ```
+
+`npm test` 同时运行根目录 `tests/` 下的共享语义同步检查；Codex 原生分发另有 `npm run test:native`。
 
 测试覆盖 contract 的 closed-world 校验、canonical JSON/hash、状态机、基线 capture/compare、commit-pinned installer、adapter 静态契约、公开 Markdown 的隐私/loader 门禁、**全仓发布面泄漏闸**，以及五类 paired pressure samples。
 
