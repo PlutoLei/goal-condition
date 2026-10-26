@@ -103,6 +103,11 @@ test('core skill leads with the condition path and gates the contract lane behin
   }
   // 评估器只看 transcript 这条事实必须留在正文：它决定 condition 要写「贴出来」而不是「确保成立」。
   assert.ok(skill.includes('只看 transcript'), 'core skill no longer states the evaluator input boundary');
+  // 2026-10-25 真实 /goal 试跑：代码一次做对，评估器却因证据分散、审查只贴摘要、覆盖面无据、挂着旧子代理驳回 4 次。
+  const checkItem = skill.slice(skill.indexOf('2. **陈述检查方式**'), skill.indexOf('3. **要紧的约束**'));
+  for (const term of ['集中贴出', '涉及 Git 仓库时', '结论原文', '覆盖的正是最终改动', '停掉本次 goal 里执行体自己起的、已用不上的后台命令与子代理', '归属不清的不停']) {
+    assert.ok(checkItem.includes(term), `check-method item is missing final-turn evidence rule ${term}`);
+  }
   // 2026-10-05：2.1.289 起模型可经 ProposeGoal 提议 goal（≤500 字符、一键批准），手敲 /goal 上限 4000。
   // 两个上限分属两个通道，混成一个数字会让长 condition 被工具拒收，或让短 condition 白走剪贴板。
   const mainPath = skill.slice(conditionHeading, contractHeading);
